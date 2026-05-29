@@ -33,17 +33,15 @@
 
 <br>
 
-> **Status — pre-release (`v0.3.0`).** The concurrent core is real: per-key state
-> lives in a tunable **sharded store** (unrelated keys never contend — an
-> existing-key check takes only a read lock plus an atomic), memory is **bounded
-> by eviction** so a unique-key flood hits a cap instead of growing without
-> limit, and the steady-state check is **allocation-free** — all verified by
-> `loom`, a multi-threaded stress test, and an allocation audit. Tune sharding
-> and eviction with `.with_shards(n)` and `.with_eviction(policy)`. Still ahead:
-> the **leaky-bucket, fixed-window, and sliding-window algorithms** and the
-> unified **Tier-2 builder** in `v0.4.0`. Examples for those not-yet-shipped
-> surfaces describe the target API; the roadmap drives the order in which they
-> become real.
+> **Status — pre-release (`v0.4.0`).** Feature-rich and proven: all five
+> algorithms (token bucket by default; leaky bucket, fixed window, sliding-window
+> log, and sliding-window counter under the `algorithms` feature) sit behind one
+> `Limiter` trait and the Tier-2 builder, each with its own `proptest` over-admit
+> proof. The concurrent core is real — a tunable **sharded store** where
+> unrelated keys never contend, memory **bounded by eviction**, and an
+> **allocation-free** steady-state check — all verified by `loom`, a
+> multi-threaded stress test, and an allocation audit. The remaining work toward
+> `1.0` is benchmarking, hardening, and the soak; the public surface is settling.
 
 <br>
 
@@ -55,7 +53,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 - **Sharded state.** Per-key state lives in a sharded concurrent map; unrelated keys never serialize on each other. Throughput scales with cores.
 - **Bounded memory.** Idle keys are evicted (LRU/TTL); a hostile unique-key flood hits a cap, it does not grow unbounded.
 - **Never over-admits.** For any key and window, admitted requests never exceed the configured quota — under any interleaving. Proven per algorithm with `loom` and `proptest`.
-- **Multiple algorithms, one trait.** Token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter — all behind a single `RateLimiter` trait.
+- **Multiple algorithms, one trait.** Token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter — all behind a single `Limiter` trait.
 - **One-line API.** `RateLimiter::per_second(n)` then `.check(key)`. The simple path is also the fast path.
 - **Honest `retry-after`.** Denials carry how long until the caller may retry.
 
@@ -64,7 +62,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 
 ## Features
 
-- **Multi-algorithm** — token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter, all behind one `RateLimiter` trait
+- **Multi-algorithm** — token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter, all behind one `Limiter` trait
 - **Per-key limiting** — limit per-IP, per-user, per-endpoint, per-anything; sharded so keys don't contend
 - **Lock-free hot path** — per-key buckets delegate to `better-bucket`'s atomic core; zero allocation on the steady-state `check`
 - **Bounded memory** — LRU/TTL eviction caps the key space; survives a hostile unique-key flood
@@ -117,29 +115,9 @@ id, an API token, an endpoint name.
 
 ## Configured Limiter (Tier 2)
 
-Today, build an explicit quota with `Quota::rate`, then tune the shard count and
-eviction policy with chainable adjusters:
-
-```rust
-use rate_net::{RateLimiter, Quota, Eviction};
-use std::time::Duration;
-
-// 1000 requests / minute, per key.
-let quota = Quota::rate(1000, Duration::from_secs(60)).expect("non-zero quota");
-
-let limiter = RateLimiter::with_quota(quota)
-    .with_shards(64)                                  // tune for core count
-    .with_eviction(Eviction::capacity(100_000)        // cap the key space
-        .with_idle(Duration::from_secs(300)));        // and reclaim idle keys
-
-// Take more than one unit at a time.
-let decision = limiter.check_n("tenant:acme", 5);
-```
-
-> _Planned for `v0.4`._ The single builder below — folding algorithm selection
-> in with these knobs — lands with the full algorithm suite.
-
-Choose the algorithm, quota, burst, shard count, and eviction policy:
+The builder selects the algorithm, quota, burst, shard count, and eviction
+policy in one fluent surface (algorithms other than the token bucket need the
+`algorithms` feature):
 
 ```rust
 use rate_net::{RateLimiter, Algorithm, Eviction};
@@ -157,17 +135,23 @@ let limiter = RateLimiter::builder()
 let decision = limiter.check_n("tenant:acme", 5);
 ```
 
+Prefer not to use the builder? The same knobs are chainable adjusters on a
+constructed limiter — `RateLimiter::with_quota(quota).with_shards(64)
+.with_eviction(policy).with_algorithm(algo)` — each applied immediately after
+construction.
+
 <br>
 
 ## Algorithms
 
-All algorithms share the same `RateLimiter` trait and `check` surface — swap
-the strategy without touching call sites.
+All algorithms share the same `Limiter` trait and `check` surface — swap the
+strategy through the builder without touching call sites. The token bucket is
+always available; the rest are behind the `algorithms` feature.
 
 | Algorithm | Shape | Good for |
 |-----------|-------|----------|
 | **Token bucket** | Smooth refill, allows bursts up to capacity | General-purpose; the default |
-| **Leaky bucket** | Constant drain, smooths spikes | Shaping bursty traffic to a steady rate |
+| **Leaky bucket** | Spaces units at a steady interval (GCRA) | Shaping bursty traffic to a steady rate |
 | **Fixed window** | Counter resets each window | Cheapest; tolerates boundary bursts |
 | **Sliding-window log** | Exact timestamps in a window | Highest accuracy; higher memory |
 | **Sliding-window counter** | Weighted blend of two windows | Accuracy/cost balance; common production choice |

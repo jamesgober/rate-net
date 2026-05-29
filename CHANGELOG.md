@@ -22,6 +22,48 @@
 
 ---
 
+## [0.4.0] - 2026-05-29
+
+Extended. The full algorithm suite lands behind the one `Limiter` trait, each
+with its own over-admit proof, plus the Tier-2 builder that selects algorithm,
+quota, burst, shards, eviction, and clock in one fluent surface.
+
+### Added
+
+- Four algorithms beyond the default token bucket, behind the `algorithms`
+  feature, each a `Limiter` implementation with unit, retry-after, and over-admit
+  `proptest` coverage:
+  - **Leaky bucket (GCRA)** — spaces admitted units at the emission interval,
+    smoothing to a steady rate while tolerating the quota's `burst`. Lock-free:
+    one atomic theoretical-arrival-time advanced by compare-and-swap.
+  - **Fixed window** — the cheapest option; a lock-free packed `(window, count)`
+    atomic that resets each window. Tolerates the classic boundary burst.
+  - **Sliding-window log** — exact: keeps the timestamp of every admitted unit in
+    the trailing window, never bursts at boundaries, memory bounded by `limit`.
+  - **Sliding-window counter** — O(1) approximate: a time-weighted blend of the
+    current and previous window's counts.
+- `RateLimiter::builder()` and the `Builder` type — the Tier-2 path:
+  `.algorithm()`, `.quota()` / `.per_second()` / `.per_minute()`, `.burst()`,
+  `.shards()`, `.eviction()`, `.clock()`, `.build()`.
+- `RateLimiter::with_algorithm` to select the algorithm on an existing limiter.
+- `Quota::burst` and `Quota::with_burst` — a burst ceiling distinct from the
+  sustained `limit` (honoured by the token and leaky buckets).
+- The `Algorithm` selector now drives per-key state via enum dispatch (no
+  boxing, no vtable); its non-token variants are gated by the `algorithms`
+  feature.
+- `tests/proptest_algorithms.rs` — the per-algorithm over-admit proofs through
+  the full `RateLimiter`.
+- CI now also runs clippy and the test suite on the default (token-bucket-only)
+  feature set, alongside `--all-features`.
+
+### Changed
+
+- The internal check path carries elapsed `Duration` (not just milliseconds) to
+  each key's state, giving the window and leaky algorithms nanosecond resolution
+  so sub-millisecond periods stay accurate.
+
+---
+
 ## [0.3.0] - 2026-05-29
 
 Core. The real concurrent machine: a sharded, bounded-memory per-key store with
@@ -174,7 +216,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/rate-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/rate-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/rate-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/rate-net/releases/tag/v0.1.0

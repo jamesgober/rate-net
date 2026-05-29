@@ -2,10 +2,11 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
-use better_bucket::Bucket;
 use clock_lib::{Clock, Monotonic, SystemClock};
 
+use crate::algo::AlgoState;
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
@@ -17,7 +18,7 @@ use crate::store::Store;
 /// available core, rounded to a power of two and clamped to a sane range. More
 /// shards means less contention between unrelated keys, at the cost of a little
 /// more memory.
-fn default_shard_count() -> usize {
+pub(crate) fn default_shard_count() -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(NonZeroUsize::get)
         .unwrap_or(1);
@@ -97,6 +98,7 @@ pub trait Limiter {
 /// }
 /// ```
 pub struct RateLimiter<C: Clock + Clone = SystemClock> {
+    algorithm: Algorithm,
     quota: Quota,
     clock: C,
     epoch: Monotonic,
@@ -161,20 +163,52 @@ impl RateLimiter<SystemClock> {
     #[must_use]
     pub fn with_quota(quota: Quota) -> Self {
         Self::build(
+            Algorithm::default(),
             quota,
             SystemClock::new(),
             default_shard_count(),
             Eviction::default(),
         )
     }
+
+    /// Starts a [`Builder`](crate::Builder) — the Tier-2 path that selects the
+    /// algorithm, quota, burst, shard count, eviction policy, and clock in one
+    /// fluent surface.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{RateLimiter, Eviction};
+    /// use std::time::Duration;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .quota(1000, Duration::from_secs(60)) // 1000 / minute
+    ///     .burst(50)
+    ///     .shards(64)
+    ///     .eviction(Eviction::idle(Duration::from_secs(300)))
+    ///     .build();
+    /// assert_eq!(limiter.quota().limit(), 1000);
+    /// assert_eq!(limiter.quota().burst(), 50);
+    /// ```
+    pub fn builder() -> crate::builder::Builder<SystemClock> {
+        crate::builder::Builder::new()
+    }
 }
 
 impl<C: Clock + Clone> RateLimiter<C> {
-    /// Assembles a limiter from its parts, anchoring the eviction clock.
-    fn build(quota: Quota, clock: C, shards: usize, eviction: Eviction) -> Self {
+    /// Assembles a limiter from its parts, anchoring the eviction clock. Shared
+    /// with [`Builder`](crate::Builder).
+    pub(crate) fn build(
+        algorithm: Algorithm,
+        quota: Quota,
+        clock: C,
+        shards: usize,
+        eviction: Eviction,
+    ) -> Self {
         let epoch = clock.now();
         let store = Store::new(shards, eviction);
         Self {
+            algorithm,
             quota,
             clock,
             epoch,
@@ -214,7 +248,40 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_clock<C2: Clock + Clone>(self, clock: C2) -> RateLimiter<C2> {
-        RateLimiter::build(self.quota, clock, self.shards, self.eviction)
+        RateLimiter::build(
+            self.algorithm,
+            self.quota,
+            clock,
+            self.shards,
+            self.eviction,
+        )
+    }
+
+    /// Selects the algorithm, discarding any per-key state.
+    ///
+    /// Intended immediately after construction. The leaky bucket and the window
+    /// algorithms require the `algorithms` feature; without it the only
+    /// selectable variant is [`Algorithm::TokenBucket`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "algorithms")] {
+    /// use rate_net::{RateLimiter, Algorithm};
+    ///
+    /// let limiter = RateLimiter::per_second(100).with_algorithm(Algorithm::SlidingWindowCounter);
+    /// assert_eq!(limiter.algorithm(), Algorithm::SlidingWindowCounter);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_algorithm(self, algorithm: Algorithm) -> Self {
+        Self::build(
+            algorithm,
+            self.quota,
+            self.clock,
+            self.shards,
+            self.eviction,
+        )
     }
 
     /// Sets the shard count, discarding any per-key state.
@@ -233,7 +300,13 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_shards(self, shards: usize) -> Self {
-        Self::build(self.quota, self.clock, shards, self.eviction)
+        Self::build(
+            self.algorithm,
+            self.quota,
+            self.clock,
+            shards,
+            self.eviction,
+        )
     }
 
     /// Sets the eviction policy, discarding any per-key state.
@@ -254,7 +327,13 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_eviction(self, eviction: Eviction) -> Self {
-        Self::build(self.quota, self.clock, self.shards, eviction)
+        Self::build(
+            self.algorithm,
+            self.quota,
+            self.clock,
+            self.shards,
+            eviction,
+        )
     }
 
     /// Checks a single unit against `key`.
@@ -325,7 +404,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub const fn algorithm(&self) -> Algorithm {
-        Algorithm::TokenBucket
+        self.algorithm
     }
 
     /// The eviction policy bounding the per-key store.
@@ -376,24 +455,24 @@ impl<C: Clock + Clone> RateLimiter<C> {
         self.store.len()
     }
 
-    /// The shared check path: hand the key to the store as of the current time,
-    /// seeding a fresh bucket if this is the first time the key is seen.
+    /// The shared check path: hand the key to the store as of the elapsed time,
+    /// seeding fresh per-key state if this is the first time the key is seen.
     fn check_inner(&self, key: Key, n: u32) -> Decision {
-        let now_ms = self.now_ms();
-        self.store.check(key, n, now_ms, || self.new_bucket())
+        let now = self.now();
+        self.store.check(key, n, now, || self.new_state(now))
     }
 
-    /// Builds a fresh per-key bucket for the configured quota, anchored at the
-    /// injected clock's current reading.
-    fn new_bucket(&self) -> Bucket<C> {
-        Bucket::per_duration(self.quota.limit(), self.quota.period()).with_clock(self.clock.clone())
+    /// Builds fresh per-key state for the configured algorithm and quota,
+    /// anchored at the elapsed time `now`.
+    fn new_state(&self, now: Duration) -> AlgoState<C> {
+        AlgoState::new(self.algorithm, &self.quota, self.clock.clone(), now)
     }
 
-    /// Monotonic milliseconds since this limiter's epoch, for eviction
-    /// timestamps. Saturating, so a multi-million-year uptime cannot wrap it.
-    fn now_ms(&self) -> u64 {
-        let elapsed = self.clock.now().saturating_duration_since(self.epoch);
-        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+    /// Monotonic elapsed time since this limiter's epoch, for the window
+    /// algorithms and eviction timestamps. Saturating, so a multi-million-year
+    /// uptime cannot wrap it.
+    fn now(&self) -> Duration {
+        self.clock.now().saturating_duration_since(self.epoch)
     }
 }
 

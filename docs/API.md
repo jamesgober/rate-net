@@ -18,11 +18,11 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.3.0`).** The concurrent core is real — a sharded,
-> bounded-memory per-key store with an allocation-free steady-state check. Items
-> under [Public API](#public-api) are callable now; sections marked _(planned)_
-> describe the intended surface and are filled in as each roadmap phase ships —
-> the additional algorithms and the unified Tier-2 builder land in `0.4.0`.
+> **Status: pre-1.0 (`v0.4.0`).** The algorithm suite is complete — five
+> algorithms behind one [`Limiter`](#limiter-trait) trait, selectable through the
+> Tier-2 [`Builder`](#builder) — over a sharded, bounded-memory, allocation-free
+> core. Everything documented here is callable now; the leaky bucket and window
+> algorithms require the `algorithms` feature.
 
 ## Table of Contents
 
@@ -35,9 +35,11 @@
     - [`with_clock`](#ratelimiterwith_clock)
     - [`with_shards`](#ratelimiterwith_shards)
     - [`with_eviction`](#ratelimiterwith_eviction)
+    - [`with_algorithm`](#ratelimiterwith_algorithm)
     - [`check`](#ratelimitercheck)
     - [`check_n`](#ratelimitercheck_n)
     - [`quota` / `algorithm` / `shards` / `eviction` / `tracked_keys`](#ratelimiter-introspection)
+  - [`Builder`](#builder)
   - [`Limiter` trait](#limiter-trait)
   - [`Decision`](#decision)
   - [`Quota`](#quota)
@@ -47,7 +49,7 @@
   - [`Key`](#key)
   - [`VERSION`](#version)
 - [Sharding and eviction](#sharding-and-eviction)
-- [Tier 2 — the configured path](#tier-2--the-configured-path) _(planned: 0.4)_
+- [Tier 2 — the configured path](#tier-2--the-configured-path)
 - [Algorithms](#algorithms)
 - [Feature flags](#feature-flags)
 
@@ -227,6 +229,28 @@ let limiter = RateLimiter::per_second(1000)
 assert_eq!(limiter.eviction().max_keys(), Some(100_000));
 ```
 
+#### `RateLimiter::with_algorithm`
+
+```rust
+pub fn with_algorithm(self, algorithm: Algorithm) -> Self
+```
+
+Selects the [`Algorithm`](#algorithm), discarding any per-key state. Intended
+immediately after construction. The leaky bucket and window algorithms require
+the `algorithms` feature; without it the only selectable variant is
+`Algorithm::TokenBucket`.
+
+- `algorithm` — the strategy to apply.
+
+```rust
+# #[cfg(feature = "algorithms")] {
+use rate_net::{RateLimiter, Algorithm};
+
+let limiter = RateLimiter::per_second(100).with_algorithm(Algorithm::FixedWindow);
+assert_eq!(limiter.algorithm(), Algorithm::FixedWindow);
+# }
+```
+
 #### `RateLimiter::check`
 
 ```rust
@@ -328,6 +352,44 @@ assert_eq!(limiter.tracked_keys(), 1);
 
 ---
 
+### `Builder`
+
+```rust
+pub struct Builder<C: Clock + Clone = SystemClock> { /* private */ }
+```
+
+The Tier-2 path, started with [`RateLimiter::builder`](#ratelimiter). Chain the
+knobs you care about, then `build()`. Anything left unset keeps a sane default
+(token bucket, default sharding, bounded-memory eviction); the quota defaults to
+a limit of `0`, which denies everything, so set it. `build()` is infallible.
+
+Methods: `algorithm(Algorithm)`, `quota(limit, period)`, `per_second(limit)`,
+`per_minute(limit)`, `burst(u32)`, `shards(usize)`, `eviction(Eviction)`,
+`clock(C2)`, and `build() -> RateLimiter<C>`.
+
+```rust
+use rate_net::{RateLimiter, Algorithm, Eviction};
+use std::time::Duration;
+
+# #[cfg(feature = "algorithms")]
+let limiter = RateLimiter::builder()
+    .algorithm(Algorithm::SlidingWindowCounter)
+    .quota(1000, Duration::from_secs(60)) // 1000 / minute
+    .burst(50)                            // allow short bursts
+    .shards(64)                           // tune for core count
+    .eviction(Eviction::idle(Duration::from_secs(300)))
+    .build();
+```
+
+The same knobs are also available as chainable adjusters on a constructed
+limiter — [`with_shards`](#ratelimiterwith_shards),
+[`with_eviction`](#ratelimiterwith_eviction),
+[`with_algorithm`](#ratelimiterwith_algorithm),
+[`with_clock`](#ratelimiterwith_clock) — for when the builder is more than you
+need.
+
+---
+
 ### `Limiter` trait
 
 ```rust
@@ -407,9 +469,11 @@ if let Decision::Deny { retry_after } = limiter.check("u") {
 pub struct Quota { /* private */ }
 ```
 
-A rate limit: `limit` requests per `period`, per key. Under the token bucket a
-key starts with a full allowance of `limit`, spends one unit per admitted
-request, and accrues the allowance back over `period`.
+A rate limit: `limit` requests per `period`, per key, with a `burst` ceiling.
+Under the token bucket a key starts with a full allowance of `burst`, spends one
+unit per admitted request, and accrues `limit` units back over `period`.
+`burst` defaults to `limit`; the window algorithms admit at most `limit` per
+`period` and ignore it.
 
 Constructors:
 
@@ -418,7 +482,8 @@ Constructors:
 - `rate(limit: u32, period: Duration) -> Result<Quota, RateLimiterError>` —
   validated for arbitrary windows.
 
-Accessors: `limit(&self) -> u32`, `period(&self) -> Duration`.
+Accessors: `limit() -> u32`, `period() -> Duration`, `burst() -> u32`. Builder:
+`with_burst(u32) -> Quota`.
 
 ```rust
 use rate_net::Quota;
@@ -498,17 +563,18 @@ assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
 ```rust
 #[non_exhaustive]
 pub enum Algorithm {
-    TokenBucket,          // default; the only variant wired in 0.2
-    LeakyBucket,          // planned: 0.4
-    FixedWindow,          // planned: 0.4
-    SlidingWindowLog,     // planned: 0.4
-    SlidingWindowCounter, // planned: 0.4
+    TokenBucket,                              // always available; the default
+    #[cfg(feature = "algorithms")] LeakyBucket,
+    #[cfg(feature = "algorithms")] FixedWindow,
+    #[cfg(feature = "algorithms")] SlidingWindowLog,
+    #[cfg(feature = "algorithms")] SlidingWindowCounter,
 }
 ```
 
-Selects the algorithm a limiter applies; the selector a future builder uses to
-pick between them. `#[non_exhaustive]` and `Default` (`TokenBucket`). The
-remaining variants name the surface that lands in `0.4`.
+Selects the algorithm a limiter applies; the selector the [`Builder`](#builder)
+and [`with_algorithm`](#ratelimiterwith_algorithm) use. `#[non_exhaustive]` and
+`Default` (`TokenBucket`). The four non-token variants exist only when the
+`algorithms` feature is enabled.
 
 ```rust
 use rate_net::Algorithm;
@@ -633,26 +699,30 @@ check).
 
 ## Tier 2 — the configured path
 
-Shard count and eviction policy are configurable today through the chainable
-[`with_shards`](#ratelimiterwith_shards) and
-[`with_eviction`](#ratelimiterwith_eviction) adjusters (above), combined with
-[`with_quota`](#ratelimiterwith_quota) / [`Quota::rate`](#quota).
-
-_Planned: 0.4._ A single builder that folds algorithm selection in with these
-knobs — quota, burst, shard count, eviction policy, and clock — in one fluent
-surface.
+The [`Builder`](#builder) folds every knob — algorithm, quota, burst, shard
+count, eviction policy, and clock — into one fluent surface, started with
+[`RateLimiter::builder`](#ratelimiter). The same knobs are also chainable
+adjusters ([`with_shards`](#ratelimiterwith_shards),
+[`with_eviction`](#ratelimiterwith_eviction),
+[`with_algorithm`](#ratelimiterwith_algorithm),
+[`with_clock`](#ratelimiterwith_clock)) on a constructed limiter.
 
 ---
 
 ## Algorithms
 
-| Algorithm | Status | Notes |
-|-----------|--------|-------|
-| Token bucket | **shipped (0.2)** | Default; delegates to `better-bucket`. |
-| Leaky bucket | planned: 0.4 | Constant-drain shaping. |
-| Fixed window | planned: 0.4 | Cheapest; boundary-burst tolerant. |
-| Sliding-window log | planned: 0.4 | Exact; higher memory. |
-| Sliding-window counter | planned: 0.4 | Weighted two-window blend. |
+All five share the [`Limiter`](#limiter-trait) surface and are selected by
+[`Algorithm`](#algorithm). The token bucket is always available; the rest
+require the `algorithms` feature. Each carries its own `proptest` over-admit
+proof.
+
+| Algorithm | Feature | Notes |
+|-----------|---------|-------|
+| Token bucket | always | Default; delegates to `better-bucket`. Bursts to capacity, then sustains. |
+| Leaky bucket | `algorithms` | GCRA; spaces units at the emission interval, tolerating `burst`. |
+| Fixed window | `algorithms` | Cheapest; lock-free packed counter. Tolerates a boundary burst (up to `2 × limit`). |
+| Sliding-window log | `algorithms` | Exact; no boundary burst. Memory bounded by `limit` per key. |
+| Sliding-window counter | `algorithms` | O(1) weighted two-window blend; approximate (worst case `2 × limit`). |
 
 ---
 
@@ -661,7 +731,7 @@ surface.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std`        | yes | Standard library. Enables the limiter — the purpose-built sharded store, the token-bucket core (`better-bucket`'s `clock` feature), the injectable clock (`clock-lib`), and the error type (`error-forge`). With it off the crate is `no_std` and exposes only [`VERSION`](#version). |
-| `algorithms` | no  | The full suite beyond the default token bucket. _(wired in 0.4)_ |
+| `algorithms` | no  | The leaky bucket and the window algorithms (fixed, sliding-log, sliding-counter), and their [`Algorithm`](#algorithm) variants. The token bucket is always available without it. |
 | `async`      | no  | Optional additive async-friendly wrapper. Implies `std`. |
 
 ---

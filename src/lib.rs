@@ -19,17 +19,18 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. As of `0.3.0` the concurrent core is real:
-//! per-key state lives in a purpose-built **sharded store** (an existing-key
-//! [`check`](RateLimiter::check) takes only a shard read lock plus the bucket's
-//! atomic accounting, so unrelated keys never contend), memory is **bounded by
-//! eviction** so a flood of unique keys hits a cap, and the steady-state check
-//! is **allocation-free**. The token-bucket accounting is delegated to
-//! [`better-bucket`](https://crates.io/crates/better-bucket); time comes from an
-//! injectable clock. The public shape — the [`Decision`] result, the [`Quota`],
-//! [`Algorithm`], and [`Eviction`] types, the [`RateLimiterError`], and the
-//! [`Limiter`] trait — is in place. The leaky-bucket, fixed-window, and
-//! sliding-window algorithms and the Tier-2 builder arrive in `0.4.0`.
+//! Pre-1.0, under active development. As of `0.4.0` the algorithm suite is
+//! complete: the token bucket (default) plus — under the `algorithms` feature —
+//! the leaky bucket, fixed window, sliding-window log, and sliding-window
+//! counter, all behind the one [`Limiter`] trait and selectable through the
+//! Tier-2 [`Builder`]. Per-key state lives in a purpose-built **sharded store**
+//! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
+//! plus the algorithm's atomic accounting, so unrelated keys never contend),
+//! memory is **bounded by eviction** so a flood of unique keys hits a cap, and
+//! the steady-state check is **allocation-free**. Token-bucket accounting is
+//! delegated to [`better-bucket`](https://crates.io/crates/better-bucket); time
+//! comes from an injectable clock. Each algorithm carries its own `proptest`
+//! over-admit proof.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -100,7 +101,11 @@
 // store, the clock-driven token bucket, and the domain error type). With `std`
 // off the crate is no_std and exposes only `VERSION`.
 #[cfg(feature = "std")]
+mod algo;
+#[cfg(feature = "std")]
 mod algorithm;
+#[cfg(feature = "std")]
+mod builder;
 #[cfg(feature = "std")]
 mod decision;
 #[cfg(feature = "std")]
@@ -118,6 +123,8 @@ mod store;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::Algorithm;
+#[cfg(feature = "std")]
+pub use crate::builder::Builder;
 #[cfg(feature = "std")]
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
