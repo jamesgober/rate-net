@@ -33,19 +33,20 @@
 
 <br>
 
-> **Status — pre-release (`v0.8.0`, alpha) — API frozen.** The public surface is
-> fixed through `1.0` and now validated against a representative gatekeeper
-> consumer (the `bouncer-io` integration pattern) through the public allow/deny
-> API only. All five algorithms (token bucket by default; leaky bucket, fixed
-> window, sliding-window log, and sliding-window counter under the `algorithms`
-> feature) behind one `Limiter` trait and the Tier-2 builder, each with its own
-> `proptest` over-admit proof; an optional await-until-ready async layer; runnable
-> [examples](./examples); and a [benchmark suite](./docs/BENCHMARKS.md) with an
-> honest head-to-head vs `governor`. The concurrent core is a tunable **sharded
-> store** where unrelated keys never contend, memory **bounded by eviction**, and
-> an **allocation-free** steady-state check — verified by `loom`, a stress test,
-> an allocation audit, an **adversarial-traffic suite**, and a **consumer
-> integration**. The remaining work toward `1.0` is the beta bug-fix soak.
+> **Status — pre-release (`v0.9.0`, beta) — API frozen.** The public surface is
+> fixed through `1.0` and `Send + Sync + 'static` is locked in at the type level.
+> Every algorithm is concurrency-stressed (eight threads on one hot key — each
+> admits exactly its quota), validated against a representative gatekeeper
+> consumer (the `bouncer-io` integration pattern), and proved under `loom`,
+> `proptest`, and an adversarial-traffic suite. All five algorithms (token
+> bucket by default; leaky bucket, fixed window, sliding-window log, and
+> sliding-window counter under the `algorithms` feature) behind one `Limiter`
+> trait and the Tier-2 builder; an optional await-until-ready async layer;
+> runnable [examples](./examples); a [benchmark suite](./docs/BENCHMARKS.md)
+> with an honest head-to-head vs `governor`. The concurrent core is a tunable
+> **sharded store** where unrelated keys never contend, memory **bounded by
+> eviction**, and an **allocation-free** steady-state check. From here to `1.0`:
+> bug fixes and documentation polish only.
 
 <br>
 

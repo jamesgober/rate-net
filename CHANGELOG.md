@@ -22,6 +22,27 @@
 
 ---
 
+## [0.9.0] - 2026-05-29
+
+Beta. The surface stays frozen — only bug fixes and documentation polish before
+`1.0`. This release widens concurrency coverage and locks the thread-safety
+guarantees in at the type level.
+
+### Added
+
+- `tests/stress.rs` — every algorithm under real contention. Eight threads hammer
+  one hot key against the token bucket, the leaky bucket, the fixed window, the
+  sliding-window log, and the sliding-window counter; with the clock frozen,
+  each admits **exactly** the quota — proving the lock-free CAS paths and the
+  per-key `Mutex` paths are both correct under load (no over-admit, no lost
+  decrements, no deadlock).
+- Compile-time `Send + Sync + 'static` assertions for every public type:
+  `RateLimiter`, `AsyncLimiter`, `Decision`, `Quota`, `Eviction`, `Algorithm`,
+  `RateLimiterError`, and `Key`. The "shared across threads" promise is now
+  enforced by the compiler, not just documented.
+
+---
+
 ## [0.8.0] - 2026-05-29
 
 Alpha. The first-consumer shake-out: the public surface is validated the way a
@@ -349,7 +370,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/rate-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/rate-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/rate-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/rate-net/compare/v0.5.0...v0.6.0

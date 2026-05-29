@@ -62,3 +62,78 @@ fn stress_many_keys_never_over_or_under_admit() {
         );
     }
 }
+
+/// Every algorithm — token bucket (lock-free), leaky bucket (lock-free CAS),
+/// fixed window (lock-free packed atomic), and the sliding-window log/counter
+/// (per-key `Mutex`) — must hold its per-key limit under real concurrency on a
+/// single hot key. With the clock frozen, exactly the quota is admitted: never
+/// more (no over-admit, no torn updates) and never fewer (no lost decrements,
+/// no deadlock).
+#[cfg(feature = "algorithms")]
+#[test]
+fn stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
+    use rate_net::Algorithm;
+
+    const LIMIT: u32 = 200;
+    const THREADS: usize = 8;
+    const PASSES: u32 = 50; // THREADS * PASSES = 400 attempts > LIMIT
+
+    for algorithm in [
+        Algorithm::TokenBucket,
+        Algorithm::LeakyBucket,
+        Algorithm::FixedWindow,
+        Algorithm::SlidingWindowLog,
+        Algorithm::SlidingWindowCounter,
+    ] {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .algorithm(algorithm)
+                .per_second(LIMIT)
+                .clock(Arc::clone(&clock))
+                .build(),
+        );
+        let admitted = Arc::new(AtomicU32::new(0));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let limiter = Arc::clone(&limiter);
+            let admitted = Arc::clone(&admitted);
+            handles.push(thread::spawn(move || {
+                for _ in 0..PASSES {
+                    if limiter.check("hot").is_allow() {
+                        let _ = admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread panicked");
+        }
+
+        let total = admitted.load(Ordering::Relaxed);
+        assert_eq!(
+            total, LIMIT,
+            "{algorithm:?} admitted {total} under contention, expected exactly {LIMIT}"
+        );
+    }
+}
+
+/// The public surface promises the limiter is shared across threads. Lock these
+/// guarantees in at the *type* level so any regression surfaces at compile time
+/// rather than as a runtime test failure.
+#[test]
+fn public_types_are_send_sync_and_static() {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+    assert_send_sync_static::<rate_net::RateLimiter>();
+    assert_send_sync_static::<rate_net::Decision>();
+    assert_send_sync_static::<rate_net::Quota>();
+    assert_send_sync_static::<rate_net::Eviction>();
+    assert_send_sync_static::<rate_net::Algorithm>();
+    assert_send_sync_static::<rate_net::RateLimiterError>();
+    assert_send_sync_static::<rate_net::Key>();
+
+    #[cfg(feature = "async")]
+    assert_send_sync_static::<rate_net::AsyncLimiter>();
+}
