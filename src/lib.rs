@@ -19,24 +19,23 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0 **beta** (`0.9.0`): the **API is frozen** (since `0.7.0`) and locked
-//! in at the *type* level too — every public type is `Send + Sync + 'static`
-//! and that is asserted at compile time. The integration shake-out at `0.8.0`
-//! confirmed the surface is consumable through the public allow/deny API only,
-//! and `0.9.0` widens the concurrency coverage: a single hot key under eight
-//! threads against **every** algorithm admits exactly its quota — never more
-//! (no over-admit, no torn updates) and never fewer (no lost decrements, no
-//! deadlock). The five algorithms sit behind the one [`Limiter`] trait (token
-//! bucket by default; the leaky bucket and window algorithms under the
-//! `algorithms` feature), with the Tier-2 [`Builder`], an optional `AsyncLimiter`
-//! await-until-ready layer (`async` feature), runnable
+//! Pre-1.0 **release candidate** (`0.9.5`): the API is frozen (since `0.7.0`),
+//! locked at the *type* level (every public type is `Send + Sync + 'static`,
+//! asserted at compile time), proven under contention against every algorithm
+//! (eight threads on one hot key, exactly the quota — no over-admit, no lost
+//! decrement, no deadlock), validated through a representative gatekeeper
+//! consumer, and benchmark numbers held at the optimized baseline with no
+//! regression across the beta soak. The five algorithms sit behind the one
+//! [`Limiter`] trait (token bucket by default; the leaky bucket and window
+//! algorithms under the `algorithms` feature), with the Tier-2 [`Builder`], an
+//! optional `AsyncLimiter` await-until-ready layer (`async` feature), runnable
 //! [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
 //! `criterion` suite. Per-key state lives in a purpose-built **sharded store**
 //! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
 //! plus the algorithm's atomic accounting, so unrelated keys never contend),
 //! memory is **bounded by eviction**, and the steady-state check is
-//! **allocation-free**. From here, the only changes before `1.0` are bug fixes
-//! and documentation polish.
+//! **allocation-free**. Critical fixes and documentation polish only from here
+//! to `1.0`.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {

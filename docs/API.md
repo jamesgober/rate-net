@@ -18,11 +18,11 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.9.0`, beta) — API frozen.** The public surface
-> documented here will not change before `1.0` except for additive,
+> **Status: pre-1.0 (`v0.9.5`, release candidate) — API frozen.** The public
+> surface documented here will not change before `1.0` except for additive,
 > backward-compatible items. Every public type is asserted `Send + Sync +
 > 'static` at compile time, and every algorithm is stress-tested under
-> contention.
+> contention. Critical fixes and documentation polish only from here to `1.0`.
 > Five algorithms behind one [`Limiter`](#limiter-trait) trait, the Tier-2
 > [`Builder`](#builder), an optional [`AsyncLimiter`](#asynclimiter)
 > await-until-ready layer, runnable

@@ -22,6 +22,21 @@
 
 ---
 
+## [0.9.5] - 2026-05-29
+
+Release candidate. The beta soak surfaced no bugs and no API friction. Final
+benchmark numbers re-captured and unchanged from the `0.6.0` baseline (within
+~±2 ns noise across the four tracked paths). Critical fixes and documentation
+polish only before `1.0`.
+
+### Changed
+
+- Status declared **release candidate** in the lib, README, and API reference.
+- No functional changes; no breaking changes; the public surface is unchanged
+  from `0.7.0`.
+
+---
+
 ## [0.9.0] - 2026-05-29
 
 Beta. The surface stays frozen — only bug fixes and documentation polish before
@@ -370,7 +385,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/jamesgober/rate-net/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/rate-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/rate-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/rate-net/compare/v0.6.0...v0.7.0
