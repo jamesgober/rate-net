@@ -19,18 +19,18 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. As of `0.4.0` the algorithm suite is
-//! complete: the token bucket (default) plus — under the `algorithms` feature —
-//! the leaky bucket, fixed window, sliding-window log, and sliding-window
-//! counter, all behind the one [`Limiter`] trait and selectable through the
-//! Tier-2 [`Builder`]. Per-key state lives in a purpose-built **sharded store**
-//! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
-//! plus the algorithm's atomic accounting, so unrelated keys never contend),
-//! memory is **bounded by eviction** so a flood of unique keys hits a cap, and
-//! the steady-state check is **allocation-free**. Token-bucket accounting is
-//! delegated to [`better-bucket`](https://crates.io/crates/better-bucket); time
-//! comes from an injectable clock. Each algorithm carries its own `proptest`
-//! over-admit proof.
+//! Pre-1.0. As of `0.5.0` the crate is **feature complete** and features are
+//! frozen: the five algorithms behind the one [`Limiter`] trait (token bucket by
+//! default; the leaky bucket and window algorithms under the `algorithms`
+//! feature), the Tier-2 [`Builder`], an optional [`AsyncLimiter`] await-until-
+//! ready layer (`async` feature), runnable [`examples/`](https://github.com/jamesgober/rate-net/tree/main/examples),
+//! and a baseline `criterion` suite. Per-key state lives in a purpose-built
+//! **sharded store** (an existing-key [`check`](RateLimiter::check) takes only a
+//! shard read lock plus the algorithm's atomic accounting, so unrelated keys
+//! never contend), memory is **bounded by eviction**, and the steady-state check
+//! is **allocation-free**. Each algorithm carries its own `proptest` over-admit
+//! proof. What remains for `1.0` is optimization (the single-digit-nanosecond
+//! check and the comparative benchmark), hardening, and the stability soak.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -104,6 +104,8 @@
 mod algo;
 #[cfg(feature = "std")]
 mod algorithm;
+#[cfg(feature = "async")]
+mod async_limiter;
 #[cfg(feature = "std")]
 mod builder;
 #[cfg(feature = "std")]
@@ -123,6 +125,8 @@ mod store;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::Algorithm;
+#[cfg(feature = "async")]
+pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
 pub use crate::builder::Builder;
 #[cfg(feature = "std")]

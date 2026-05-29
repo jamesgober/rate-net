@@ -22,6 +22,40 @@
 
 ---
 
+## [0.5.0] - 2026-05-29
+
+Feature complete. Everything a consumer needs is in place — runnable examples,
+an optional async-wait layer, and a baseline benchmark suite — and features are
+frozen. The remaining work toward `1.0` is optimization, hardening, and the
+stability soak.
+
+### Added
+
+- `AsyncLimiter` (behind the `async` feature) — an await-until-ready wrapper.
+  `until_ready` / `until_ready_n` retry on each denial, sleeping for the reported
+  `retry_after` via `tokio::time`, until the key is admitted (or give up
+  immediately when the request can never succeed); `check` / `check_n` pass
+  straight through. The core stays sync and runtime-free — only this optional,
+  additive layer touches `tokio`.
+- `examples/` — runnable end-to-end demos: `per_second`, `per_key` (per-IP and
+  per-user), `mock_clock` (deterministic refill with no real sleep), and
+  `retry_after` (mapping a denial to HTTP `429` + `Retry-After`); plus
+  `algorithms` (requires `algorithms`) and `async_wait` (requires `async`).
+- A Criterion benchmark suite ([`benches/rate_bench.rs`](benches/rate_bench.rs)):
+  `single_key`, `many_keys` (shard scaling), `contended_single_key` (4 threads),
+  and `eviction_sweep`. Baseline numbers recorded in
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+### Changed
+
+- The optional `tokio` dependency is trimmed to its `time` feature (only the
+  timer is used). A `cfg(not(loom))` dev-dependency on `tokio` drives the async
+  tests and example without interfering with the `loom` model-check build.
+- **Feature freeze.** No new features are planned before `1.0`; subsequent
+  releases are optimization, hardening, and stabilization only.
+
+---
+
 ## [0.4.0] - 2026-05-29
 
 Extended. The full algorithm suite lands behind the one `Limiter` trait, each
@@ -216,7 +250,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/rate-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/rate-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/rate-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/rate-net/compare/v0.1.0...v0.2.0

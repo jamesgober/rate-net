@@ -18,11 +18,13 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.4.0`).** The algorithm suite is complete — five
-> algorithms behind one [`Limiter`](#limiter-trait) trait, selectable through the
-> Tier-2 [`Builder`](#builder) — over a sharded, bounded-memory, allocation-free
-> core. Everything documented here is callable now; the leaky bucket and window
-> algorithms require the `algorithms` feature.
+> **Status: pre-1.0 (`v0.5.0`, feature complete).** Five algorithms behind one
+> [`Limiter`](#limiter-trait) trait, the Tier-2 [`Builder`](#builder), an optional
+> [`AsyncLimiter`](#asynclimiter) await-until-ready layer, runnable
+> [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
+> baseline [benchmark suite](./BENCHMARKS.md) — over a sharded, bounded-memory,
+> allocation-free core. Features are frozen. The leaky bucket and window
+> algorithms require the `algorithms` feature; `AsyncLimiter` requires `async`.
 
 ## Table of Contents
 
@@ -40,6 +42,7 @@
     - [`check_n`](#ratelimitercheck_n)
     - [`quota` / `algorithm` / `shards` / `eviction` / `tracked_keys`](#ratelimiter-introspection)
   - [`Builder`](#builder)
+  - [`AsyncLimiter`](#asynclimiter) _(feature: `async`)_
   - [`Limiter` trait](#limiter-trait)
   - [`Decision`](#decision)
   - [`Quota`](#quota)
@@ -390,6 +393,47 @@ need.
 
 ---
 
+### `AsyncLimiter`
+
+_Requires the `async` feature._
+
+```rust
+pub struct AsyncLimiter<C: Clock + Clone = SystemClock> { /* private */ }
+```
+
+An await-until-ready wrapper around a [`RateLimiter`](#ratelimiter). The core is
+sync and runtime-free; this optional layer adds the one thing that needs a
+runtime — *waiting* for a key to become allowed.
+
+- `new(RateLimiter<C>) -> AsyncLimiter<C>` (also `From<RateLimiter<C>>`);
+  `inner() -> &RateLimiter<C>`, `into_inner() -> RateLimiter<C>`.
+- `check(key) -> Decision`, `check_n(key, n) -> Decision` — synchronous
+  pass-throughs.
+- `async until_ready(key)`, `async until_ready_n(key, n)` — retry on each
+  denial, sleeping for the reported `retry_after` (via `tokio::time::sleep`),
+  until the key is admitted. Returns immediately if the request can never
+  succeed (a `retry_after` of `Duration::MAX`), so it never waits forever.
+
+`until_ready` needs a clock that actually advances (the default `SystemClock`);
+under a frozen `ManualClock` the allowance never refills, so it would wait
+indefinitely.
+
+```rust
+use rate_net::{AsyncLimiter, RateLimiter};
+
+# async fn demo() {
+let limiter = AsyncLimiter::new(RateLimiter::per_second(100));
+
+// Non-blocking, same as the sync API.
+let _ = limiter.check("user:42");
+
+// Or await until the key is within its limit.
+limiter.until_ready("user:42").await;
+# }
+```
+
+---
+
 ### `Limiter` trait
 
 ```rust
@@ -732,7 +776,7 @@ proof.
 |---------|---------|-------------|
 | `std`        | yes | Standard library. Enables the limiter — the purpose-built sharded store, the token-bucket core (`better-bucket`'s `clock` feature), the injectable clock (`clock-lib`), and the error type (`error-forge`). With it off the crate is `no_std` and exposes only [`VERSION`](#version). |
 | `algorithms` | no  | The leaky bucket and the window algorithms (fixed, sliding-log, sliding-counter), and their [`Algorithm`](#algorithm) variants. The token bucket is always available without it. |
-| `async`      | no  | Optional additive async-friendly wrapper. Implies `std`. |
+| `async`      | no  | The [`AsyncLimiter`](#asynclimiter) await-until-ready wrapper. Additive; implies `std`. Only this layer touches a runtime (`tokio`'s timer). |
 
 ---
 

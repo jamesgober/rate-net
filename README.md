@@ -33,15 +33,17 @@
 
 <br>
 
-> **Status — pre-release (`v0.4.0`).** Feature-rich and proven: all five
-> algorithms (token bucket by default; leaky bucket, fixed window, sliding-window
-> log, and sliding-window counter under the `algorithms` feature) sit behind one
-> `Limiter` trait and the Tier-2 builder, each with its own `proptest` over-admit
-> proof. The concurrent core is real — a tunable **sharded store** where
-> unrelated keys never contend, memory **bounded by eviction**, and an
-> **allocation-free** steady-state check — all verified by `loom`, a
-> multi-threaded stress test, and an allocation audit. The remaining work toward
-> `1.0` is benchmarking, hardening, and the soak; the public surface is settling.
+> **Status — pre-release (`v0.5.0`, feature complete).** Features are frozen: all
+> five algorithms (token bucket by default; leaky bucket, fixed window,
+> sliding-window log, and sliding-window counter under the `algorithms` feature)
+> behind one `Limiter` trait and the Tier-2 builder, each with its own `proptest`
+> over-admit proof; an optional await-until-ready async layer; runnable
+> [examples](./examples); and a baseline [benchmark suite](./docs/BENCHMARKS.md).
+> The concurrent core is a tunable **sharded store** where unrelated keys never
+> contend, memory **bounded by eviction**, and an **allocation-free** steady-state
+> check — verified by `loom`, a multi-threaded stress test, and an allocation
+> audit. The remaining work toward `1.0` is optimization (the single-digit-ns
+> check and a `governor` comparison), hardening, and the stability soak.
 
 <br>
 
@@ -81,10 +83,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rate-net = "0.1"
+rate-net = "0.5"
 
 # Full algorithm suite + optional async layer:
-rate-net = { version = "0.1", features = ["algorithms", "async"] }
+rate-net = { version = "0.5", features = ["algorithms", "async"] }
 ```
 
 <hr>
@@ -187,17 +189,59 @@ assert!(limiter.check("k").is_allow());
 
 <br>
 
+## Awaiting (async)
+
+The core is sync and runtime-free — `check` never blocks. When you'd rather
+*wait* for a key to become allowed than shed the request, the optional `async`
+feature wraps a limiter in an `AsyncLimiter` whose `until_ready` awaits until the
+key is admitted (sleeping for the reported `retry_after`):
+
+```rust
+use rate_net::{AsyncLimiter, RateLimiter};
+
+# async fn demo() {
+let limiter = AsyncLimiter::new(RateLimiter::per_second(100));
+
+// Non-blocking, allow/deny — same as the sync API.
+let _ = limiter.check("user:42");
+
+// Or await until the key is within its limit.
+limiter.until_ready("user:42").await;
+# }
+```
+
+Only this layer touches a runtime (`tokio`'s timer), and only under the `async`
+feature; the core never depends on one.
+
+<br>
+
+## Examples
+
+Runnable, self-contained demos in [`examples/`](./examples):
+
+```bash
+cargo run --example per_second    # Tier-1: N requests/second per key
+cargo run --example per_key       # per-IP and per-user, independent allowances
+cargo run --example mock_clock    # deterministic refill with a ManualClock
+cargo run --example retry_after   # mapping a denial to HTTP 429 + Retry-After
+
+cargo run --example algorithms --features algorithms  # compare all five algorithms
+cargo run --example async_wait   --features async      # await until allowed
+```
+
+<br>
+
 ## Feature Flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std`        | ✅ | Standard library. Required for the sharded store and eviction. |
 | `algorithms` | ❌ | The full suite beyond the default token bucket (leaky, fixed window, sliding-window log, sliding-window counter). |
-| `async`      | ❌ | Optional async-friendly wrapper layer. Additive — the core has no runtime dependency. |
+| `async`      | ❌ | `AsyncLimiter` with `until_ready` (await until a key is allowed). Additive — only this layer touches a runtime; the core does not. |
 
 ```toml
 # Everything:
-rate-net = { version = "0.1", features = ["algorithms", "async"] }
+rate-net = { version = "0.5", features = ["algorithms", "async"] }
 ```
 
 <br>
@@ -224,18 +268,25 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Performance
 
-The single-key `check` is designed to land in single-digit nanoseconds in
-steady state, and many-key throughput scales near-linearly with shard count.
-The Criterion suite covers single-key, many-key (shard scaling), contended
-single-key, and eviction-sweep cost:
+Baseline Criterion means at the `v0.5.0` feature freeze (Windows x86_64, Rust
+stable, `opt-level = 3`). These are **pre-optimization** — `0.6` tightens the
+check path (one keyed hash for both shard selection and the map probe, a faster
+hasher) and adds the head-to-head comparison against `governor`.
+
+| Path | Median |
+|------|-------:|
+| Single-key check | ~77 ns |
+| Many-key check (64 shards) | ~99 ns |
+| Contended single key (4 threads) | ~76 ns/op |
+| Eviction sweep (cold insert at cap) | ~287 ns |
 
 ```bash
 cargo bench --bench rate_bench
 ```
 
-A head-to-head comparison against `governor` (and `tower`'s limiters where
-comparable) ships with the performance write-up as the suite matures toward
-1.0, numbers recorded honestly.
+Full method and per-path notes are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+A head-to-head comparison against `governor` ships with the `0.6` optimization
+pass, numbers recorded honestly.
 
 <br>
 
