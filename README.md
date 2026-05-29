@@ -33,14 +33,15 @@
 
 <br>
 
-> **Status — pre-release (`v0.1.0`).** This is the scaffold milestone: the crate
-> metadata, the cross-platform CI quality gates, and the documented shape of the
-> API are in place, but the rate-limiting logic is not implemented yet. The
-> examples below describe the **target** API that lands across the `0.x` series —
-> the `Decision` result and the `RateLimiter` trait in `v0.2.0`, the sharded
-> lock-free core with bounded eviction in `v0.3.0`, and the full algorithm suite
-> in `v0.4.0`. Until then the only callable item is the `rate_net::VERSION`
-> constant. The roadmap drives the order in which the surface below becomes real.
+> **Status — pre-release (`v0.2.0`).** The public API shape is locked and the
+> one-line Tier-1 path works today: `RateLimiter::per_second(n)` then
+> `limiter.check(key)`, backed by a token bucket and an injectable clock. Per-key
+> state currently lives in a concurrent map; the **tunable sharded store with
+> bounded-memory eviction** and the **zero-allocation steady state** land in
+> `v0.3.0`, the **leaky-bucket, fixed-window, and sliding-window algorithms** in
+> `v0.4.0`, and the **Tier-2 builder** (custom burst, shard count, eviction
+> policy) alongside them. Examples for those not-yet-shipped surfaces describe
+> the target API; the roadmap drives the order in which they become real.
 
 <br>
 
@@ -114,6 +115,10 @@ id, an API token, an endpoint name.
 
 ## Configured Limiter (Tier 2)
 
+> _Planned for `v0.4`._ The builder below lands with the full algorithm suite.
+> Today, use `RateLimiter::with_quota(Quota::rate(limit, period)?)` for an
+> explicit per-second/per-minute/per-duration quota.
+
 Choose the algorithm, quota, burst, shard count, and eviction policy:
 
 ```rust
@@ -156,22 +161,24 @@ reimplement it.
 ## Deterministic Testing (mockable clock)
 
 ```rust
-use rate_net::{RateLimiter, Decision};
+use rate_net::RateLimiter;
 use clock_lib::ManualClock;
+use std::sync::Arc;
 use std::time::Duration;
 
-let clock = ManualClock::new();
-let limiter = RateLimiter::per_second(5).with_clock(clock.clone());
+// Share the clock with the limiter via `Arc`, then drive it by hand.
+let clock = Arc::new(ManualClock::new());
+let limiter = RateLimiter::per_second(5).with_clock(Arc::clone(&clock));
 
 // Drain the key's quota.
 for _ in 0..5 {
-    assert!(matches!(limiter.check("k"), Decision::Allow));
+    assert!(limiter.check("k").is_allow());
 }
-assert!(matches!(limiter.check("k"), Decision::Deny { .. }));
+assert!(limiter.check("k").is_deny());
 
-// Advance one second — no real sleep.
+// Advance one second — no real sleep — and the allowance is back.
 clock.advance(Duration::from_secs(1));
-assert!(matches!(limiter.check("k"), Decision::Allow));
+assert!(limiter.check("k").is_allow());
 ```
 
 <br>

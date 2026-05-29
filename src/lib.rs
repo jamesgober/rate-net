@@ -19,15 +19,19 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. This `0.1.0` release is the **scaffold**:
-//! it establishes the crate metadata, the quality-gate tooling, and the
-//! documented shape of the API that lands across the `0.x` series. There is no
-//! rate-limiting logic yet — the foundation API (the [`Decision`](#) result and
-//! the `RateLimiter` trait) arrives in `0.2.0`, and the real sharded, lock-free,
-//! bounded-memory core in `0.3.0`. The surface below is the target the
-//! documentation describes; it is not callable in this release.
+//! Pre-1.0, under active development. This `0.2.0` release lands the
+//! **foundation**: the public shape is locked — the [`Decision`] result, the
+//! [`Quota`] and [`Algorithm`] types, the [`RateLimiterError`], and the
+//! [`Limiter`] trait — alongside a correct single-key token-bucket
+//! [`RateLimiter`] that delegates its accounting to
+//! [`better-bucket`](https://crates.io/crates/better-bucket) and reads time from
+//! an injectable clock. Per-key state lives in a concurrent map today; the
+//! tunable sharded store with bounded-memory eviction and the zero-allocation
+//! steady state arrive in `0.3.0`, and the remaining algorithms in `0.4.0`. The
+//! example below is callable now.
 //!
-//! ```text
+//! ```
+//! # #[cfg(feature = "std")] {
 //! use rate_net::{RateLimiter, Decision};
 //!
 //! // 100 requests per second, per key.
@@ -38,9 +42,12 @@
 //!         // allowed — serve the request
 //!     }
 //!     Decision::Deny { retry_after } => {
-//!         // denied — return 429 with Retry-After: {retry_after}
+//!         // denied — return 429 with `Retry-After: retry_after`
+//!         let _ = retry_after;
 //!     }
+//!     _ => {}
 //! }
+//! # }
 //! ```
 //!
 //! ## Design goals
@@ -88,6 +95,35 @@
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+// The limiter surface requires the standard library (the concurrent per-key
+// store, the clock-driven token bucket, and the domain error type). With `std`
+// off the crate is no_std and exposes only `VERSION`.
+#[cfg(feature = "std")]
+mod algorithm;
+#[cfg(feature = "std")]
+mod decision;
+#[cfg(feature = "std")]
+mod error;
+#[cfg(feature = "std")]
+mod key;
+#[cfg(feature = "std")]
+mod limiter;
+#[cfg(feature = "std")]
+mod quota;
+
+#[cfg(feature = "std")]
+pub use crate::algorithm::Algorithm;
+#[cfg(feature = "std")]
+pub use crate::decision::Decision;
+#[cfg(feature = "std")]
+pub use crate::error::RateLimiterError;
+#[cfg(feature = "std")]
+pub use crate::key::Key;
+#[cfg(feature = "std")]
+pub use crate::limiter::{Limiter, RateLimiter};
+#[cfg(feature = "std")]
+pub use crate::quota::Quota;
+
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///
 /// Exposed so a consumer can report the exact `rate-net` build it links
@@ -99,7 +135,7 @@
 /// ```
 /// // Reports the current 0.x series and carries a major.minor.patch core.
 /// let version = rate_net::VERSION;
-/// assert!(version.starts_with("0.1"));
+/// assert!(version.starts_with("0."));
 /// assert_eq!(version.split('.').count(), 3);
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

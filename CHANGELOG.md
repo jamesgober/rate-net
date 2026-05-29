@@ -22,6 +22,53 @@
 
 ---
 
+## [0.2.0] - 2026-05-28
+
+Foundation. The public API shape is locked and a correct single-key
+token-bucket limiter ships behind it. Per-key state lives in a concurrent map;
+the tunable sharded store with bounded-memory eviction and the zero-allocation
+steady state arrive in `0.3.0`, and the remaining algorithms in `0.4.0`.
+
+### Added
+
+- `RateLimiter` — the keyed rate limiter. Tier-1 constructors
+  `per_second(limit)` and `per_minute(limit)` (infallible) plus `with_quota`,
+  the `check(key)` / `check_n(key, n)` request path, the `with_clock`
+  clock-injection seam, and `quota` / `algorithm` / `tracked_keys`
+  introspection. The default token-bucket accounting is delegated to
+  `better-bucket`; time is read from an injectable `clock-lib` clock. `Send +
+  Sync`; a `Debug` impl that never prints keys.
+- `Limiter` trait — the shared surface every algorithm implements, so generic
+  code can hold any limiter and call `check` without naming the concrete type.
+- `Decision` (`#[non_exhaustive]`) — `Allow` / `Deny { retry_after }`, with
+  `is_allow` / `is_deny` / `retry_after` helpers and a `From<better_bucket::Decision>`
+  bridge.
+- `Quota` — `per_second` / `per_minute` (infallible) and the validated
+  `rate(limit, period)` constructor.
+- `Algorithm` (`#[non_exhaustive]`) — the algorithm selector; defaults to
+  `TokenBucket`, the only variant wired in this release.
+- `RateLimiterError` (`#[non_exhaustive]`) — construction-time validation
+  errors (`ZeroQuota`, `ZeroPeriod`), implemented on `error-forge`'s
+  `ForgeError` for portfolio-wide error metadata.
+- `Key` — the opaque per-key identity, with `From` conversions for `&str`,
+  `String`, `&[u8]`, `Vec<u8>`, `u64`, and `IpAddr`.
+- `tests/proptest_overadmit.rs` — the per-algorithm over-admit invariant
+  (`proptest`): across any interleaving of checks and time advances a key is
+  never admitted beyond its quota, and distinct keys are accounted
+  independently.
+- `MockClock`-driven unit tests covering quota exhaustion, refill across a
+  window, partial refill, per-key independence, `check_n`, the `n = 0` and
+  `n > quota` edges, and the zero-limit case — all deterministic, no `sleep`.
+
+### Changed
+
+- The `std` feature now also pulls in `better-bucket` (with its `clock`
+  feature), `clock-lib`, and `error-forge`; these power the limiter and were
+  made optional so the no_std build (which still exposes only `VERSION`) stays
+  dependency-light.
+
+---
+
 ## [0.1.0] - 2026-05-28
 
 Initial scaffold and repository bootstrap. No rate-limiting logic yet — this
@@ -86,6 +133,7 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamesgober/rate-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/rate-net/releases/tag/v0.1.0
 [`VERSION`]: https://docs.rs/rate-net/latest/rate_net/constant.VERSION.html
