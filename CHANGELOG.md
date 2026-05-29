@@ -22,6 +22,40 @@
 
 ---
 
+## [1.0.0] - 2026-05-29
+
+**Stable.** The public API is frozen until `2.0`. The `0.9.5` release candidate
+soaked clean — no bugs and no friction from real consumption — and is promoted
+to `1.0.0` with no functional changes, only the status declaration and
+documentation polish. Pinning `rate-net = "1"` is now the supported install.
+
+### Changed
+
+- Status declared **stable (`1.0.0`)** in the lib, README, and API reference.
+- README install snippets and the API quickstart use `rate-net = "1"`.
+- `docs/BENCHMARKS.md` re-anchored at the `v1.0.0` tag; the four tracked paths
+  (single-key, many-key, contended single key, eviction sweep) remained within
+  ~±2 ns of the `0.6.0` baseline through the beta and RC soak — sample-to-sample
+  variance, not regression.
+- `VERSION` doctest re-anchored from the `0.x` series to a generic SemVer
+  `major.minor.patch` shape check.
+- Historical pre-RC release notes (`docs/release/v0.1.0`..`v0.8.0`) removed; the
+  immediate pre-release line (`v0.9.0`, `v0.9.5`) is kept for context. The full
+  pre-`1.0` history remains in this changelog.
+
+### Notes
+
+- **No breaking changes.** The public surface — `RateLimiter` and its methods,
+  `Builder`, `AsyncLimiter`, `Limiter`, `Decision`, `Quota`, `Eviction`,
+  `Algorithm`, `RateLimiterError`, `Key`, `VERSION`, and the `DEFAULT_MAX_KEYS`
+  constant — is unchanged from `0.7.0` and is now frozen until `2.0`.
+- The honest head-to-head against `governor` is unchanged: rate-net's per-key
+  overhead is competitive once the clock is held equal, and the path to beating
+  `governor` end-to-end remains a faster monotonic source in `clock-lib` (raised
+  as a separate sibling enhancement).
+
+---
+
 ## [0.9.5] - 2026-05-29
 
 Release candidate. The beta soak surfaced no bugs and no API friction. Final
@@ -385,7 +419,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/rate-net/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/rate-net/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/rate-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/rate-net/compare/v0.7.0...v0.8.0

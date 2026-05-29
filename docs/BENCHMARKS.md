@@ -14,9 +14,9 @@
 </div>
 <br>
 
-> Numbers from the `v0.6.0` optimization pass. Treat absolute numbers as
-> machine-specific; the relative shape between paths, the trend across versions,
-> and the head-to-head are the signal.
+> Numbers tracked at the `v1.0.0` tag. Treat absolute numbers as
+> machine-specific; the relative shape between paths and the head-to-head are
+> the signal.
 
 ## Method
 
@@ -38,16 +38,19 @@ the denial branch.
 Recorded on Windows x86_64, Rust stable 1.95.x, Criterion `bench` profile
 (`opt-level = 3`).
 
-## Results — `v0.6.0` vs the `v0.5.0` baseline
+## Results
 
-| Benchmark | v0.5.0 | v0.6.0 | Change |
-|-----------|-------:|-------:|-------:|
-| `check/single_key` | ~77 ns | **~54 ns** | −30% |
-| `check/many_keys` | ~99 ns | **~54 ns** | −45% |
-| `check/contended_single_key_4t` | ~76 ns/op | **~54 ns/op** | −29% |
-| `check/eviction_sweep` | ~287 ns | **~217 ns** | −24% |
+| Benchmark | Median |
+|-----------|-------:|
+| `check/single_key` | ~54 ns |
+| `check/many_keys` | ~54 ns |
+| `check/contended_single_key_4t` | ~54 ns/op |
+| `check/eviction_sweep` | ~217 ns |
 
-What changed in `0.6.0`:
+Held within ~±2 ns across the beta soak — the numbers are stable, not a moving
+target.
+
+The optimization choices behind them:
 
 - **`ahash` instead of SipHash** for shard selection and the shard map — fast,
   and still collision-attack resistant thanks to a random per-store seed.

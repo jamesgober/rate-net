@@ -19,23 +19,22 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0 **release candidate** (`0.9.5`): the API is frozen (since `0.7.0`),
-//! locked at the *type* level (every public type is `Send + Sync + 'static`,
-//! asserted at compile time), proven under contention against every algorithm
-//! (eight threads on one hot key, exactly the quota — no over-admit, no lost
-//! decrement, no deadlock), validated through a representative gatekeeper
-//! consumer, and benchmark numbers held at the optimized baseline with no
-//! regression across the beta soak. The five algorithms sit behind the one
-//! [`Limiter`] trait (token bucket by default; the leaky bucket and window
-//! algorithms under the `algorithms` feature), with the Tier-2 [`Builder`], an
-//! optional `AsyncLimiter` await-until-ready layer (`async` feature), runnable
+//! **Stable (`1.0.0`).** The public API is frozen until `2.0`. The five
+//! algorithms sit behind the one [`Limiter`] trait (token bucket by default; the
+//! leaky bucket and window algorithms under the `algorithms` feature), with the
+//! Tier-2 [`Builder`], an optional `AsyncLimiter` await-until-ready layer
+//! (`async` feature), runnable
 //! [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
 //! `criterion` suite. Per-key state lives in a purpose-built **sharded store**
 //! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
 //! plus the algorithm's atomic accounting, so unrelated keys never contend),
 //! memory is **bounded by eviction**, and the steady-state check is
-//! **allocation-free**. Critical fixes and documentation polish only from here
-//! to `1.0`.
+//! **allocation-free**. Every public type is `Send + Sync + 'static`, asserted
+//! at compile time. The safety invariants — never over-admit, bounded memory —
+//! are proved by `proptest` (per algorithm), `loom`, a multi-threaded stress
+//! suite across every algorithm, an allocation audit, and an adversarial-traffic
+//! suite, and the surface is validated through a representative gatekeeper
+//! consumer.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -156,10 +155,10 @@ pub use crate::quota::Quota;
 /// # Examples
 ///
 /// ```
-/// // Reports the current 0.x series and carries a major.minor.patch core.
+/// // Carries a `major.minor.patch` SemVer core.
 /// let version = rate_net::VERSION;
-/// assert!(version.starts_with("0."));
 /// assert_eq!(version.split('.').count(), 3);
+/// assert!(version.split('.').all(|part| !part.is_empty()));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

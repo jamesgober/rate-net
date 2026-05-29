@@ -33,21 +33,18 @@
 
 <br>
 
-> **Status — pre-release (`v0.9.5`, release candidate) — API frozen.** The public
-> surface is fixed through `1.0`; `Send + Sync + 'static` is locked in at the type
-> level; every algorithm is concurrency-stressed (eight threads on one hot key —
-> each admits exactly its quota); validated against a representative gatekeeper
-> consumer (the `bouncer-io` integration pattern); proved under `loom`,
-> `proptest`, and an adversarial-traffic suite; and benchmark numbers held at
-> the optimized baseline across the beta soak. All five algorithms (token bucket
-> by default; leaky bucket, fixed window, sliding-window log, and sliding-window
-> counter under the `algorithms` feature) behind one `Limiter` trait and the
-> Tier-2 builder; an optional await-until-ready async layer; runnable
-> [examples](./examples); a [benchmark suite](./docs/BENCHMARKS.md) with an
-> honest head-to-head vs `governor`. The concurrent core is a tunable **sharded
-> store** where unrelated keys never contend, memory **bounded by eviction**,
-> and an **allocation-free** steady-state check. From here to `1.0`: critical
-> fixes and documentation polish only.
+> **Stable (`v1.0.0`).** The public API is frozen until `2.0`. Five algorithms
+> (token bucket by default; leaky bucket, fixed window, sliding-window log, and
+> sliding-window counter under the `algorithms` feature) behind one `Limiter`
+> trait and the Tier-2 builder; an optional await-until-ready async layer;
+> runnable [examples](./examples); a [benchmark suite](./docs/BENCHMARKS.md)
+> with an honest head-to-head vs `governor`. The concurrent core is a tunable
+> **sharded store** where unrelated keys never contend, memory **bounded by
+> eviction**, and an **allocation-free** steady-state check. The safety
+> invariants are proved by `proptest` (per algorithm), `loom`, multi-threaded
+> stress across every algorithm, an allocation audit, an adversarial-traffic
+> suite, and a representative gatekeeper consumer; `Send + Sync + 'static` is
+> locked in at the type level.
 
 <br>
 
@@ -87,10 +84,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rate-net = "0.5"
+rate-net = "1"
 
 # Full algorithm suite + optional async layer:
-rate-net = { version = "0.5", features = ["algorithms", "async"] }
+rate-net = { version = "1", features = ["algorithms", "async"] }
 ```
 
 <hr>
@@ -245,7 +242,7 @@ cargo run --example async_wait   --features async      # await until allowed
 
 ```toml
 # Everything:
-rate-net = { version = "0.5", features = ["algorithms", "async"] }
+rate-net = { version = "1", features = ["algorithms", "async"] }
 ```
 
 <br>
@@ -272,15 +269,15 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Performance
 
-Criterion means after the `v0.6.0` optimization pass (Windows x86_64, Rust
-stable, `opt-level = 3`):
+Criterion medians at the `v1.0.0` tag (Windows x86_64, Rust stable,
+`opt-level = 3`):
 
-| Path | v0.5.0 | v0.6.0 |
-|------|-------:|-------:|
-| Single-key check | ~77 ns | **~54 ns** |
-| Many-key check (64 shards) | ~99 ns | **~54 ns** |
-| Contended single key (4 threads) | ~76 ns/op | **~54 ns/op** |
-| Eviction sweep (cold insert at cap) | ~287 ns | **~217 ns** |
+| Path | Median |
+|------|-------:|
+| Single-key check | ~54 ns |
+| Many-key check (64 shards) | ~54 ns |
+| Contended single key (4 threads) | ~54 ns/op |
+| Eviction sweep (cold insert at cap) | ~217 ns |
 
 ```bash
 cargo bench --bench rate_bench
