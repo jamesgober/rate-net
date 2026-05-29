@@ -18,8 +18,10 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.7.0`) — API frozen.** The public surface documented here
-> will not change before `1.0` except for additive, backward-compatible items.
+> **Status: pre-1.0 (`v0.8.0`, alpha) — API frozen.** The public surface
+> documented here will not change before `1.0` except for additive,
+> backward-compatible items, and is validated against a representative gatekeeper
+> consumer (the `bouncer-io` integration pattern) through this API only.
 > Five algorithms behind one [`Limiter`](#limiter-trait) trait, the Tier-2
 > [`Builder`](#builder), an optional [`AsyncLimiter`](#asynclimiter)
 > await-until-ready layer, runnable

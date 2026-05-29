@@ -22,6 +22,33 @@
 
 ---
 
+## [0.8.0] - 2026-05-29
+
+Alpha. The first-consumer shake-out: the public surface is validated the way a
+real gatekeeper (`bouncer-io`) integrates it, confirming the allow/deny boundary
+holds. The integration needed no API additions, so the surface stays frozen.
+
+### Added
+
+- `tests/consumer_pattern.rs` — a representative gatekeeper coded against the
+  `Limiter` trait (not the concrete type), keying by caller identity (IP / user),
+  turning a `Decision` into an HTTP-shaped verdict, and shared across threads via
+  `Arc`. Covers per-identity isolation, honest retry-after, exact per-client
+  limits under concurrency, every configured algorithm, and an async
+  (await-until-ready) gatekeeper. The consumer touches **only** the public API —
+  never any internal state.
+- `examples/gatekeeper.rs` — a runnable minimal HTTP-style gatekeeper that limits
+  per client IP and returns `429` + `Retry-After`, using only the public surface.
+
+### Notes
+
+- The integration read naturally with no friction: no new public items were
+  needed, so the frozen API is confirmed consumable. The "consumers call the
+  API, never touch internal state" boundary is enforced by visibility and
+  demonstrated by the gatekeeper.
+
+---
+
 ## [0.7.0] - 2026-05-29
 
 Hardening and **API freeze**. The limiter is exercised against the threat model
@@ -322,7 +349,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/rate-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/rate-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/rate-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/rate-net/compare/v0.4.0...v0.5.0
