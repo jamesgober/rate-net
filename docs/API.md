@@ -18,13 +18,15 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.5.0`, feature complete).** Five algorithms behind one
-> [`Limiter`](#limiter-trait) trait, the Tier-2 [`Builder`](#builder), an optional
-> [`AsyncLimiter`](#asynclimiter) await-until-ready layer, runnable
+> **Status: pre-1.0 (`v0.6.0`).** Feature-frozen and optimized. Five algorithms
+> behind one [`Limiter`](#limiter-trait) trait, the Tier-2 [`Builder`](#builder),
+> an optional [`AsyncLimiter`](#asynclimiter) await-until-ready layer, runnable
 > [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
-> baseline [benchmark suite](./BENCHMARKS.md) — over a sharded, bounded-memory,
-> allocation-free core. Features are frozen. The leaky bucket and window
-> algorithms require the `algorithms` feature; `AsyncLimiter` requires `async`.
+> [benchmark suite](./BENCHMARKS.md) (with an honest head-to-head vs `governor`) —
+> over a sharded, bounded-memory, allocation-free core. The leaky bucket and
+> window algorithms require the `algorithms` feature; `AsyncLimiter` requires
+> `async`. Everything documented here is callable now and the public surface is
+> stable through the `0.x` hardening releases.
 
 ## Table of Contents
 

@@ -38,8 +38,14 @@ jobs:
         run: cargo test --all-features
       - name: Test (default features)
         run: cargo test
-      - name: Doc
+      - name: Doc (all features)
         run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      # Feature-gated items must not leave broken intra-doc links in the
+      # always-compiled crate docs, so doc the lean default build too.
+      - name: Doc (default features)
+        run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 

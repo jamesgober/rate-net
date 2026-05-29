@@ -33,17 +33,17 @@
 
 <br>
 
-> **Status — pre-release (`v0.5.0`, feature complete).** Features are frozen: all
-> five algorithms (token bucket by default; leaky bucket, fixed window,
-> sliding-window log, and sliding-window counter under the `algorithms` feature)
-> behind one `Limiter` trait and the Tier-2 builder, each with its own `proptest`
-> over-admit proof; an optional await-until-ready async layer; runnable
-> [examples](./examples); and a baseline [benchmark suite](./docs/BENCHMARKS.md).
-> The concurrent core is a tunable **sharded store** where unrelated keys never
-> contend, memory **bounded by eviction**, and an **allocation-free** steady-state
-> check — verified by `loom`, a multi-threaded stress test, and an allocation
-> audit. The remaining work toward `1.0` is optimization (the single-digit-ns
-> check and a `governor` comparison), hardening, and the stability soak.
+> **Status — pre-release (`v0.6.0`, feature-frozen and optimized).** All five
+> algorithms (token bucket by default; leaky bucket, fixed window, sliding-window
+> log, and sliding-window counter under the `algorithms` feature) behind one
+> `Limiter` trait and the Tier-2 builder, each with its own `proptest` over-admit
+> proof; an optional await-until-ready async layer; runnable [examples](./examples);
+> and a [benchmark suite](./docs/BENCHMARKS.md) with an honest head-to-head vs
+> `governor`. The concurrent core is a tunable **sharded store** where unrelated
+> keys never contend, memory **bounded by eviction**, and an **allocation-free**
+> steady-state check — verified by `loom`, a multi-threaded stress test, and an
+> allocation audit. `0.6` cut the per-check overhead (`ahash`, no redundant clock
+> read); the remaining work toward `1.0` is hardening and the stability soak.
 
 <br>
 
@@ -268,25 +268,27 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Performance
 
-Baseline Criterion means at the `v0.5.0` feature freeze (Windows x86_64, Rust
-stable, `opt-level = 3`). These are **pre-optimization** — `0.6` tightens the
-check path (one keyed hash for both shard selection and the map probe, a faster
-hasher) and adds the head-to-head comparison against `governor`.
+Criterion means after the `v0.6.0` optimization pass (Windows x86_64, Rust
+stable, `opt-level = 3`):
 
-| Path | Median |
-|------|-------:|
-| Single-key check | ~77 ns |
-| Many-key check (64 shards) | ~99 ns |
-| Contended single key (4 threads) | ~76 ns/op |
-| Eviction sweep (cold insert at cap) | ~287 ns |
+| Path | v0.5.0 | v0.6.0 |
+|------|-------:|-------:|
+| Single-key check | ~77 ns | **~54 ns** |
+| Many-key check (64 shards) | ~99 ns | **~54 ns** |
+| Contended single key (4 threads) | ~76 ns/op | **~54 ns/op** |
+| Eviction sweep (cold insert at cap) | ~287 ns | **~217 ns** |
 
 ```bash
 cargo bench --bench rate_bench
 ```
 
-Full method and per-path notes are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
-A head-to-head comparison against `governor` ships with the `0.6` optimization
-pass, numbers recorded honestly.
+A head-to-head against [`governor`](https://crates.io/crates/governor) is
+recorded honestly: `governor` is currently faster (~17 ns vs ~44 ns single-key),
+almost entirely because it reads a TSC-based `quanta` clock (~5 ns) while rate-net
+reads `Instant::now()` (~20 ns on Windows) through `better-bucket` / `clock-lib`.
+rate-net's own per-key overhead is competitive; closing the gap needs a faster
+monotonic clock in `clock-lib`. Full method, numbers, and analysis in
+[`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 <br>
 

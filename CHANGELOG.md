@@ -22,6 +22,48 @@
 
 ---
 
+## [0.6.0] - 2026-05-29
+
+Optimization. The per-check overhead is cut substantially, with the work profiled
+and the results — including an honest head-to-head against `governor` — recorded
+in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). No new features; no breaking
+changes.
+
+### Changed
+
+- **Hashing** — shard selection and the shard map now use `ahash` instead of
+  SipHash: fast, and still collision-attack resistant thanks to a random
+  per-store seed.
+- **No redundant clock read on the hot path** — for the default path (token
+  bucket + capacity-only eviction) the limiter no longer reads the clock at all.
+  `better-bucket` already reads it for refill, and least-recently-seen eviction
+  now orders by a cheap per-shard logical counter rather than wall time. The
+  clock is read only when a window algorithm or an idle TTL needs real time.
+- `#[inline]` on the check path so it inlines across the crate boundary.
+- Net effect on the tracked baselines (Windows x86_64): single-key check
+  ~77 ns → ~54 ns, many-key ~99 ns → ~54 ns, eviction sweep ~287 ns → ~217 ns.
+
+### Added
+
+- `benches/comparison.rs` — a head-to-head against `governor`, gated on
+  `cfg(comparison)` (via `RUSTFLAGS="--cfg comparison"`) so the heavy
+  benchmark-only dependency never enters the default tree, `--all-features`, or
+  CI.
+- An `ahash` dependency, pulled in by `std`.
+- CI now also docs the default feature set, catching broken intra-doc links to
+  feature-gated items in the always-compiled crate docs.
+
+### Notes
+
+- `governor` is currently faster (~17 ns vs ~44 ns single-key), almost entirely
+  because it reads a TSC-based `quanta` clock (~5 ns) while rate-net reads
+  `clock-lib`'s `Instant::now()` (~20 ns on Windows). rate-net's own per-key
+  overhead is competitive; beating `governor` end-to-end needs a faster monotonic
+  clock in `clock-lib` (a sibling enhancement). This is documented honestly
+  rather than worked around.
+
+---
+
 ## [0.5.0] - 2026-05-29
 
 Feature complete. Everything a consumer needs is in place — runnable examples,
@@ -250,7 +292,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/rate-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/rate-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/rate-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/rate-net/compare/v0.2.0...v0.3.0

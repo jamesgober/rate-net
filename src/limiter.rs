@@ -105,6 +105,11 @@ pub struct RateLimiter<C: Clock + Clone = SystemClock> {
     shards: usize,
     eviction: Eviction,
     store: Store<C>,
+    /// Whether the check path must read the clock: the token bucket reads its
+    /// own clock and capacity-only eviction needs no real time, so the common
+    /// case skips the read entirely. Window algorithms (which need `now`) and an
+    /// idle TTL (which measures real elapsed time) turn it on.
+    reads_clock: bool,
 }
 
 impl RateLimiter<SystemClock> {
@@ -207,6 +212,9 @@ impl<C: Clock + Clone> RateLimiter<C> {
     ) -> Self {
         let epoch = clock.now();
         let store = Store::new(shards, eviction);
+        // The token bucket reads its own clock and capacity-only eviction orders
+        // by a logical counter, so that combination needs no clock read here.
+        let reads_clock = algorithm != Algorithm::TokenBucket || eviction.idle_ttl().is_some();
         Self {
             algorithm,
             quota,
@@ -215,6 +223,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
             shards,
             eviction,
             store,
+            reads_clock,
         }
     }
 
@@ -352,6 +361,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// assert_eq!(limiter.check("user:42"), Decision::Allow);
     /// assert!(limiter.check("user:42").is_deny()); // limit reached
     /// ```
+    #[inline]
     pub fn check(&self, key: impl Into<Key>) -> Decision {
         self.check_inner(key.into(), 1)
     }
@@ -375,6 +385,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// assert_eq!(limiter.check_n("tenant:acme", 6), Decision::Allow);
     /// assert!(limiter.check_n("tenant:acme", 1).is_deny()); // 10 spent
     /// ```
+    #[inline]
     pub fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
         self.check_inner(key.into(), n)
     }
@@ -457,8 +468,13 @@ impl<C: Clock + Clone> RateLimiter<C> {
 
     /// The shared check path: hand the key to the store as of the elapsed time,
     /// seeding fresh per-key state if this is the first time the key is seen.
+    #[inline]
     fn check_inner(&self, key: Key, n: u32) -> Decision {
-        let now = self.now();
+        let now = if self.reads_clock {
+            self.now()
+        } else {
+            Duration::ZERO
+        };
         self.store.check(key, n, now, || self.new_state(now))
     }
 

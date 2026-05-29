@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -62,12 +62,14 @@ path = "src/lib.rs"
 
 # LINTS
 # #################################
-# `loom` is a build-time cfg toggled via `RUSTFLAGS="--cfg loom"` for the
-# concurrency model-check harness; `docsrs` is set by docs.rs. Registering both
-# keeps the `unexpected_cfgs` lint quiet under `-D warnings`.
+# `loom` and `comparison` are build-time cfgs toggled via `RUSTFLAGS="--cfg ..."`
+# (the concurrency model check and the `governor` comparison bench); `docsrs` is
+# set by docs.rs. Registering them keeps `unexpected_cfgs` quiet under
+# `-D warnings`.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(loom)',
+    'cfg(comparison)',
     'cfg(docsrs)',
 ] }
 
@@ -91,6 +93,7 @@ std = [
     "dep:clock-lib",
     "clock-lib/std",
     "dep:error-forge",
+    "dep:ahash",
 ]
 
 # The full algorithm suite beyond the default token bucket: leaky bucket,
@@ -114,6 +117,10 @@ better-bucket = { version = "1.0", default-features = false, optional = true }
 clock-lib     = { version = "1.0", default-features = false, optional = true }
 # Domain error type metadata (kind/caption), shared across the portfolio stack.
 error-forge   = { version = "1.0", optional = true }
+# Fast, DoS-resistant hashing for the shard map and shard selection. A random
+# per-store seed (runtime-rng) keeps it collision-attack resistant on hostile
+# keys; required by `std` for the hot path.
+ahash         = { version = "0.8", optional = true }
 # Optional async-friendly wrapper layer; additive only. Only the timer is used.
 tokio         = { version = "1", default-features = false, features = ["time"], optional = true }
 
@@ -136,6 +143,12 @@ loom = "0.7"
 [target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time"] }
 
+# Benchmark-only: the incumbent for the head-to-head comparison. Gated on
+# `cfg(comparison)` (set via `RUSTFLAGS="--cfg comparison"`) so it never enters
+# the default tree, `--all-features`, or CI.
+[target.'cfg(comparison)'.dev-dependencies]
+governor = "0.8"
+
 
 
 # EXAMPLES
@@ -156,6 +169,10 @@ required-features = ["async"]
 # #################################
 [[bench]]
 name    = "rate_bench"
+harness = false
+
+[[bench]]
+name    = "comparison"
 harness = false
 
 

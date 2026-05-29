@@ -15,10 +15,10 @@
 
 use core::time::Duration;
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use ahash::RandomState;
 
 use clock_lib::Clock;
 
@@ -27,23 +27,33 @@ use crate::decision::Decision;
 use crate::eviction::Eviction;
 use crate::key::Key;
 
-/// Per-key state: the algorithm's data, plus the last time the key was checked
-/// (monotonic milliseconds since the limiter's epoch), used for idle expiry and
-/// least-recently-seen eviction.
+/// Per-key state: the algorithm's data, plus a "last seen" stamp for eviction.
+///
+/// The stamp is monotonic milliseconds since the limiter's epoch when an idle
+/// TTL is configured (so idle expiry can compare against real time), and a
+/// per-shard logical sequence number otherwise — which gives the same
+/// least-recently-seen *ordering* for capacity eviction without paying for a
+/// clock read on every check.
 struct Entry<C: Clock> {
     state: AlgoState<C>,
-    last_seen_ms: AtomicU64,
+    last_seen: AtomicU64,
 }
 
-/// One shard of the store: an independently locked slice of the key space.
+/// One shard of the store: an independently locked slice of the key space. The
+/// map hashes with `ahash` (fast, and collision-attack resistant via the random
+/// seed baked into its `RandomState`).
 struct Shard<C: Clock> {
-    map: RwLock<HashMap<Key, Entry<C>>>,
+    map: RwLock<HashMap<Key, Entry<C>, RandomState>>,
+    /// Monotonic per-shard counter handing out "last seen" stamps when no TTL is
+    /// set. Per-shard so unrelated shards never contend on it.
+    seq: AtomicU64,
 }
 
 impl<C: Clock> Shard<C> {
     fn new() -> Self {
         Self {
-            map: RwLock::new(HashMap::new()),
+            map: RwLock::new(HashMap::default()),
+            seq: AtomicU64::new(0),
         }
     }
 }
@@ -91,6 +101,7 @@ impl<C: Clock> Store<C> {
 
     /// Checks `n` units against `key` as of elapsed time `now`, creating the
     /// key's state from `make_state` if this is the first time the key is seen.
+    #[inline]
     pub(crate) fn check(
         &self,
         key: Key,
@@ -107,7 +118,9 @@ impl<C: Clock> Store<C> {
         {
             let guard = read_guard(&shard.map);
             if let Some(entry) = guard.get(&key) {
-                entry.last_seen_ms.store(now_ms, Ordering::Relaxed);
+                entry
+                    .last_seen
+                    .store(self.stamp(shard, now_ms), Ordering::Relaxed);
                 return entry.state.acquire(n, now);
             }
         }
@@ -116,10 +129,13 @@ impl<C: Clock> Store<C> {
         // thread may have inserted it in the gap), evict to make room, insert.
         let mut guard = write_guard(&shard.map);
         if let Some(entry) = guard.get(&key) {
-            entry.last_seen_ms.store(now_ms, Ordering::Relaxed);
+            entry
+                .last_seen
+                .store(self.stamp(shard, now_ms), Ordering::Relaxed);
             return entry.state.acquire(n, now);
         }
 
+        let stamp = self.stamp(shard, now_ms);
         self.evict_for_insert(&mut guard, now_ms);
         let state = make_state();
         let outcome = state.acquire(n, now);
@@ -127,10 +143,23 @@ impl<C: Clock> Store<C> {
             key,
             Entry {
                 state,
-                last_seen_ms: AtomicU64::new(now_ms),
+                last_seen: AtomicU64::new(stamp),
             },
         );
         outcome
+    }
+
+    /// The "last seen" stamp for an access: real elapsed milliseconds when an
+    /// idle TTL is configured (so expiry can be measured), otherwise a cheap
+    /// per-shard sequence number that preserves least-recently-seen ordering
+    /// without a clock read.
+    #[inline]
+    fn stamp(&self, shard: &Shard<C>, now_ms: u64) -> u64 {
+        if self.idle_ttl_ms.is_some() {
+            now_ms
+        } else {
+            shard.seq.fetch_add(1, Ordering::Relaxed)
+        }
     }
 
     /// The number of keys with live state across all shards. A momentary,
@@ -155,10 +184,11 @@ impl<C: Clock> Store<C> {
     /// Makes room in a shard about to receive a new key: drop idle-expired keys,
     /// then, if still at capacity, evict the least-recently-seen key. Runs under
     /// the caller's write lock and touches only this shard.
-    fn evict_for_insert(&self, map: &mut HashMap<Key, Entry<C>>, now_ms: u64) {
+    fn evict_for_insert(&self, map: &mut HashMap<Key, Entry<C>, RandomState>, now_ms: u64) {
         if let Some(ttl) = self.idle_ttl_ms {
+            // With a TTL set, `last_seen` holds real elapsed milliseconds.
             map.retain(|_, entry| {
-                now_ms.saturating_sub(entry.last_seen_ms.load(Ordering::Relaxed)) < ttl
+                now_ms.saturating_sub(entry.last_seen.load(Ordering::Relaxed)) < ttl
             });
         }
 
@@ -166,7 +196,7 @@ impl<C: Clock> Store<C> {
             while map.len() >= cap {
                 let victim = map
                     .iter()
-                    .min_by_key(|(_, entry)| entry.last_seen_ms.load(Ordering::Relaxed))
+                    .min_by_key(|(_, entry)| entry.last_seen.load(Ordering::Relaxed))
                     .map(|(key, _)| key.clone());
                 match victim {
                     Some(key) => {
