@@ -1,15 +1,30 @@
 //! The rate limiter and the trait every algorithm shares.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use better_bucket::Bucket;
-use clock_lib::{Clock, SystemClock};
-use dashmap::DashMap;
+use clock_lib::{Clock, Monotonic, SystemClock};
 
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
+use crate::eviction::Eviction;
 use crate::key::Key;
 use crate::quota::Quota;
+use crate::store::Store;
+
+/// Default shard count when the caller does not choose one: four shards per
+/// available core, rounded to a power of two and clamped to a sane range. More
+/// shards means less contention between unrelated keys, at the cost of a little
+/// more memory.
+fn default_shard_count() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1);
+    (parallelism.saturating_mul(4))
+        .next_power_of_two()
+        .clamp(1, 4096)
+}
 
 /// The shared rate-limiting surface, independent of the algorithm behind it.
 ///
@@ -25,7 +40,7 @@ use crate::quota::Quota;
 /// # Examples
 ///
 /// ```
-/// use rate_net::{Limiter, RateLimiter, Decision};
+/// use rate_net::{Limiter, RateLimiter};
 ///
 /// // Generic over any limiter implementation.
 /// fn admit_one<L: Limiter>(limiter: &L, key: &str) -> bool {
@@ -49,10 +64,14 @@ pub trait Limiter {
 ///
 /// Tracks an independent allowance for every key it sees and answers
 /// [`check`](Self::check) in the time it takes to hash the key and run its
-/// bucket. State for unrelated keys lives in different shards of a concurrent
-/// map, so they never contend; the limiter is `Send + Sync` and is meant to be
-/// shared (behind an [`Arc`](std::sync::Arc), or as a `static`) across all the
-/// threads serving requests.
+/// bucket. Per-key state lives in a [sharded](Self::with_shards) concurrent
+/// store: unrelated keys land in different shards and never contend, an
+/// existing-key check takes only a shared read lock plus the bucket's atomic
+/// accounting, and memory is bounded by [eviction](Self::with_eviction) so a
+/// flood of unique keys hits a cap instead of growing without limit. The
+/// limiter is `Send + Sync` and is meant to be shared — behind an
+/// [`Arc`](std::sync::Arc), or as a `static` — across all the threads serving
+/// requests.
 ///
 /// The default algorithm is the token bucket, whose accounting is delegated to
 /// [`better-bucket`](https://crates.io/crates/better-bucket): each key bursts up
@@ -80,7 +99,10 @@ pub trait Limiter {
 pub struct RateLimiter<C: Clock + Clone = SystemClock> {
     quota: Quota,
     clock: C,
-    keys: DashMap<Key, Bucket<C>>,
+    epoch: Monotonic,
+    shards: usize,
+    eviction: Eviction,
+    store: Store<C>,
 }
 
 impl RateLimiter<SystemClock> {
@@ -120,7 +142,7 @@ impl RateLimiter<SystemClock> {
     }
 
     /// Creates a limiter from an explicit [`Quota`], driven by the OS monotonic
-    /// clock.
+    /// clock, with default sharding and a bounded-memory [`Eviction`] policy.
     ///
     /// Use this with [`Quota::rate`] when the window is neither a second nor a
     /// minute.
@@ -138,25 +160,41 @@ impl RateLimiter<SystemClock> {
     /// ```
     #[must_use]
     pub fn with_quota(quota: Quota) -> Self {
-        Self {
+        Self::build(
             quota,
-            clock: SystemClock::new(),
-            keys: DashMap::new(),
-        }
+            SystemClock::new(),
+            default_shard_count(),
+            Eviction::default(),
+        )
     }
 }
 
 impl<C: Clock + Clone> RateLimiter<C> {
+    /// Assembles a limiter from its parts, anchoring the eviction clock.
+    fn build(quota: Quota, clock: C, shards: usize, eviction: Eviction) -> Self {
+        let epoch = clock.now();
+        let store = Store::new(shards, eviction);
+        Self {
+            quota,
+            clock,
+            epoch,
+            shards,
+            eviction,
+            store,
+        }
+    }
+
     /// Replaces the limiter's time source, discarding any per-key state.
     ///
     /// This is the clock-injection seam, intended for use immediately after
     /// construction. Injecting a `ManualClock` makes refill behaviour
-    /// deterministic so window and rollover tests run with no `sleep`.
+    /// deterministic so window and rollover tests run with no `sleep`. The shard
+    /// count and eviction policy are preserved.
     ///
     /// # Examples
     ///
     /// ```
-    /// use rate_net::{RateLimiter, Decision};
+    /// use rate_net::RateLimiter;
     /// use clock_lib::ManualClock;
     /// use std::sync::Arc;
     /// use std::time::Duration;
@@ -176,11 +214,47 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_clock<C2: Clock + Clone>(self, clock: C2) -> RateLimiter<C2> {
-        RateLimiter {
-            quota: self.quota,
-            clock,
-            keys: DashMap::new(),
-        }
+        RateLimiter::build(self.quota, clock, self.shards, self.eviction)
+    }
+
+    /// Sets the shard count, discarding any per-key state.
+    ///
+    /// Intended immediately after construction. More shards reduce contention
+    /// between unrelated keys; the value is rounded up to a power of two. A good
+    /// starting point is a small multiple of the core count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1000).with_shards(64);
+    /// assert_eq!(limiter.shards(), 64);
+    /// ```
+    #[must_use]
+    pub fn with_shards(self, shards: usize) -> Self {
+        Self::build(self.quota, self.clock, shards, self.eviction)
+    }
+
+    /// Sets the eviction policy, discarding any per-key state.
+    ///
+    /// Intended immediately after construction. The default policy bounds memory
+    /// with a generous key-capacity cap; override it to tune the cap or add an
+    /// idle TTL.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{RateLimiter, Eviction};
+    /// use std::time::Duration;
+    ///
+    /// let limiter = RateLimiter::per_second(1000)
+    ///     .with_eviction(Eviction::capacity(100_000).with_idle(Duration::from_secs(300)));
+    /// assert_eq!(limiter.eviction().max_keys(), Some(100_000));
+    /// ```
+    #[must_use]
+    pub fn with_eviction(self, eviction: Eviction) -> Self {
+        Self::build(self.quota, self.clock, self.shards, eviction)
     }
 
     /// Checks a single unit against `key`.
@@ -254,10 +328,38 @@ impl<C: Clock + Clone> RateLimiter<C> {
         Algorithm::TokenBucket
     }
 
+    /// The eviction policy bounding the per-key store.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{RateLimiter, DEFAULT_MAX_KEYS};
+    ///
+    /// assert_eq!(RateLimiter::per_second(1).eviction().max_keys(), Some(DEFAULT_MAX_KEYS));
+    /// ```
+    #[must_use]
+    pub const fn eviction(&self) -> Eviction {
+        self.eviction
+    }
+
+    /// The number of shards the per-key store is split across (a power of two).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// assert_eq!(RateLimiter::per_second(1).with_shards(32).shards(), 32);
+    /// ```
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.store.shard_count()
+    }
+
     /// The number of keys with live state right now.
     ///
-    /// A momentary snapshot, advisory under concurrent access. Until eviction
-    /// lands it only grows; it is exposed mainly for tests and diagnostics.
+    /// A momentary snapshot, advisory under concurrent access — and bounded by
+    /// the [eviction](Self::eviction) policy.
     ///
     /// # Examples
     ///
@@ -271,23 +373,27 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn tracked_keys(&self) -> usize {
-        self.keys.len()
+        self.store.len()
     }
 
-    /// The shared check path: locate (or create) the key's bucket and acquire.
+    /// The shared check path: hand the key to the store as of the current time,
+    /// seeding a fresh bucket if this is the first time the key is seen.
     fn check_inner(&self, key: Key, n: u32) -> Decision {
-        let outcome = self
-            .keys
-            .entry(key)
-            .or_insert_with(|| self.new_bucket())
-            .acquire(n);
-        outcome.into()
+        let now_ms = self.now_ms();
+        self.store.check(key, n, now_ms, || self.new_bucket())
     }
 
     /// Builds a fresh per-key bucket for the configured quota, anchored at the
     /// injected clock's current reading.
     fn new_bucket(&self) -> Bucket<C> {
         Bucket::per_duration(self.quota.limit(), self.quota.period()).with_clock(self.clock.clone())
+    }
+
+    /// Monotonic milliseconds since this limiter's epoch, for eviction
+    /// timestamps. Saturating, so a multi-million-year uptime cannot wrap it.
+    fn now_ms(&self) -> u64 {
+        let elapsed = self.clock.now().saturating_duration_since(self.epoch);
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
     }
 }
 
@@ -305,7 +411,9 @@ impl<C: Clock + Clone> fmt::Debug for RateLimiter<C> {
         f.debug_struct("RateLimiter")
             .field("algorithm", &self.algorithm())
             .field("quota", &self.quota)
-            .field("tracked_keys", &self.keys.len())
+            .field("shards", &self.shards())
+            .field("eviction", &self.eviction)
+            .field("tracked_keys", &self.store.len())
             .finish()
     }
 }
@@ -322,6 +430,7 @@ mod tests {
     use super::{Limiter, RateLimiter};
     use crate::algorithm::Algorithm;
     use crate::decision::Decision;
+    use crate::eviction::Eviction;
     use crate::quota::Quota;
 
     fn manual() -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
@@ -343,12 +452,10 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(limiter.check("k"), Decision::Allow);
         }
-        // Sixth request in the same instant is denied.
         let decision = limiter.check("k");
         assert!(decision.is_deny());
         assert!(decision.retry_after().is_some());
 
-        // A full second restores the whole allowance.
         clock.advance(Duration::from_secs(1));
         assert_eq!(limiter.check("k"), Decision::Allow);
     }
@@ -357,13 +464,11 @@ mod tests {
     fn test_keys_are_independent() {
         let (_clock, limiter) = manual();
 
-        // Drain one key entirely.
         for _ in 0..5 {
             assert!(limiter.check("a").is_allow());
         }
         assert!(limiter.check("a").is_deny());
 
-        // A different key is untouched.
         assert!(limiter.check("b").is_allow());
     }
 
@@ -378,11 +483,9 @@ mod tests {
     #[test]
     fn test_check_n_zero_always_admits() {
         let (_clock, limiter) = manual();
-        // Drain the key first.
         for _ in 0..5 {
             assert!(limiter.check("k").is_allow());
         }
-        // A zero-unit check costs nothing and is always admitted.
         assert_eq!(limiter.check_n("k", 0), Decision::Allow);
     }
 
@@ -396,7 +499,6 @@ mod tests {
                 retry_after: Duration::MAX
             }
         );
-        // Even after time passes, an over-capacity request still cannot succeed.
         clock.advance(Duration::from_secs(10));
         assert_eq!(limiter.check_n("k", 6).retry_after(), Some(Duration::MAX));
     }
@@ -409,7 +511,6 @@ mod tests {
 
     #[test]
     fn test_partial_refill_admits_proportionally() {
-        // 10 per second → one token every 100ms.
         let clock = Arc::new(ManualClock::new());
         let limiter = RateLimiter::per_second(10).with_clock(Arc::clone(&clock));
         for _ in 0..10 {
@@ -417,7 +518,6 @@ mod tests {
         }
         assert!(limiter.check("k").is_deny());
 
-        // 300ms restores ~3 tokens.
         clock.advance(Duration::from_millis(300));
         assert!(limiter.check("k").is_allow());
         assert!(limiter.check("k").is_allow());
@@ -442,7 +542,36 @@ mod tests {
     }
 
     #[test]
-    fn test_limiter_trait_object_safe_via_generic() {
+    fn test_with_shards_rounds_to_power_of_two() {
+        let limiter = RateLimiter::per_second(1).with_shards(5);
+        assert_eq!(limiter.shards(), 8);
+    }
+
+    #[test]
+    fn test_with_eviction_is_reported() {
+        let limiter = RateLimiter::per_second(1).with_eviction(Eviction::capacity(10));
+        assert_eq!(limiter.eviction().max_keys(), Some(10));
+    }
+
+    #[test]
+    fn test_unique_key_flood_is_bounded_by_capacity() {
+        let limiter = RateLimiter::per_second(1)
+            .with_shards(8)
+            .with_eviction(Eviction::capacity(100));
+        for k in 0..50_000u64 {
+            let _ = limiter.check(k);
+        }
+        // Per-shard rounding of a 100-key cap across 8 shards.
+        let bound = 100usize.div_ceil(8).max(1) * 8;
+        assert!(
+            limiter.tracked_keys() <= bound,
+            "flood grew to {} keys, bound {bound}",
+            limiter.tracked_keys()
+        );
+    }
+
+    #[test]
+    fn test_limiter_trait_generic() {
         fn count_admitted<L: Limiter>(limiter: &L, key: &str, attempts: u32) -> u32 {
             (0..attempts)
                 .filter(|_| limiter.check(key).is_allow())

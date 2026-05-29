@@ -22,6 +22,47 @@
 
 ---
 
+## [0.3.0] - 2026-05-29
+
+Core. The real concurrent machine: a sharded, bounded-memory per-key store with
+an allocation-free steady-state check path. The token bucket is wired to
+`better-bucket`; memory is bounded by eviction so a flood of unique keys hits a
+cap instead of growing without limit.
+
+### Added
+
+- Purpose-built **sharded per-key store**. An existing-key check takes only a
+  shard *read* lock plus the bucket's atomic accounting, so unrelated keys — and
+  concurrent checks of the same key — never serialise; only first-seeing a key
+  takes the brief write lock. Shard count is configurable via
+  `RateLimiter::with_shards` and defaults to a small multiple of the core count.
+- **Bounded-memory eviction** — the `Eviction` policy type and `DEFAULT_MAX_KEYS`
+  constant. A per-shard, lazy, incremental sweep (run while inserting a new key,
+  under the write lock already held, never as a background thread or
+  stop-the-world pass) drops idle-expired keys and, at capacity, evicts the
+  least-recently-seen key. The default is safe: a capacity cap so a unique-key
+  flood is bounded out of the box. Configurable via `RateLimiter::with_eviction`.
+- `RateLimiter::shards` and `RateLimiter::eviction` introspection.
+- Inline-or-heap `Key` storage: the common identities (IP addresses, `u64` ids,
+  short string keys) are held inline, so an existing-key check performs no heap
+  allocation.
+- Concurrency and memory proofs: a `loom` model of the store's get-or-insert
+  protocol (two racing first-touches share one bucket and never over-admit); a
+  multi-threaded stress test (across many keys, each key is admitted exactly its
+  quota — never more, never fewer); an allocation audit asserting the
+  steady-state check allocates nothing; and unit tests for the unique-key-flood
+  bound, idle-TTL reclamation, and a hot key surviving eviction pressure.
+
+### Changed
+
+- Replaced the `dashmap` dependency with the purpose-built store, which is what
+  makes per-shard incremental eviction and the read-lock steady-state path
+  possible. `std` no longer pulls in `dashmap`.
+- Existing-key checks now take a shard read lock rather than a write lock, so
+  unrelated keys sharing a shard no longer serialise.
+
+---
+
 ## [0.2.0] - 2026-05-28
 
 Foundation. The public API shape is locked and a correct single-key
@@ -133,7 +174,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/rate-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/rate-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/rate-net/releases/tag/v0.1.0
 [`VERSION`]: https://docs.rs/rate-net/latest/rate_net/constant.VERSION.html

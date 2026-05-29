@@ -19,16 +19,17 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, under active development. This `0.2.0` release lands the
-//! **foundation**: the public shape is locked — the [`Decision`] result, the
-//! [`Quota`] and [`Algorithm`] types, the [`RateLimiterError`], and the
-//! [`Limiter`] trait — alongside a correct single-key token-bucket
-//! [`RateLimiter`] that delegates its accounting to
-//! [`better-bucket`](https://crates.io/crates/better-bucket) and reads time from
-//! an injectable clock. Per-key state lives in a concurrent map today; the
-//! tunable sharded store with bounded-memory eviction and the zero-allocation
-//! steady state arrive in `0.3.0`, and the remaining algorithms in `0.4.0`. The
-//! example below is callable now.
+//! Pre-1.0, under active development. As of `0.3.0` the concurrent core is real:
+//! per-key state lives in a purpose-built **sharded store** (an existing-key
+//! [`check`](RateLimiter::check) takes only a shard read lock plus the bucket's
+//! atomic accounting, so unrelated keys never contend), memory is **bounded by
+//! eviction** so a flood of unique keys hits a cap, and the steady-state check
+//! is **allocation-free**. The token-bucket accounting is delegated to
+//! [`better-bucket`](https://crates.io/crates/better-bucket); time comes from an
+//! injectable clock. The public shape — the [`Decision`] result, the [`Quota`],
+//! [`Algorithm`], and [`Eviction`] types, the [`RateLimiterError`], and the
+//! [`Limiter`] trait — is in place. The leaky-bucket, fixed-window, and
+//! sliding-window algorithms and the Tier-2 builder arrive in `0.4.0`.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -105,11 +106,15 @@ mod decision;
 #[cfg(feature = "std")]
 mod error;
 #[cfg(feature = "std")]
+mod eviction;
+#[cfg(feature = "std")]
 mod key;
 #[cfg(feature = "std")]
 mod limiter;
 #[cfg(feature = "std")]
 mod quota;
+#[cfg(feature = "std")]
+mod store;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::Algorithm;
@@ -117,6 +122,8 @@ pub use crate::algorithm::Algorithm;
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
 pub use crate::error::RateLimiterError;
+#[cfg(feature = "std")]
+pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
 #[cfg(feature = "std")]
 pub use crate::key::Key;
 #[cfg(feature = "std")]

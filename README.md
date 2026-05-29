@@ -33,15 +33,17 @@
 
 <br>
 
-> **Status — pre-release (`v0.2.0`).** The public API shape is locked and the
-> one-line Tier-1 path works today: `RateLimiter::per_second(n)` then
-> `limiter.check(key)`, backed by a token bucket and an injectable clock. Per-key
-> state currently lives in a concurrent map; the **tunable sharded store with
-> bounded-memory eviction** and the **zero-allocation steady state** land in
-> `v0.3.0`, the **leaky-bucket, fixed-window, and sliding-window algorithms** in
-> `v0.4.0`, and the **Tier-2 builder** (custom burst, shard count, eviction
-> policy) alongside them. Examples for those not-yet-shipped surfaces describe
-> the target API; the roadmap drives the order in which they become real.
+> **Status — pre-release (`v0.3.0`).** The concurrent core is real: per-key state
+> lives in a tunable **sharded store** (unrelated keys never contend — an
+> existing-key check takes only a read lock plus an atomic), memory is **bounded
+> by eviction** so a unique-key flood hits a cap instead of growing without
+> limit, and the steady-state check is **allocation-free** — all verified by
+> `loom`, a multi-threaded stress test, and an allocation audit. Tune sharding
+> and eviction with `.with_shards(n)` and `.with_eviction(policy)`. Still ahead:
+> the **leaky-bucket, fixed-window, and sliding-window algorithms** and the
+> unified **Tier-2 builder** in `v0.4.0`. Examples for those not-yet-shipped
+> surfaces describe the target API; the roadmap drives the order in which they
+> become real.
 
 <br>
 
@@ -115,9 +117,27 @@ id, an API token, an endpoint name.
 
 ## Configured Limiter (Tier 2)
 
-> _Planned for `v0.4`._ The builder below lands with the full algorithm suite.
-> Today, use `RateLimiter::with_quota(Quota::rate(limit, period)?)` for an
-> explicit per-second/per-minute/per-duration quota.
+Today, build an explicit quota with `Quota::rate`, then tune the shard count and
+eviction policy with chainable adjusters:
+
+```rust
+use rate_net::{RateLimiter, Quota, Eviction};
+use std::time::Duration;
+
+// 1000 requests / minute, per key.
+let quota = Quota::rate(1000, Duration::from_secs(60)).expect("non-zero quota");
+
+let limiter = RateLimiter::with_quota(quota)
+    .with_shards(64)                                  // tune for core count
+    .with_eviction(Eviction::capacity(100_000)        // cap the key space
+        .with_idle(Duration::from_secs(300)));        // and reclaim idle keys
+
+// Take more than one unit at a time.
+let decision = limiter.check_n("tenant:acme", 5);
+```
+
+> _Planned for `v0.4`._ The single builder below — folding algorithm selection
+> in with these knobs — lands with the full algorithm suite.
 
 Choose the algorithm, quota, burst, shard count, and eviction policy:
 

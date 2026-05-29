@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -81,12 +81,11 @@ default = ["std"]
 
 # Standard library. The limiter — the sharded per-key store, the token-bucket
 # core (better-bucket's clock-driven surface), the injectable clock, and the
-# domain error type — requires std, so std gates `dashmap`, `better-bucket`'s
-# `clock` feature, `clock-lib`, and `error-forge`. With std off the crate is
-# no_std and exposes only `VERSION`; the pared-down single-key mode follows in a
-# later release.
+# domain error type — requires std, so std gates `better-bucket`'s `clock`
+# feature, `clock-lib`, and `error-forge`. With std off the crate is no_std and
+# exposes only `VERSION`; the pared-down single-key mode follows in a later
+# release.
 std = [
-    "dep:dashmap",
     "dep:better-bucket",
     "better-bucket/clock",
     "dep:clock-lib",
@@ -113,8 +112,6 @@ async = ["std", "dep:tokio"]
 better-bucket = { version = "1.0", default-features = false, optional = true }
 # Monotonic, mockable time for deterministic tests and the clock-injection seam.
 clock-lib     = { version = "1.0", default-features = false, optional = true }
-# Sharded concurrent per-key store. Required by `std`.
-dashmap       = { version = "6", optional = true }
 # Domain error type metadata (kind/caption), shared across the portfolio stack.
 error-forge   = { version = "1.0", optional = true }
 # Optional async-friendly wrapper layer; additive only.

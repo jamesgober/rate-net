@@ -18,11 +18,11 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.2.0`).** The public shape is locked and the Tier-1
-> token-bucket limiter works today. Items under [Public API](#public-api) are
-> callable now; sections marked _(planned)_ describe the intended surface and
-> are filled in as each roadmap phase ships — the Tier-2 builder, bounded-memory
-> eviction, and the additional algorithms land across `0.3.0`–`0.4.0`.
+> **Status: pre-1.0 (`v0.3.0`).** The concurrent core is real — a sharded,
+> bounded-memory per-key store with an allocation-free steady-state check. Items
+> under [Public API](#public-api) are callable now; sections marked _(planned)_
+> describe the intended surface and are filled in as each roadmap phase ships —
+> the additional algorithms and the unified Tier-2 builder land in `0.4.0`.
 
 ## Table of Contents
 
@@ -33,16 +33,20 @@
     - [`per_minute`](#ratelimiterper_minute)
     - [`with_quota`](#ratelimiterwith_quota)
     - [`with_clock`](#ratelimiterwith_clock)
+    - [`with_shards`](#ratelimiterwith_shards)
+    - [`with_eviction`](#ratelimiterwith_eviction)
     - [`check`](#ratelimitercheck)
     - [`check_n`](#ratelimitercheck_n)
-    - [`quota` / `algorithm` / `tracked_keys`](#ratelimiter-introspection)
+    - [`quota` / `algorithm` / `shards` / `eviction` / `tracked_keys`](#ratelimiter-introspection)
   - [`Limiter` trait](#limiter-trait)
   - [`Decision`](#decision)
   - [`Quota`](#quota)
+  - [`Eviction`](#eviction)
   - [`Algorithm`](#algorithm)
   - [`RateLimiterError`](#ratelimitererror)
   - [`Key`](#key)
   - [`VERSION`](#version)
+- [Sharding and eviction](#sharding-and-eviction)
 - [Tier 2 — the configured path](#tier-2--the-configured-path) _(planned: 0.4)_
 - [Algorithms](#algorithms)
 - [Feature flags](#feature-flags)
@@ -182,6 +186,47 @@ clock.advance(Duration::from_secs(1)); // no real sleep
 assert!(limiter.check("k").is_allow());
 ```
 
+#### `RateLimiter::with_shards`
+
+```rust
+pub fn with_shards(self, shards: usize) -> Self
+```
+
+Sets the shard count, discarding any per-key state. Intended immediately after
+construction. More shards reduce contention between unrelated keys; the value is
+rounded up to a power of two. See [Sharding and eviction](#sharding-and-eviction).
+
+- `shards` — the desired shard count (rounded up to a power of two). A small
+  multiple of the core count is a good starting point.
+
+```rust
+use rate_net::RateLimiter;
+
+let limiter = RateLimiter::per_second(1000).with_shards(64);
+assert_eq!(limiter.shards(), 64);
+```
+
+#### `RateLimiter::with_eviction`
+
+```rust
+pub fn with_eviction(self, eviction: Eviction) -> Self
+```
+
+Sets the [eviction policy](#eviction), discarding any per-key state. Intended
+immediately after construction. The default bounds memory with a generous
+capacity cap; override it to tune the cap or add an idle TTL.
+
+- `eviction` — the [`Eviction`](#eviction) policy.
+
+```rust
+use rate_net::{RateLimiter, Eviction};
+use std::time::Duration;
+
+let limiter = RateLimiter::per_second(1000)
+    .with_eviction(Eviction::capacity(100_000).with_idle(Duration::from_secs(300)));
+assert_eq!(limiter.eviction().max_keys(), Some(100_000));
+```
+
 #### `RateLimiter::check`
 
 ```rust
@@ -250,26 +295,32 @@ assert_eq!(
 );
 ```
 
-<h4 id="ratelimiter-introspection">Introspection: <code>quota</code> / <code>algorithm</code> / <code>tracked_keys</code></h4>
+<h4 id="ratelimiter-introspection">Introspection: <code>quota</code> / <code>algorithm</code> / <code>shards</code> / <code>eviction</code> / <code>tracked_keys</code></h4>
 
 ```rust
 pub fn quota(&self) -> Quota
 pub const fn algorithm(&self) -> Algorithm
+pub fn shards(&self) -> usize
+pub const fn eviction(&self) -> Eviction
 pub fn tracked_keys(&self) -> usize
 ```
 
 - `quota` — the [`Quota`](#quota) every key is limited to.
 - `algorithm` — the [`Algorithm`](#algorithm) in force (currently always
   `TokenBucket`).
+- `shards` — the number of shards the per-key store is split across (a power of
+  two).
+- `eviction` — the [`Eviction`](#eviction) policy bounding the store.
 - `tracked_keys` — the number of keys with live state; a momentary, advisory
-  snapshot, exposed mainly for tests and diagnostics.
+  snapshot bounded by the eviction policy.
 
 ```rust
 use rate_net::{RateLimiter, Algorithm};
 
-let limiter = RateLimiter::per_second(50);
+let limiter = RateLimiter::per_second(50).with_shards(16);
 assert_eq!(limiter.quota().limit(), 50);
 assert_eq!(limiter.algorithm(), Algorithm::TokenBucket);
+assert_eq!(limiter.shards(), 16);
 assert_eq!(limiter.tracked_keys(), 0);
 let _ = limiter.check("a");
 assert_eq!(limiter.tracked_keys(), 1);
@@ -395,6 +446,53 @@ assert_eq!(Quota::rate(10, Duration::ZERO), Err(RateLimiterError::ZeroPeriod));
 
 ---
 
+### `Eviction`
+
+```rust
+pub struct Eviction { /* private */ }
+pub const DEFAULT_MAX_KEYS: usize; // 1 << 20
+```
+
+How the limiter bounds the memory its per-key state can occupy — the defense
+against a unique-key flood. Two independent bounds compose: a **capacity** cap
+(a hard ceiling on live keys; the least-recently-seen key is evicted to make
+room) and an **idle TTL** (keys not seen for longer than the TTL are reclaimed).
+Eviction is lazy, incremental, and per-shard — it never sweeps the whole store
+or blocks the check path.
+
+Constructors:
+
+- `capacity(max_keys)` — a cap, no TTL.
+- `idle(ttl)` — a TTL, keeping the [`DEFAULT_MAX_KEYS`] cap (idle expiry alone
+  does not bound a flood, so the cap stays as the flood defense).
+- `new(max_keys, ttl)` — both bounds.
+- `unbounded()` — neither (only safe when the key space is intrinsically
+  bounded).
+
+Builders: `with_capacity(max_keys)`, `with_idle(ttl)`, `without_capacity()`.
+Accessors: `max_keys() -> Option<usize>`, `idle_ttl() -> Option<Duration>`.
+
+The [`Default`] is safe — a `DEFAULT_MAX_KEYS` cap and no TTL, so memory is
+bounded out of the box.
+
+```rust
+use rate_net::{Eviction, DEFAULT_MAX_KEYS};
+use std::time::Duration;
+
+// Cap at 100k keys and reclaim anything idle for five minutes.
+let policy = Eviction::capacity(100_000).with_idle(Duration::from_secs(300));
+assert_eq!(policy.max_keys(), Some(100_000));
+assert_eq!(policy.idle_ttl(), Some(Duration::from_secs(300)));
+
+// The default is bounded.
+assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
+```
+
+[`DEFAULT_MAX_KEYS`]: #eviction
+[`Default`]: https://doc.rust-lang.org/std/default/trait.Default.html
+
+---
+
 ### `Algorithm`
 
 ```rust
@@ -457,9 +555,12 @@ pub struct Key(/* private */);
 ```
 
 The opaque per-key identity a limit is tracked against — an IP, a user id, an API
-token, a route. Stored as owned bytes; two keys are equal exactly when their
-bytes are equal, so the identity is the byte content, not the source type. You
-rarely name it directly: `check` accepts `impl Into<Key>`.
+token, a route. Stored as owned bytes — inline for keys up to a couple dozen
+bytes, on the heap beyond that — so the common identities (IP addresses, `u64`
+ids, short strings) cost no allocation and the steady-state check stays
+allocation-free. Two keys are equal exactly when their bytes are equal, so the
+identity is the byte content, not the source type. You rarely name it directly:
+`check` accepts `impl Into<Key>`.
 
 `From` conversions: `&str`, `String`, `&[u8]`, `Vec<u8>`, `u64`, `IpAddr`.
 `as_bytes(&self) -> &[u8]` borrows the raw bytes.
@@ -492,12 +593,54 @@ assert!(rate_net::VERSION.starts_with("0."));
 
 ---
 
+## Sharding and eviction
+
+Per-key state lives in a **sharded** store: the key is hashed to one of a
+power-of-two number of shards, each guarded by its own lock. An existing-key
+check takes only a shard *read* lock and lets the key's bucket do its own atomic
+accounting, so unrelated keys — and concurrent checks of the same key — never
+serialise. Only first-seeing a key takes the brief write lock. Tune the shard
+count with [`with_shards`](#ratelimiterwith_shards); it defaults to a small
+multiple of the core count.
+
+Memory is **bounded by eviction** (see [`Eviction`](#eviction)), the defense
+against a unique-key flood. Eviction is lazy and per-shard: while inserting a new
+key, under the write lock already held, the store drops idle-expired keys in that
+one shard and, if the shard is at capacity, evicts its least-recently-seen key.
+There is no background timer and no whole-store sweep, so the steady-state check
+path is never blocked. The capacity cap is enforced approximately per shard, so
+the live-key count stays within a small factor of the configured maximum.
+
+```rust
+use rate_net::{RateLimiter, Quota, Eviction};
+use std::time::Duration;
+
+let limiter = RateLimiter::with_quota(Quota::rate(1000, Duration::from_secs(60))?)
+    .with_shards(64)
+    .with_eviction(Eviction::capacity(100_000).with_idle(Duration::from_secs(300)));
+
+assert_eq!(limiter.shards(), 64);
+assert_eq!(limiter.eviction().max_keys(), Some(100_000));
+# Ok::<(), rate_net::RateLimiterError>(())
+```
+
+These guarantees are verified by a `loom` model of the get-or-insert protocol, a
+multi-threaded stress test (each key admitted exactly its quota under
+contention), and an allocation audit (zero allocations on the steady-state
+check).
+
+---
+
 ## Tier 2 — the configured path
 
-_Planned: 0.4._ A builder selecting algorithm, quota, burst, shard count, and
-eviction policy, plus clock injection. Until it lands, use
-[`RateLimiter::with_quota`](#ratelimiterwith_quota) with
-[`Quota::rate`](#quota) for explicit per-key rates.
+Shard count and eviction policy are configurable today through the chainable
+[`with_shards`](#ratelimiterwith_shards) and
+[`with_eviction`](#ratelimiterwith_eviction) adjusters (above), combined with
+[`with_quota`](#ratelimiterwith_quota) / [`Quota::rate`](#quota).
+
+_Planned: 0.4._ A single builder that folds algorithm selection in with these
+knobs — quota, burst, shard count, eviction policy, and clock — in one fluent
+surface.
 
 ---
 
@@ -517,7 +660,7 @@ eviction policy, plus clock injection. Until it lands, use
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`        | yes | Standard library. Enables the limiter — the sharded store (`dashmap`), the token-bucket core (`better-bucket`'s `clock` feature), the injectable clock (`clock-lib`), and the error type (`error-forge`). With it off the crate is `no_std` and exposes only [`VERSION`](#version). |
+| `std`        | yes | Standard library. Enables the limiter — the purpose-built sharded store, the token-bucket core (`better-bucket`'s `clock` feature), the injectable clock (`clock-lib`), and the error type (`error-forge`). With it off the crate is `no_std` and exposes only [`VERSION`](#version). |
 | `algorithms` | no  | The full suite beyond the default token bucket. _(wired in 0.4)_ |
 | `async`      | no  | Optional additive async-friendly wrapper. Implies `std`. |
 
