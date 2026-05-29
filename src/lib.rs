@@ -19,19 +19,20 @@
 //!
 //! ## Status
 //!
-//! Pre-1.0, feature-frozen and optimized. The five algorithms sit behind the one
-//! [`Limiter`] trait (token bucket by default; the leaky bucket and window
-//! algorithms under the `algorithms` feature), with the Tier-2 [`Builder`], an
-//! optional `AsyncLimiter` await-until-ready layer (`async` feature), runnable
-//! [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
-//! `criterion` suite. Per-key state lives in a purpose-built **sharded store**
-//! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
-//! plus the algorithm's atomic accounting, so unrelated keys never contend),
-//! memory is **bounded by eviction**, and the steady-state check is
+//! Pre-1.0, **API frozen** as of `0.7.0`: the public surface below will not
+//! change until `1.0` except for additive, backward-compatible items. The five
+//! algorithms sit behind the one [`Limiter`] trait (token bucket by default; the
+//! leaky bucket and window algorithms under the `algorithms` feature), with the
+//! Tier-2 [`Builder`], an optional `AsyncLimiter` await-until-ready layer
+//! (`async` feature), runnable [examples](https://github.com/jamesgober/rate-net/tree/main/examples),
+//! and a `criterion` suite. Per-key state lives in a purpose-built **sharded
+//! store** (an existing-key [`check`](RateLimiter::check) takes only a shard read
+//! lock plus the algorithm's atomic accounting, so unrelated keys never
+//! contend), memory is **bounded by eviction**, and the steady-state check is
 //! **allocation-free**. Each algorithm carries its own `proptest` over-admit
-//! proof. `0.6` minimized the per-check overhead (`ahash`, no redundant clock
-//! read); the absolute latency is bounded by the monotonic clock read. What
-//! remains for `1.0` is hardening and the stability soak.
+//! proof, and an adversarial-traffic suite covers floods, burst storms, clock
+//! jumps, and near-maximum requests. What remains for `1.0` is the
+//! consumer-integration shake-out and the stability soak.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {

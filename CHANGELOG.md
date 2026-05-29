@@ -22,6 +22,36 @@
 
 ---
 
+## [0.7.0] - 2026-05-29
+
+Hardening and **API freeze**. The limiter is exercised against the threat model
+it is built for — hostile traffic — and the public surface is now fixed.
+
+### Added
+
+- `tests/hardening.rs` — an adversarial-traffic and edge-matrix suite (15 tests)
+  asserting no panic, no wrap, no over-admit, and bounded memory under:
+  - a flood of 100 000 unique keys (stays within the capacity bound, and a
+    concurrently-live key is never corrupted);
+  - a burst storm of 10× the quota at one instant (admits exactly the quota);
+  - no clock advance (admits exactly the quota);
+  - a 100-day clock jump (refills to the cap, never beyond);
+  - a request of `u32::MAX` units (denied, no panic, limiter still usable);
+  - a `u32::MAX` quota and a zero quota;
+  - rapid reconfiguration (`with_shards` / `with_eviction` chained);
+  - and, per algorithm, the edge matrix — zero units, exact quota, `n > limit`,
+    refill after a window, and the exact window boundary.
+
+### Changed
+
+- **API frozen.** The public surface — `RateLimiter` and its methods, `Builder`,
+  `AsyncLimiter`, `Limiter`, `Decision`, `Quota`, `Eviction`, `Algorithm`,
+  `RateLimiterError`, `Key`, and `VERSION` — is fixed. Any pre-1.0 additions will
+  be additive and backward-compatible; nothing will be removed or have its
+  signature changed before `1.0`.
+
+---
+
 ## [0.6.0] - 2026-05-29
 
 Optimization. The per-check overhead is cut substantially, with the work profiled
@@ -292,7 +322,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/rate-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/rate-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/rate-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/rate-net/compare/v0.3.0...v0.4.0

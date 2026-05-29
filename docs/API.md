@@ -18,15 +18,16 @@
 > format mirrors the portfolio standard
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 >
-> **Status: pre-1.0 (`v0.6.0`).** Feature-frozen and optimized. Five algorithms
-> behind one [`Limiter`](#limiter-trait) trait, the Tier-2 [`Builder`](#builder),
-> an optional [`AsyncLimiter`](#asynclimiter) await-until-ready layer, runnable
+> **Status: pre-1.0 (`v0.7.0`) — API frozen.** The public surface documented here
+> will not change before `1.0` except for additive, backward-compatible items.
+> Five algorithms behind one [`Limiter`](#limiter-trait) trait, the Tier-2
+> [`Builder`](#builder), an optional [`AsyncLimiter`](#asynclimiter)
+> await-until-ready layer, runnable
 > [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
 > [benchmark suite](./BENCHMARKS.md) (with an honest head-to-head vs `governor`) —
-> over a sharded, bounded-memory, allocation-free core. The leaky bucket and
-> window algorithms require the `algorithms` feature; `AsyncLimiter` requires
-> `async`. Everything documented here is callable now and the public surface is
-> stable through the `0.x` hardening releases.
+> over a sharded, bounded-memory, allocation-free core hardened against
+> adversarial traffic. The leaky bucket and window algorithms require the
+> `algorithms` feature; `AsyncLimiter` requires `async`.
 
 ## Table of Contents
 
@@ -586,18 +587,49 @@ Accessors: `max_keys() -> Option<usize>`, `idle_ttl() -> Option<Duration>`.
 The [`Default`] is safe — a `DEFAULT_MAX_KEYS` cap and no TTL, so memory is
 bounded out of the box.
 
+A hard cap, the flood defense, with no idle expiry:
+
+```rust
+use rate_net::Eviction;
+
+let policy = Eviction::capacity(100_000);
+assert_eq!(policy.max_keys(), Some(100_000));
+assert_eq!(policy.idle_ttl(), None);
+```
+
+Reclaim idle keys while keeping the default cap as the flood defense:
+
 ```rust
 use rate_net::{Eviction, DEFAULT_MAX_KEYS};
 use std::time::Duration;
 
-// Cap at 100k keys and reclaim anything idle for five minutes.
-let policy = Eviction::capacity(100_000).with_idle(Duration::from_secs(300));
-assert_eq!(policy.max_keys(), Some(100_000));
+let policy = Eviction::idle(Duration::from_secs(300));
 assert_eq!(policy.idle_ttl(), Some(Duration::from_secs(300)));
-
-// The default is bounded.
-assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
+assert_eq!(policy.max_keys(), Some(DEFAULT_MAX_KEYS)); // still capped
 ```
+
+Both bounds, chosen explicitly:
+
+```rust
+use rate_net::Eviction;
+use std::time::Duration;
+
+let policy = Eviction::capacity(50_000).with_idle(Duration::from_secs(60));
+assert_eq!(policy.max_keys(), Some(50_000));
+assert_eq!(policy.idle_ttl(), Some(Duration::from_secs(60)));
+```
+
+Unbounded — only when the key space is intrinsically small (a fixed tenant set):
+
+```rust
+use rate_net::Eviction;
+
+let policy = Eviction::unbounded();
+assert_eq!(policy.max_keys(), None);
+```
+
+The [`Default`] is safe — a [`DEFAULT_MAX_KEYS`] cap and no TTL — so memory is
+bounded out of the box.
 
 [`DEFAULT_MAX_KEYS`]: #eviction
 [`Default`]: https://doc.rust-lang.org/std/default/trait.Default.html

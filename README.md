@@ -33,17 +33,18 @@
 
 <br>
 
-> **Status — pre-release (`v0.6.0`, feature-frozen and optimized).** All five
-> algorithms (token bucket by default; leaky bucket, fixed window, sliding-window
-> log, and sliding-window counter under the `algorithms` feature) behind one
-> `Limiter` trait and the Tier-2 builder, each with its own `proptest` over-admit
-> proof; an optional await-until-ready async layer; runnable [examples](./examples);
-> and a [benchmark suite](./docs/BENCHMARKS.md) with an honest head-to-head vs
-> `governor`. The concurrent core is a tunable **sharded store** where unrelated
-> keys never contend, memory **bounded by eviction**, and an **allocation-free**
-> steady-state check — verified by `loom`, a multi-threaded stress test, and an
-> allocation audit. `0.6` cut the per-check overhead (`ahash`, no redundant clock
-> read); the remaining work toward `1.0` is hardening and the stability soak.
+> **Status — pre-release (`v0.7.0`) — API frozen.** The public surface is fixed
+> through `1.0`. All five algorithms (token bucket by default; leaky bucket,
+> fixed window, sliding-window log, and sliding-window counter under the
+> `algorithms` feature) behind one `Limiter` trait and the Tier-2 builder, each
+> with its own `proptest` over-admit proof; an optional await-until-ready async
+> layer; runnable [examples](./examples); and a [benchmark suite](./docs/BENCHMARKS.md)
+> with an honest head-to-head vs `governor`. The concurrent core is a tunable
+> **sharded store** where unrelated keys never contend, memory **bounded by
+> eviction**, and an **allocation-free** steady-state check — verified by `loom`,
+> a multi-threaded stress test, an allocation audit, and an **adversarial-traffic
+> suite** (floods, burst storms, clock jumps, near-max requests). The remaining
+> work toward `1.0` is the consumer-integration shake-out and the stability soak.
 
 <br>
 
