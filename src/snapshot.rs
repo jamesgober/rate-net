@@ -4,7 +4,8 @@ use core::time::Duration;
 
 /// How much of its allowance a key has left, read without consuming any.
 ///
-/// Returned by `RateLimiter::peek`. It answers what rate-limit response
+/// Returned by `RateLimiter::peek` and
+/// [`Gcra::peek_at`](crate::Gcra::peek_at). It answers what rate-limit response
 /// headers need — the capacity, what is left of it, and when it is whole again
 /// — for allowed responses as well as denied ones, without touching the key's
 /// state: peeking never counts a unit, never creates state for an unseen key,
@@ -39,6 +40,9 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Assembles a snapshot, clamping `remaining` to `limit`.
+    // Every producer of snapshots needs 64-bit atomics; on a target without
+    // them the type still exists (it is plain data) but nothing builds one.
+    #[cfg_attr(not(target_has_atomic = "64"), allow(dead_code))]
     pub(crate) fn new(limit: u32, remaining: u32, reset_after: Duration) -> Self {
         Self {
             limit,
@@ -49,11 +53,13 @@ impl Snapshot {
 
     /// A key with its whole allowance: `remaining == limit`, nothing to wait
     /// for. What an unseen key reports.
+    #[cfg(any(feature = "std", test))]
     pub(crate) fn full(limit: u32) -> Self {
         Self::new(limit, limit, Duration::ZERO)
     }
 
     /// A limiter that admits nothing: no capacity, and never any.
+    #[cfg_attr(not(target_has_atomic = "64"), allow(dead_code))]
     pub(crate) fn closed() -> Self {
         Self::new(0, 0, Duration::MAX)
     }

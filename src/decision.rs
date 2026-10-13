@@ -103,6 +103,7 @@ impl Decision {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<better_bucket::Decision> for Decision {
     /// Lifts a [`better_bucket::Decision`] into the rate-net decision. The token
     /// bucket's `Allowed`/`Denied { retry_after }` maps directly; any future
@@ -142,6 +143,7 @@ mod tests {
         assert_eq!(deny.retry_after(), Some(Duration::from_secs(2)));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_from_better_bucket_allowed_maps_to_allow() {
         assert_eq!(
@@ -150,6 +152,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_from_better_bucket_denied_carries_retry_after() {
         let upstream = better_bucket::Decision::Denied {

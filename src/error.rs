@@ -17,8 +17,9 @@ use core::fmt;
 /// A limit configuration rejected at construction time.
 ///
 /// Returned by [`Quota::rate`](crate::Quota::rate) and by the validating
-/// builder (`Builder::try_build`) when the supplied values cannot describe a
-/// working rate limit. Each variant names exactly which constraint
+/// constructors — `Builder::try_build` and
+/// [`Gcra::try_new`](crate::Gcra::try_new) — when the supplied values cannot
+/// describe a working rate limit. Each variant names exactly which constraint
 /// was violated so the caller can correct the specific field.
 ///
 /// The enum is `#[non_exhaustive]`: future releases may add validation rules
@@ -69,6 +70,7 @@ pub enum RateLimiterError {
 
 impl RateLimiterError {
     /// A stable, machine-readable name for the variant.
+    #[cfg(feature = "std")]
     const fn name(self) -> &'static str {
         match self {
             Self::ZeroQuota => "ZeroQuota",

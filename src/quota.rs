@@ -206,6 +206,7 @@ impl Quota {
     /// Assembles a quota from raw parts without validation, for the infallible
     /// [`Builder`](crate::Builder) path. A zero `limit` admits nothing; a zero
     /// `period` yields a degenerate limiter that never refills.
+    #[cfg(any(feature = "std", test))]
     pub(crate) const fn from_parts(limit: u32, period: Duration, burst: u32) -> Self {
         Self {
             limit,

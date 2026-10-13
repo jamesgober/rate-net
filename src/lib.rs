@@ -112,23 +112,20 @@ mod algorithm;
 mod async_limiter;
 #[cfg(feature = "std")]
 mod builder;
-#[cfg(feature = "std")]
 mod decision;
-#[cfg(feature = "std")]
 mod error;
 #[cfg(feature = "std")]
 mod eviction;
+#[cfg(target_has_atomic = "64")]
+mod gcra;
 #[cfg(feature = "std")]
 mod key;
 #[cfg(feature = "std")]
 mod limiter;
-#[cfg(feature = "std")]
 mod quota;
-#[cfg(feature = "std")]
 mod snapshot;
 #[cfg(feature = "std")]
 mod store;
-#[cfg(feature = "std")]
 mod sync;
 
 #[cfg(feature = "std")]
@@ -137,19 +134,17 @@ pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};
 pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
 pub use crate::builder::Builder;
-#[cfg(feature = "std")]
 pub use crate::decision::Decision;
-#[cfg(feature = "std")]
 pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
 pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+#[cfg(target_has_atomic = "64")]
+pub use crate::gcra::Gcra;
 #[cfg(feature = "std")]
 pub use crate::key::Key;
 #[cfg(feature = "std")]
 pub use crate::limiter::{Limiter, RateLimiter};
-#[cfg(feature = "std")]
 pub use crate::quota::Quota;
-#[cfg(feature = "std")]
 pub use crate::snapshot::Snapshot;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.

@@ -105,14 +105,7 @@ impl Algorithm {
         match self {
             Self::TokenBucket => non_zero_burst(quota),
             #[cfg(feature = "algorithms")]
-            Self::LeakyBucket => {
-                non_zero_burst(quota)?;
-                // One emission interval must be at least a nanosecond.
-                if u128::from(quota.limit()) > quota.period().as_nanos() {
-                    return Err(RateLimiterError::RateTooHigh);
-                }
-                Ok(())
-            }
+            Self::LeakyBucket => crate::gcra::validate(quota),
             #[cfg(feature = "algorithms")]
             Self::SlidingWindowLog => {
                 if quota.limit() > MAX_SLIDING_LOG_LIMIT {

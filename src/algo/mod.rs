@@ -19,8 +19,6 @@ use crate::snapshot::Snapshot;
 #[cfg(feature = "algorithms")]
 mod fixed_window;
 #[cfg(feature = "algorithms")]
-mod leaky;
-#[cfg(feature = "algorithms")]
 mod sliding_counter;
 #[cfg(feature = "algorithms")]
 mod sliding_log;
@@ -28,17 +26,17 @@ mod sliding_log;
 #[cfg(feature = "algorithms")]
 use self::fixed_window::FixedWindow;
 #[cfg(feature = "algorithms")]
-use self::leaky::LeakyBucket;
-#[cfg(feature = "algorithms")]
 use self::sliding_counter::SlidingCounter;
 #[cfg(feature = "algorithms")]
 use self::sliding_log::SlidingLog;
+#[cfg(feature = "algorithms")]
+use crate::gcra::Gcra;
 
 /// Per-key state for whichever algorithm the limiter runs.
 pub(crate) enum AlgoState<C: Clock> {
     TokenBucket(Bucket<C>),
     #[cfg(feature = "algorithms")]
-    LeakyBucket(LeakyBucket),
+    LeakyBucket(Gcra),
     #[cfg(feature = "algorithms")]
     FixedWindow(FixedWindow),
     #[cfg(feature = "algorithms")]
@@ -57,7 +55,7 @@ impl<C: Clock> AlgoState<C> {
         match algorithm {
             Algorithm::TokenBucket => Self::TokenBucket(token_bucket(quota, clock)),
             #[cfg(feature = "algorithms")]
-            Algorithm::LeakyBucket => Self::LeakyBucket(LeakyBucket::new(quota)),
+            Algorithm::LeakyBucket => Self::LeakyBucket(Gcra::new(*quota)),
             #[cfg(feature = "algorithms")]
             Algorithm::FixedWindow => Self::FixedWindow(FixedWindow::new(quota, now)),
             #[cfg(feature = "algorithms")]
@@ -77,7 +75,7 @@ impl<C: Clock> AlgoState<C> {
         match self {
             Self::TokenBucket(bucket) => bucket.acquire(n).into(),
             #[cfg(feature = "algorithms")]
-            Self::LeakyBucket(state) => state.acquire(n, now),
+            Self::LeakyBucket(state) => state.check_n_at(n, now),
             #[cfg(feature = "algorithms")]
             Self::FixedWindow(state) => state.acquire(n, now),
             #[cfg(feature = "algorithms")]
@@ -100,7 +98,7 @@ impl<C: Clock> AlgoState<C> {
                 Snapshot::new(capacity, bucket.available(), reset_after)
             }
             #[cfg(feature = "algorithms")]
-            Self::LeakyBucket(state) => state.peek(now),
+            Self::LeakyBucket(state) => state.peek_at(now),
             #[cfg(feature = "algorithms")]
             Self::FixedWindow(state) => state.peek(now),
             #[cfg(feature = "algorithms")]
