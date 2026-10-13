@@ -198,7 +198,8 @@ impl<C: Clock + Clone> Builder<C> {
     }
 
     /// Sets the shard count (rounded up to a power of two). Defaults to a small
-    /// multiple of the core count.
+    /// multiple of the core count. `try_build` rejects `0` and anything above
+    /// [`MAX_SHARDS`](crate::MAX_SHARDS); `build` clamps into that range.
     ///
     /// # Examples
     ///
@@ -296,6 +297,8 @@ impl<C: Clock + Clone> Builder<C> {
     ///   per nanosecond.
     /// - [`RateLimiterError::LimitTooLarge`] — a sliding-window-log limit above
     ///   [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT).
+    /// - [`RateLimiterError::ShardCountOutOfRange`] — a shard count of `0` or
+    ///   above [`MAX_SHARDS`](crate::MAX_SHARDS).
     /// - [`RateLimiterError::IdleTtlTooShort`] — an idle TTL shorter than the
     ///   time a key needs to recover its full allowance (`burst / limit`
     ///   periods for the buckets, one period for the fixed window and log, two
@@ -388,6 +391,12 @@ impl<C: Clock + Clone> Builder<C> {
     fn validate(&self) -> Result<(), RateLimiterError> {
         let quota = self.quota_value();
         self.algorithm.validate(&quota)?;
+        if self
+            .shards
+            .is_some_and(|shards| shards == 0 || shards > crate::store::MAX_SHARDS)
+        {
+            return Err(RateLimiterError::ShardCountOutOfRange);
+        }
         if let Some(ttl) = self.eviction.idle_ttl() {
             if ttl < self.algorithm.recovery_time(&quota) {
                 return Err(RateLimiterError::IdleTtlTooShort);
@@ -568,6 +577,36 @@ mod tests {
         );
         let closed = RateLimiter::builder().build_direct();
         assert!(closed.check().is_deny());
+    }
+
+    #[test]
+    fn test_extreme_shard_counts_never_panic() {
+        for shards in [
+            0usize,
+            1,
+            3,
+            crate::MAX_SHARDS,
+            crate::MAX_SHARDS + 1,
+            usize::MAX,
+        ] {
+            let limiter = RateLimiter::builder().per_second(1).shards(shards).build();
+            assert!(limiter.shards() >= 1 && limiter.shards() <= crate::MAX_SHARDS);
+            assert!(limiter.check("k").is_allow());
+            let valid = (1..=crate::MAX_SHARDS).contains(&shards);
+            let checked = RateLimiter::builder()
+                .per_second(1)
+                .shards(shards)
+                .try_build();
+            assert_eq!(
+                checked.err(),
+                (!valid).then_some(RateLimiterError::ShardCountOutOfRange),
+                "{shards}"
+            );
+        }
+        assert_eq!(
+            RateLimiter::per_second(1).with_shards(usize::MAX).shards(),
+            crate::MAX_SHARDS
+        );
     }
 
     #[test]

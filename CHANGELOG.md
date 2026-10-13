@@ -94,7 +94,9 @@ documentation claims that were not true of `1.0.0` are corrected.
 
 - `Builder::try_build` / `Builder::try_build_direct` — validate the
   configuration and return a `RateLimiterError`. New variants: `ZeroBurst`,
-  `RateTooHigh`, `LimitTooLarge`, `IdleTtlTooShort`. `MAX_SLIDING_LOG_LIMIT`.
+  `RateTooHigh`, `LimitTooLarge`, `ShardCountOutOfRange`, `IdleTtlTooShort`.
+  `MAX_SLIDING_LOG_LIMIT`, `MAX_SHARDS` (the shard count is clamped to it, so
+  `shards(usize::MAX)` no longer overflows).
   `Builder::new`, `Default`, and `Debug` for `Builder`.
 - `RateLimiter::peek` → `Snapshot` (`limit`, `remaining`, `reset_after`,
   `reset_after_secs`, `is_exhausted`, `headers`) — read an allowance without

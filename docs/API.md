@@ -315,12 +315,14 @@ sharding, bounded eviction, `SystemClock`); the quota defaults to a limit of
 - **`try_build`** validates and names the first problem: `ZeroQuota`,
   `ZeroPeriod`, `ZeroBurst` (token / leaky bucket), `RateTooHigh` (leaky bucket
   above one unit per nanosecond), `LimitTooLarge` (sliding-window log above
-  [`MAX_SLIDING_LOG_LIMIT`](#constants)), `IdleTtlTooShort` (an idle TTL below
+  [`MAX_SLIDING_LOG_LIMIT`](#constants)), `ShardCountOutOfRange` (a shard count
+  of `0` or above [`MAX_SHARDS`](#constants)), `IdleTtlTooShort` (an idle TTL below
   the quota's recovery time — `burst / limit` periods for the buckets, one period
   for the fixed window and log, two for the sliding-window counter).
 - **`build`** never fails and **fails closed**: a zero limit, period, or burst
   denies everything for every algorithm; a too-fast leaky-bucket rate is clamped
-  to one unit per nanosecond; a short idle TTL is raised to the recovery time.
+  to one unit per nanosecond; a short idle TTL is raised to the recovery time;
+  a shard count is clamped to `1..=MAX_SHARDS`.
 - **`try_build_direct` / `build_direct`** build a [`DirectLimiter`](#directlimiter)
   from the same algorithm, quota, burst, and clock (shards and eviction are
   ignored).
@@ -821,7 +823,8 @@ do not exist.
 ```rust ignore
 #[non_exhaustive]
 pub enum RateLimiterError {
-    ZeroQuota, ZeroPeriod, ZeroBurst, RateTooHigh, LimitTooLarge, IdleTtlTooShort,
+    ZeroQuota, ZeroPeriod, ZeroBurst, RateTooHigh, LimitTooLarge,
+    ShardCountOutOfRange, IdleTtlTooShort,
 }
 ```
 
@@ -838,6 +841,7 @@ the variant name, `is_retryable()` is `false`. `#[non_exhaustive]`.
 | `ZeroBurst` | The burst was `0` (token / leaky bucket). |
 | `RateTooHigh` | A leaky bucket faster than one unit per nanosecond. |
 | `LimitTooLarge` | A sliding-window log limit above `MAX_SLIDING_LOG_LIMIT`. |
+| `ShardCountOutOfRange` | A shard count of `0` or above `MAX_SHARDS`. |
 | `IdleTtlTooShort` | An idle TTL below the quota's recovery time. |
 
 ```rust
@@ -879,6 +883,7 @@ assert!(err.to_string().contains('6'));
 pub const VERSION: &str;                         // this crate's version
 pub const DEFAULT_MAX_KEYS: usize = 1 << 20;     // the default capacity cap
 pub const MAX_SLIDING_LOG_LIMIT: u32 = 1 << 16;  // try_build ceiling for the log
+pub const MAX_SHARDS: usize = 1 << 16;           // shard-count ceiling (clamped by build)
 pub const MIN_COARSE_RESOLUTION: Duration;       // 100 µs: CoarseClock::spawn floor
 ```
 
@@ -886,6 +891,7 @@ pub const MIN_COARSE_RESOLUTION: Duration;       // 100 µs: CoarseClock::spawn 
 assert_eq!(rate_net::VERSION.split('.').count(), 3);
 assert_eq!(rate_net::DEFAULT_MAX_KEYS, 1_048_576);
 assert_eq!(rate_net::MAX_SLIDING_LOG_LIMIT, 65_536);
+assert_eq!(rate_net::MAX_SHARDS, 65_536);
 assert_eq!(rate_net::MIN_COARSE_RESOLUTION, std::time::Duration::from_micros(100));
 ```
 

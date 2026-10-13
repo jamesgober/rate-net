@@ -54,10 +54,24 @@ use crate::snapshot::Snapshot;
 use crate::sync::{self, AtomicBool, AtomicU64, Ordering, RwLock};
 
 /// The hash bits that pick a shard. `hashbrown` takes the bucket index from the
-/// low bits and a 7-bit tag from the top, so bits 40.. (12 bits cover the
-/// 4096-shard maximum) never correlate with either: keys sharing a shard still
-/// spread evenly across its table.
+/// low bits and a 7-bit tag from the top 7 (57..64), so bits 40..56 (16 bits
+/// cover the [`MAX_SHARDS`] maximum) never correlate with either: keys sharing
+/// a shard still spread evenly across its table.
 const SHARD_SHIFT: u32 = 40;
+
+/// The most shards a store will create. A larger request (including
+/// `usize::MAX`) is clamped to it rather than overflowing or exhausting
+/// memory; `Builder::try_build` rejects it.
+///
+/// # Examples
+///
+/// ```
+/// use rate_net::{MAX_SHARDS, RateLimiter};
+///
+/// assert_eq!(MAX_SHARDS, 65_536);
+/// assert_eq!(RateLimiter::per_second(1).with_shards(usize::MAX).shards(), MAX_SHARDS);
+/// ```
+pub const MAX_SHARDS: usize = 1 << 16;
 
 /// The most slots the CLOCK hand examines to evict one entry.
 pub(crate) const CLOCK_SCAN: usize = 32;
@@ -323,11 +337,13 @@ pub(crate) struct Store<C: Clock> {
 }
 
 impl<C: Clock> Store<C> {
-    /// Builds a store with `shards` shards (rounded up to a power of two, at
-    /// least one) and the given eviction policy. An idle TTL shorter than
-    /// `min_idle` is raised to it.
+    /// Builds a store with `shards` shards (clamped to `1..=MAX_SHARDS`, then
+    /// rounded up to a power of two) and the given eviction policy. An idle
+    /// TTL shorter than `min_idle` is raised to it.
     pub(crate) fn new(shards: usize, eviction: Eviction, min_idle: Duration) -> Self {
-        let shard_count = shards.max(1).next_power_of_two();
+        // `MAX_SHARDS` is a power of two, so rounding a clamped value up never
+        // passes it (and never overflows).
+        let shard_count = shards.clamp(1, MAX_SHARDS).next_power_of_two();
         // Spread a total cap evenly across shards; at least one key per shard so
         // a tiny cap with many shards still admits keys.
         let per_shard_cap = eviction.max_keys().map_or(MAX_SLOTS, |max| {

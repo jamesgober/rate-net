@@ -163,6 +163,8 @@ pub use crate::limiter::{DynLimiter, Limiter, RateLimiter};
 pub use crate::metrics::Metrics;
 pub use crate::quota::Quota;
 pub use crate::snapshot::Snapshot;
+#[cfg(feature = "std")]
+pub use crate::store::MAX_SHARDS;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///

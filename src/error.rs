@@ -60,6 +60,10 @@ pub enum RateLimiterError {
     /// [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT) use the
     /// sliding-window counter, which is O(1) per key.
     LimitTooLarge,
+    /// The shard count is zero or above [`MAX_SHARDS`](crate::MAX_SHARDS)
+    /// (65,536). The infallible constructors clamp it; pick a count between
+    /// one and that ceiling — a small multiple of the core count is typical.
+    ShardCountOutOfRange,
     /// The idle TTL is shorter than the time a key needs to recover its full
     /// allowance. Evicting a key earlier than that hands it a fresh quota
     /// early — an over-admit. Raise the TTL to at least the quota's recovery
@@ -78,6 +82,7 @@ impl RateLimiterError {
             Self::ZeroBurst => "ZeroBurst",
             Self::RateTooHigh => "RateTooHigh",
             Self::LimitTooLarge => "LimitTooLarge",
+            Self::ShardCountOutOfRange => "ShardCountOutOfRange",
             Self::IdleTtlTooShort => "IdleTtlTooShort",
         }
     }
@@ -91,6 +96,7 @@ impl fmt::Display for RateLimiterError {
             Self::ZeroBurst => "quota burst must be greater than zero",
             Self::RateTooHigh => "quota rate exceeds one unit per nanosecond",
             Self::LimitTooLarge => "quota limit exceeds the sliding-window log's per-key ceiling",
+            Self::ShardCountOutOfRange => "shard count must be between 1 and 65,536",
             Self::IdleTtlTooShort => "idle TTL is shorter than the quota's recovery time",
         };
         f.write_str(message)
@@ -192,12 +198,13 @@ mod tests {
     use super::{InsufficientCapacity, RateLimiterError};
     use error_forge::ForgeError;
 
-    const ALL: [RateLimiterError; 6] = [
+    const ALL: [RateLimiterError; 7] = [
         RateLimiterError::ZeroQuota,
         RateLimiterError::ZeroPeriod,
         RateLimiterError::ZeroBurst,
         RateLimiterError::RateTooHigh,
         RateLimiterError::LimitTooLarge,
+        RateLimiterError::ShardCountOutOfRange,
         RateLimiterError::IdleTtlTooShort,
     ];
 
@@ -211,6 +218,11 @@ mod tests {
             RateLimiterError::LimitTooLarge
                 .to_string()
                 .contains("limit")
+        );
+        assert!(
+            RateLimiterError::ShardCountOutOfRange
+                .to_string()
+                .contains("shard")
         );
         assert!(
             RateLimiterError::IdleTtlTooShort
