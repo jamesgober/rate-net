@@ -113,6 +113,12 @@ impl FixedWindow {
 
         let now_ns = nanos(now);
         let own_window = self.window_of(now_ns);
+        // The state word this thread already judged to belong to an older
+        // window when it opened `window`. If a weak compare-and-swap fails
+        // spuriously the word is unchanged, but `latest` now names the new
+        // window, and a wrapped 32-bit index could make the old count look
+        // like the new window's. Remembering the word keeps the retry exact.
+        let mut opened_over: Option<(u64, u64)> = None;
 
         loop {
             // Load the state word first: whoever switched it raised `latest`
@@ -121,7 +127,11 @@ impl FixedWindow {
             let latest = self.latest.load(Ordering::Acquire);
             // A late thread counts against the newer window, never its own.
             let window = own_window.max(latest);
-            let base = Self::count_in(window, current, latest);
+            let base = if opened_over == Some((current, window)) {
+                0
+            } else {
+                Self::count_in(window, current, latest)
+            };
 
             // Widened: `base` and `n` are each at most `limit`, so their sum can
             // exceed `u32::MAX` when `limit > u32::MAX / 2`.
@@ -135,6 +145,7 @@ impl FixedWindow {
             if window > latest {
                 // Opening a new window: publish it before switching the state.
                 let _previous = self.latest.fetch_max(window, Ordering::AcqRel);
+                opened_over = Some((current, window));
             }
             // `total <= limit <= u32::MAX`, so the narrowing is exact.
             let next = pack(window as u32, total as u32);
