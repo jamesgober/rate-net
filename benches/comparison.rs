@@ -34,6 +34,30 @@ mod compare {
         group.finish();
     }
 
+    pub fn direct(c: &mut Criterion) {
+        let rn = rate_net::DirectLimiter::per_second(u32::MAX);
+        let gov = governor::RateLimiter::direct(governor::Quota::per_second(huge()));
+
+        let mut group = c.benchmark_group("compare/direct");
+        let _ = group.bench_function("rate-net", |b| b.iter(|| black_box(&rn).check()));
+        let _ = group.bench_function("governor", |b| b.iter(|| black_box(&gov).check()));
+        group.finish();
+    }
+
+    pub fn single_key_coarse_clock(c: &mut Criterion) {
+        let clock = rate_net::CoarseClock::spawn(std::time::Duration::from_millis(1))
+            .expect("spawn the ticker");
+        let rn = rate_net::RateLimiter::per_second(u32::MAX).with_clock(clock);
+        let _ = rn.check(42u64);
+        let gov = governor::RateLimiter::keyed(governor::Quota::per_second(huge()));
+        let _ = gov.check_key(&42u64);
+
+        let mut group = c.benchmark_group("compare/single_key_coarse_clock");
+        let _ = group.bench_function("rate-net", |b| b.iter(|| rn.check(black_box(42u64))));
+        let _ = group.bench_function("governor", |b| b.iter(|| gov.check_key(black_box(&42u64))));
+        group.finish();
+    }
+
     pub fn many_keys(c: &mut Criterion) {
         let keys: Vec<u64> = (0..10_000).collect();
 
@@ -72,6 +96,8 @@ fn main() {
     {
         let mut criterion = criterion::Criterion::default().configure_from_args();
         compare::single_key(&mut criterion);
+        compare::single_key_coarse_clock(&mut criterion);
+        compare::direct(&mut criterion);
         compare::many_keys(&mut criterion);
         criterion.final_summary();
     }
