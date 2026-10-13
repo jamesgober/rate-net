@@ -67,30 +67,61 @@ impl SlidingCounter {
         let real_now_ns = nanos(now);
         let mut state = sync::lock(&self.state);
         let (now_ns, offset) = self.roll(&mut state, real_now_ns);
-        let estimated = self.estimate(&state, offset);
 
-        if estimated + f64::from(n) <= f64::from(self.limit) {
+        if self.fits(&state, offset, n) {
             state.curr = state.curr.saturating_add(n);
             return Decision::Allow;
         }
 
-        // Denied: estimate how long until the weighted count falls enough. While
-        // the previous window still contributes, its term decays at `prev /
-        // period` per nanosecond; otherwise wait for the next window boundary.
-        // A late thread waits from its own (earlier) instant. The wait is at
-        // least a nanosecond: a denial never tells the caller to retry at once.
-        let deficit = estimated + f64::from(n) - f64::from(self.limit);
-        let wait_ns = if state.prev > 0 {
-            ((deficit * self.period_ns as f64 / f64::from(state.prev)) as u64).min(self.period_ns)
-        } else {
-            self.period_ns - offset
-        };
+        // Denied: the wait is the exact earliest instant at which the same
+        // request fits, so retrying after `retry_after` (absent other traffic)
+        // is admitted. A late thread waits from its own, earlier, instant.
+        let wait_ns = self.earliest_fit(&state, offset, n);
         let late_by = now_ns - real_now_ns;
         Decision::Deny {
             retry_after: Duration::from_nanos(wait_ns.saturating_add(late_by).max(1)),
         }
     }
 
+    /// The weighted count, scaled by the period so it stays an exact integer:
+    /// `prev * (period - offset) + curr * period`. The previous window's
+    /// contribution fades linearly across the current window — full at the
+    /// boundary, zero at the next.
+    fn weighted(&self, state: &State, offset: u64) -> u128 {
+        let period = u128::from(self.period_ns);
+        u128::from(state.prev) * (period - u128::from(offset)) + u128::from(state.curr) * period
+    }
+
+    /// Whether `n` more units fit at `offset`: `weighted + n * period <=
+    /// limit * period`, in exact integer arithmetic.
+    fn fits(&self, state: &State, offset: u64, n: u32) -> bool {
+        let period = u128::from(self.period_ns);
+        self.weighted(state, offset) + u128::from(n) * period <= u128::from(self.limit) * period
+    }
+
+    /// Nanoseconds from `offset` until `n` units first fit, assuming no other
+    /// traffic. The caller has checked they do not fit now and `n <= limit`.
+    fn earliest_fit(&self, state: &State, offset: u64, n: u32) -> u64 {
+        let period = u128::from(self.period_ns);
+        let (prev, curr) = (u128::from(state.prev), u128::from(state.curr));
+        let (limit, n) = (u128::from(self.limit), u128::from(n));
+        if curr + n <= limit && prev > 0 {
+            // Still in this window, once the previous window's share has
+            // faded enough: `prev * (period - o) <= (limit - n - curr) *
+            // period`, so `o >= period - floor((limit - n - curr) * period /
+            // prev)`.
+            let slack = (limit - n - curr) * period / prev;
+            let fit_at = period - slack.min(period);
+            (fit_at as u64).saturating_sub(offset).max(1)
+        } else {
+            // Only in the next window, where this window's count becomes the
+            // fading one: `curr * (period - x) <= (limit - n) * period`, so
+            // `x >= period - floor((limit - n) * period / curr)`.
+            let slack = ((limit - n) * period).checked_div(curr).unwrap_or(period);
+            let x = period - slack.min(period);
+            (self.period_ns - offset).saturating_add(x as u64)
+        }
+    }
     /// Rolls the windows forward to `real_now_ns` and returns the effective
     /// instant and its offset into the current window.
     ///
@@ -112,13 +143,6 @@ impl SlidingCounter {
         (now_ns, now_ns % self.period_ns)
     }
 
-    /// The weighted count: the previous window's contribution fades linearly
-    /// across the current window — full at the boundary, zero at the next.
-    fn estimate(&self, state: &State, offset: u64) -> f64 {
-        let weight = (self.period_ns - offset) as f64 / self.period_ns as f64;
-        f64::from(state.prev) * weight + f64::from(state.curr)
-    }
-
     /// Units admissible right now, and the wait until both windows' counts
     /// have faded out (the full allowance is back).
     pub(crate) fn peek(&self, now: Duration) -> Snapshot {
@@ -128,8 +152,11 @@ impl SlidingCounter {
         let real_now_ns = nanos(now);
         let mut state = sync::lock(&self.state);
         let (now_ns, offset) = self.roll(&mut state, real_now_ns);
-        let estimated = self.estimate(&state, offset);
-        let remaining = (f64::from(self.limit) - estimated).floor().max(0.0) as u32;
+        // The largest `k` with `weighted + k * period <= limit * period`.
+        let period = u128::from(self.period_ns);
+        let headroom =
+            (u128::from(self.limit) * period).saturating_sub(self.weighted(&state, offset));
+        let remaining = u32::try_from(headroom / period).unwrap_or(u32::MAX);
         let to_boundary = self.period_ns - offset;
         let full_in = if state.curr > 0 {
             // The current window's count fades out over the next one.
@@ -203,16 +230,43 @@ mod tests {
     }
 
     #[test]
-    fn test_denial_reports_a_bounded_retry_after() {
+    fn test_denial_reports_the_exact_earliest_fit() {
+        // Two spent at t=0. One more fits only once window 1 is half over:
+        // `2 * (1000 - x) / 1000 + 1 <= 2` gives x >= 500ms, so from t=100ms
+        // the wait is 900ms + 500ms.
         let sc = SlidingCounter::new(&Quota::per_second(2), at(0));
         assert!(sc.acquire(2, at(0)).is_allow());
-        match sc.acquire(1, at(100)) {
-            Decision::Deny { retry_after } => {
-                assert!(retry_after > Duration::ZERO);
-                assert!(retry_after <= Duration::from_secs(1));
-            }
-            other => panic!("expected denial, got {other:?}"),
-        }
+        assert_eq!(sc.acquire(1, at(100)).retry_after(), Some(at(1_400)));
+        assert!(sc.acquire(1, at(1_499)).is_deny());
+        assert!(sc.acquire(1, at(1_500)).is_allow());
+    }
+
+    #[test]
+    fn test_retry_after_is_never_early_within_the_window() {
+        // 10/s, all ten spent at t=0, then a check at t=500ms (the audit's
+        // case). In window 1 the previous count weighs 10 at the boundary, so
+        // one more fits only at x >= 100ms: a 600ms wait, not 500ms.
+        let sc = SlidingCounter::new(&Quota::per_second(10), at(0));
+        assert!(sc.acquire(10, at(0)).is_allow());
+        let wait = sc.acquire(1, at(500)).retry_after().unwrap_or_default();
+        assert_eq!(wait, at(600));
+        assert!(
+            sc.acquire(1, at(500) + wait - Duration::from_nanos(1))
+                .is_deny()
+        );
+        assert!(sc.acquire(1, at(500) + wait).is_allow());
+    }
+
+    #[test]
+    fn test_retry_after_while_the_previous_window_fades() {
+        // Window 1 inherits 4 from window 0; 4 more are spent in window 1, so
+        // at t=1200ms the estimate is 4 * 0.8 + 4 = 7.2 of 8. Two more need
+        // `4 * (1000 - o) / 1000 + 4 + 2 <= 8`: o >= 500ms, a 300ms wait.
+        let sc = SlidingCounter::new(&Quota::per_second(8), at(0));
+        assert!(sc.acquire(4, at(0)).is_allow());
+        assert!(sc.acquire(4, at(1_000)).is_allow());
+        assert_eq!(sc.acquire(2, at(1_200)).retry_after(), Some(at(300)));
+        assert!(sc.acquire(2, at(1_500)).is_allow());
     }
 
     #[test]
