@@ -501,6 +501,122 @@ impl<C: Clock + Clone> RateLimiter<C> {
             .unwrap_or_else(|| fresh_snapshot(self.algorithm, &self.quota))
     }
 
+    /// Restores `key`'s full allowance, as if it had been idle long enough to
+    /// refill completely. The key stays tracked.
+    ///
+    /// For administrative unblocks ("this customer was throttled by mistake")
+    /// and tests. Returns `true` if the key had state, `false` if it was not
+    /// tracked (an untracked key already has its full allowance).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_minute(2);
+    /// assert!(limiter.check_n("user:42", 2).is_allow());
+    /// assert!(limiter.check("user:42").is_deny());
+    ///
+    /// assert!(limiter.reset("user:42"));
+    /// assert!(limiter.check("user:42").is_allow());
+    /// assert!(!limiter.reset("never-seen"));
+    /// ```
+    pub fn reset(&self, key: impl Into<Key>) -> bool {
+        self.store.reset(&key.into())
+    }
+
+    /// Forgets `key` entirely, releasing its state. Its next check starts from
+    /// a fresh allowance.
+    ///
+    /// Returns `true` if the key had state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("user:42");
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    ///
+    /// assert!(limiter.remove("user:42"));
+    /// assert_eq!(limiter.tracked_keys(), 0);
+    /// assert!(!limiter.remove("user:42"));
+    /// ```
+    pub fn remove(&self, key: impl Into<Key>) -> bool {
+        self.store.remove(&key.into())
+    }
+
+    /// Forgets every key and releases the store's memory. Every key's next
+    /// check starts from a fresh allowance.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// for user in 0..100u64 {
+    ///     let _ = limiter.check(user);
+    /// }
+    /// limiter.clear();
+    /// assert_eq!(limiter.tracked_keys(), 0);
+    /// ```
+    pub fn clear(&self) {
+        self.store.clear();
+    }
+
+    /// Forgets every key whose allowance has fully recovered, returning how
+    /// many were removed.
+    ///
+    /// A key with its whole allowance back behaves exactly like a key never
+    /// seen, so this cleanup changes no decision — it only returns memory.
+    /// Eviction already bounds the store, so calling this is optional; it suits
+    /// a periodic maintenance task that wants the store to shrink back after a
+    /// traffic spike. Each shard is walked in short chunks with the lock
+    /// released in between, so concurrent checks keep flowing; the cost is
+    /// proportional to the number of tracked keys.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let limiter = RateLimiter::per_second(10).with_clock(Arc::clone(&clock));
+    /// let _ = limiter.check("busy");
+    /// let _ = limiter.check("quiet");
+    ///
+    /// clock.advance(Duration::from_secs(1)); // both refill completely
+    /// let _ = limiter.check("busy");         // ...and one spends again
+    ///
+    /// assert_eq!(limiter.retain_recent(), 1); // "quiet" is forgotten
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    /// ```
+    pub fn retain_recent(&self) -> usize {
+        self.store.retain_recent(self.now())
+    }
+
+    /// Releases memory the store holds beyond its current keys — for example
+    /// after [`retain_recent`](Self::retain_recent) or a burst of evictions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("k");
+    /// limiter.shrink_to_fit();
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    /// ```
+    pub fn shrink_to_fit(&self) {
+        self.store.shrink_to_fit();
+    }
+
     /// The shared check path: hand the key to the store as of the elapsed time,
     /// seeding fresh per-key state if this is the first time the key is seen.
     #[inline]

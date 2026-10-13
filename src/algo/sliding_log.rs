@@ -167,6 +167,14 @@ impl SlidingLog {
         });
         Snapshot::new(self.limit, self.limit.saturating_sub(used), reset_after)
     }
+
+    /// Forgets every record: the key has its full allowance again.
+    pub(crate) fn reset(&self) {
+        let mut log = sync::lock(&self.log);
+        let total = log.total();
+        log.runs.clear();
+        log.expired_total = total;
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -295,5 +303,15 @@ mod tests {
         let snapshot = sl.peek(at(1_000));
         assert_eq!((snapshot.remaining(), snapshot.reset_after()), (4, at(400)));
         assert_eq!(sl.peek(at(1_400)), Snapshot::full(5));
+    }
+
+    #[test]
+    fn test_reset_restores_the_full_allowance() {
+        let sl = SlidingLog::new(&Quota::per_second(2));
+        assert!(sl.acquire(2, at(0)).is_allow());
+        assert!(sl.acquire(1, at(0)).is_deny());
+        sl.reset();
+        assert!(sl.acquire(2, at(0)).is_allow());
+        assert!(sl.acquire(1, at(0)).is_deny());
     }
 }

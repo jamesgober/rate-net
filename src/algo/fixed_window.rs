@@ -167,6 +167,12 @@ impl FixedWindow {
         };
         Snapshot::new(self.limit, self.limit - used, reset_after)
     }
+
+    /// Zeroes the newest window's count: the key has its full allowance again.
+    pub(crate) fn reset(&self) {
+        let latest = self.latest.load(Ordering::Acquire);
+        self.state.store(pack(latest as u32, 0), Ordering::Release);
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -288,6 +294,16 @@ mod tests {
         assert_eq!(snapshot.reset_after(), at(750));
         // A new window is full again, without any check rolling it.
         assert_eq!(fw.peek(at(1_000)).remaining(), 5);
+    }
+
+    #[test]
+    fn test_reset_restores_the_current_window() {
+        let fw = FixedWindow::new(&Quota::per_second(2), at(0));
+        assert!(fw.acquire(2, at(0)).is_allow());
+        assert!(fw.acquire(1, at(0)).is_deny());
+        fw.reset();
+        assert_eq!(fw.peek(at(0)).remaining(), 2);
+        assert!(fw.acquire(2, at(0)).is_allow());
     }
 
     #[test]

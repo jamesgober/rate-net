@@ -63,6 +63,9 @@ pub(crate) const CLOCK_SCAN: usize = 32;
 /// The slots the idle sweep examines per insert.
 pub(crate) const TTL_SWEEP: usize = 8;
 
+/// The slots `retain_recent` examines per write-lock acquisition.
+const RETAIN_CHUNK: usize = 1_024;
+
 /// The most slots one shard can index (slot indices are `u32`).
 const MAX_SLOTS: usize = u32::MAX as usize;
 
@@ -366,6 +369,78 @@ impl<C: Clock> Store<C> {
         map.get(hash, key).map(|entry| entry.state.peek(now))
     }
 
+    /// Restores `key`'s full allowance, keeping it tracked. Returns whether the
+    /// key had state.
+    pub(crate) fn reset(&self, key: &Key) -> bool {
+        let hash = self.hasher.hash_one(key);
+        let map = sync::read(&self.shard(hash).map);
+        map.get(hash, key).is_some_and(|entry| {
+            entry.state.reset();
+            true
+        })
+    }
+
+    /// Forgets `key` entirely. Returns whether the key had state.
+    pub(crate) fn remove(&self, key: &Key) -> bool {
+        let hash = self.hasher.hash_one(key);
+        let mut map = sync::write(&self.shard(hash).map);
+        map.position(hash, key)
+            .and_then(|pos| map.remove_at(pos))
+            .is_some()
+    }
+
+    /// Forgets every key and releases the shards' memory.
+    pub(crate) fn clear(&self) {
+        for shard in self.shards.iter() {
+            *sync::write(&shard.map) = ShardMap::new();
+        }
+    }
+
+    /// Forgets every key whose state is indistinguishable from a fresh key's —
+    /// its whole allowance is back — so no decision changes. Returns how many
+    /// were removed.
+    ///
+    /// Each shard is walked in chunks of [`RETAIN_CHUNK`] slots, releasing the
+    /// write lock between chunks, so concurrent checks never wait behind a
+    /// whole-shard pass.
+    pub(crate) fn retain_recent(&self, now: Duration) -> usize {
+        let mut removed = 0;
+        for shard in self.shards.iter() {
+            // Walk downward: a swap-remove moves an already-examined slot into
+            // the gap, so nothing is skipped.
+            let mut cursor = usize::MAX;
+            loop {
+                let mut map = sync::write(&shard.map);
+                cursor = cursor.min(map.slots.len());
+                let stop = cursor.saturating_sub(RETAIN_CHUNK);
+                while cursor > stop {
+                    cursor -= 1;
+                    let full = map
+                        .slots
+                        .get(cursor)
+                        .is_some_and(|slot| slot.entry.state.is_full(now));
+                    if full && map.remove_at(cursor).is_some() {
+                        removed += 1;
+                    }
+                }
+                if cursor == 0 {
+                    break;
+                }
+            }
+        }
+        removed
+    }
+
+    /// Releases memory the shards hold beyond their current keys.
+    pub(crate) fn shrink_to_fit(&self) {
+        for shard in self.shards.iter() {
+            let mut map = sync::write(&shard.map);
+            let ShardMap { index, slots, .. } = &mut *map;
+            slots.shrink_to_fit();
+            index.shrink_to_fit(|&p| slots.get(p as usize).map_or(0, |slot| slot.hash));
+        }
+    }
+
     /// The number of keys with live state across all shards. A momentary,
     /// advisory snapshot.
     pub(crate) fn len(&self) -> usize {
@@ -622,6 +697,62 @@ mod tests {
 
         clock.advance(Duration::from_secs(1));
         assert!(store.check(Key::from("k"), 1, at(1_000), &make).is_allow());
+    }
+
+    #[test]
+    fn test_peek_reset_and_remove_single_keys() {
+        let store = make_store(2, Eviction::unbounded());
+        let make = token_state(10);
+        let key = Key::from("k");
+        assert_eq!(store.peek(&key, at(0)), None);
+        assert!(!store.reset(&key));
+        assert!(!store.remove(&key));
+
+        assert!(store.check(key.clone(), 4, at(0), &make).is_allow());
+        assert_eq!(store.peek(&key, at(0)).map(|s| s.remaining()), Some(6));
+        assert!(store.reset(&key));
+        assert_eq!(store.peek(&key, at(0)).map(|s| s.remaining()), Some(10));
+        assert!(store.remove(&key));
+        assert_eq!(store.peek(&key, at(0)), None);
+        assert_eq!(store.len(), 0);
+        store.assert_consistent();
+    }
+
+    #[test]
+    fn test_clear_and_shrink_forget_everything() {
+        let store = make_store(4, Eviction::unbounded());
+        let make = token_state(10);
+        for k in 0..500u64 {
+            let _ = store.check(Key::from(k), 1, at(0), &make);
+        }
+        assert_eq!(store.len(), 500);
+        store.shrink_to_fit();
+        store.assert_consistent();
+        store.clear();
+        assert_eq!(store.len(), 0);
+        store.assert_consistent();
+        assert!(store.check(Key::from(1u64), 10, at(0), &make).is_allow());
+    }
+
+    #[test]
+    fn test_retain_recent_removes_only_full_keys() {
+        // An hour-long period: nothing refills during the test.
+        let make = || AlgoState::TokenBucket(Bucket::per_duration(5, Duration::from_secs(3_600)));
+        let store = make_store(2, Eviction::unbounded());
+        // 3_000 keys: spans several retain chunks per shard.
+        for k in 0..3_000u64 {
+            let n = if k % 3 == 0 { 0 } else { 1 };
+            let _ = store.check(Key::from(k), n, at(0), make);
+        }
+        // Every third key spent nothing, so it is full and forgettable.
+        assert_eq!(store.retain_recent(at(0)), 1_000);
+        assert_eq!(store.len(), 2_000);
+        store.assert_consistent();
+        for k in 0..3_000u64 {
+            let tracked = store.peek(&Key::from(k), at(0)).is_some();
+            assert_eq!(tracked, k % 3 != 0, "key {k}");
+        }
+        assert_eq!(store.retain_recent(at(0)), 0);
     }
 
     proptest::proptest! {

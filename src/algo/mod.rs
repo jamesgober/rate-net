@@ -109,6 +109,28 @@ impl<C: Clock> AlgoState<C> {
             Self::SlidingCounter(state) => state.peek(now),
         }
     }
+
+    /// Restores the key's full allowance as of now.
+    pub(crate) fn reset(&self) {
+        match self {
+            Self::TokenBucket(bucket) => bucket.reset(),
+            #[cfg(feature = "algorithms")]
+            Self::LeakyBucket(state) => state.reset(),
+            #[cfg(feature = "algorithms")]
+            Self::FixedWindow(state) => state.reset(),
+            #[cfg(feature = "algorithms")]
+            Self::SlidingLog(state) => state.reset(),
+            #[cfg(feature = "algorithms")]
+            Self::SlidingCounter(state) => state.reset(),
+        }
+    }
+
+    /// Whether the key's state is indistinguishable from a fresh key's — its
+    /// whole allowance is available — so forgetting it changes no decision.
+    pub(crate) fn is_full(&self, now: Duration) -> bool {
+        let snapshot = self.peek(now);
+        snapshot.remaining() == snapshot.limit()
+    }
 }
 
 /// What a key that has never been seen reports: its whole allowance under
@@ -166,6 +188,23 @@ mod tests {
             Duration::ZERO,
         );
         (clock, state)
+    }
+
+    #[test]
+    fn test_token_bucket_peek_reset_and_fullness() {
+        let (clock, state) = token(Quota::per_second(10));
+        assert_eq!(state.peek(Duration::ZERO), Snapshot::full(10));
+        assert!(state.is_full(Duration::ZERO));
+        assert!(state.acquire(4, Duration::ZERO).is_allow());
+        let snapshot = state.peek(Duration::ZERO);
+        assert_eq!(snapshot.remaining(), 6);
+        // Four tokens at 10/s take 400ms to come back.
+        assert_eq!(snapshot.reset_after(), Duration::from_millis(400));
+        assert!(!state.is_full(Duration::ZERO));
+        state.reset();
+        assert!(state.is_full(Duration::ZERO));
+        clock.advance(Duration::from_secs(1));
+        assert!(state.is_full(Duration::ZERO));
     }
 
     #[test]

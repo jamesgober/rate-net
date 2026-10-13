@@ -167,6 +167,11 @@ impl LeakyBucket {
             reset_after,
         )
     }
+
+    /// Drains the bucket: the key has its full burst again.
+    pub(crate) fn reset(&self) {
+        self.tat.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -258,6 +263,19 @@ mod tests {
         assert_eq!(snapshot.reset_after(), at(400));
         assert_eq!(lb.peek(at(150)).remaining(), 7);
         assert_eq!(lb.peek(at(400)), Snapshot::full(10));
+    }
+
+    #[test]
+    fn test_reset_restores_the_full_burst() {
+        let lb = LeakyBucket::new(&Quota::per_second(3));
+        assert!(lb.acquire(3, at(0)).is_allow());
+        assert!(lb.acquire(1, at(0)).is_deny());
+        lb.reset();
+        assert!(lb.acquire(3, at(0)).is_allow());
+        assert_eq!(
+            LeakyBucket::new(&Quota::per_second(0)).peek(at(0)),
+            Snapshot::closed()
+        );
     }
 
     #[test]

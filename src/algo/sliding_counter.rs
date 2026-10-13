@@ -147,6 +147,13 @@ impl SlidingCounter {
         };
         Snapshot::new(self.limit, remaining, reset_after)
     }
+
+    /// Clears both windows: the key has its full allowance again.
+    pub(crate) fn reset(&self) {
+        let mut state = sync::lock(&self.state);
+        state.prev = 0;
+        state.curr = 0;
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -252,5 +259,14 @@ mod tests {
         // Half way through the next window, half of the 4 still counts.
         assert_eq!(sc.peek(at(1_500)).remaining(), 8);
         assert_eq!(sc.peek(at(2_000)), Snapshot::full(10));
+    }
+
+    #[test]
+    fn test_reset_clears_both_windows() {
+        let sc = SlidingCounter::new(&Quota::per_second(3), at(0));
+        assert!(sc.acquire(3, at(0)).is_allow());
+        assert!(sc.acquire(1, at(1_000)).is_deny());
+        sc.reset();
+        assert!(sc.acquire(3, at(1_000)).is_allow());
     }
 }
