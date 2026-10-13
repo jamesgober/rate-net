@@ -12,7 +12,7 @@
 pub(crate) use loom::sync::atomic::AtomicBool;
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(loom, feature = "algorithms"))]
+#[cfg(all(loom, feature = "std", feature = "algorithms"))]
 pub(crate) use loom::sync::{Mutex, MutexGuard};
 #[cfg(all(loom, feature = "std"))]
 pub(crate) use loom::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -21,7 +21,7 @@ pub(crate) use loom::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub(crate) use core::sync::atomic::AtomicBool;
 #[cfg(all(not(loom), target_has_atomic = "64"))]
 pub(crate) use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(all(not(loom), feature = "algorithms"))]
+#[cfg(all(not(loom), feature = "std", feature = "algorithms"))]
 pub(crate) use std::sync::{Mutex, MutexGuard};
 #[cfg(all(not(loom), feature = "std"))]
 pub(crate) use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -46,7 +46,7 @@ pub(crate) fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 
 /// Recovers a mutex guard even if a previous holder panicked. See [`read`].
-#[cfg(feature = "algorithms")]
+#[cfg(all(feature = "std", feature = "algorithms"))]
 #[inline]
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)

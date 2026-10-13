@@ -167,8 +167,32 @@ governor = "0.8"
 
 # EXAMPLES
 # #################################
-# Most examples build on the always-available token bucket; these two need an
-# opt-in feature, so they are only compiled when it is enabled.
+# Every example drives the std limiter, so each declares the features it needs;
+# `cargo test --no-default-features` then skips them instead of failing.
+[[example]]
+name              = "per_second"
+required-features = ["std"]
+
+[[example]]
+name              = "per_key"
+required-features = ["std"]
+
+[[example]]
+name              = "mock_clock"
+required-features = ["std"]
+
+[[example]]
+name              = "retry_after"
+required-features = ["std"]
+
+[[example]]
+name              = "gatekeeper"
+required-features = ["std"]
+
+[[example]]
+name              = "direct"
+required-features = ["std"]
+
 [[example]]
 name              = "algorithms"
 required-features = ["algorithms"]
@@ -182,8 +206,9 @@ required-features = ["async"]
 # BENCHMARKS
 # #################################
 [[bench]]
-name    = "rate_bench"
-harness = false
+name              = "rate_bench"
+harness           = false
+required-features = ["std"]
 
 [[bench]]
 name    = "comparison"
