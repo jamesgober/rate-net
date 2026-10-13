@@ -22,7 +22,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "A powerful, lock-free rate limiter for Rust: multiple algorithms behind one trait, sharded per-key state, bounded-memory eviction, retry-after, and a one-line Tier-1 API. Built against hostile traffic."
+description = "A rate limiter for Rust: five algorithms behind one trait, sharded per-key state with O(1) bounded-memory eviction, retry-after and RateLimit headers, a no_std single-key core, and a one-line Tier-1 API. Built against hostile traffic."
 
 # Keywords (5 max)
 keywords = [
@@ -81,12 +81,14 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Default build: std on, all core algorithms available.
 default = ["std"]
 
-# Standard library. The limiter — the sharded per-key store, the token-bucket
-# core (better-bucket's clock-driven surface), the injectable clock, and the
-# domain error type — requires std, so std gates `better-bucket`'s `clock`
-# feature, `clock-lib`, and `error-forge`. With std off the crate is no_std and
-# exposes only `VERSION`; the pared-down single-key mode follows in a later
-# release.
+# Standard library. The keyed limiter — the sharded per-key store, the
+# token-bucket core (better-bucket's clock-driven surface), the injectable
+# clock, `DirectLimiter`, `CoarseClock`, and the error-forge integration —
+# requires std, so std gates `better-bucket`'s `clock` feature, `clock-lib`,
+# `error-forge`, `ahash`, and `hashbrown`. With std off the crate is no_std and
+# exposes the clock-free single-key core: `Gcra` (on targets with 64-bit
+# atomics), `Quota`, `Decision`, `Snapshot`, the error types, and the header
+# names.
 std = [
     "dep:better-bucket",
     "better-bucket/clock",
