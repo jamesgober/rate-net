@@ -85,16 +85,20 @@ jobs:
           MIRIFLAGS: "-Zmiri-disable-isolation"
 
   no-std:
-    name: no_std (thumbv7em-none-eabihf)
+    name: no_std (thumbv7em-none-eabihf, wasm32-unknown-unknown)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv7em-none-eabihf
+          targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # thumbv7em has no 64-bit atomics, so this checks the data-type surface.
       - name: Build the no_std core for an embedded target
         run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
+      # wasm32 has 64-bit atomics: this builds `Gcra` itself without std.
+      - name: Build the no_std Gcra core
+        run: cargo build --lib --no-default-features --target wasm32-unknown-unknown
 
   i686:
     name: 32-bit (i686-unknown-linux-gnu)
