@@ -64,7 +64,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 
 - **Multi-algorithm** — token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter, all behind one `Limiter` trait (and the object-safe `DynLimiter`)
 - **Per-key limiting** — per-IP, per-subnet, per-user, per-endpoint, per-anything; sharded so keys rarely contend
-- **Direct limiting** — `DirectLimiter` for one stream: no key, no map, no lock
+- **Direct limiting** — `DirectLimiter` for one stream: no key, no map, no shard lock
 - **`no_std` core** — `Gcra`, a clock-free single-key limiter driven by caller-supplied time
 - **Validated configuration** — `Builder::try_build` rejects zero periods, zero bursts, out-of-range rates, and idle TTLs that would reset a key early; `build` fails closed
 - **Bounded memory** — O(1) CLOCK eviction plus an incremental idle sweep; survives a hostile unique-key flood
@@ -211,7 +211,8 @@ use the tagged constructors. `Key`'s `Debug` never prints the key's bytes.
 ## One stream, and `no_std`
 
 `DirectLimiter` limits a single stream — client-side throttling, a shared
-resource, a loop — with no key, map, hash, or lock:
+resource, a loop — with no key, map, hash, or shard lock (the token bucket's
+check is one compare-and-swap):
 
 ```rust
 use rate_net::DirectLimiter;

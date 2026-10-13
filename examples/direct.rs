@@ -1,4 +1,4 @@
-//! Pacing one stream with a `DirectLimiter`: no keys, no map, no lock — the
+//! Pacing one stream with a `DirectLimiter`: no keys, no map, no shard lock — the
 //! cheapest check the crate offers, for client-side throttling.
 //!
 //! ```text

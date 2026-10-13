@@ -15,7 +15,7 @@
 //! - `check/insert_at_default_cap` — the same at the realistic scale: the
 //!   default 1,048,576-key cap over the default shard count, full. Before the
 //!   CLOCK eviction this cost ~329 µs per insert.
-//! - `check/direct` — a [`DirectLimiter`]: no key, no map, no lock.
+//! - `check/direct` — a [`DirectLimiter`]: no key, no map, no shard lock.
 //! - `check/direct_coarse_clock` — the same on a [`CoarseClock`].
 //! - `peek/existing_key` — reading an allowance for `RateLimit-*` headers.
 //!

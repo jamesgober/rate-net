@@ -11,14 +11,17 @@ use crate::decision::Decision;
 use crate::quota::Quota;
 use crate::snapshot::Snapshot;
 
-/// A rate limiter for one stream: no keys, no map, no hash, no lock.
+/// A rate limiter for one stream: no keys, no map, no hash, no shard lock.
 ///
 /// Where [`RateLimiter`](crate::RateLimiter) tracks an allowance per key,
 /// `DirectLimiter` holds exactly one — the right tool for client-side
 /// throttling ("call this API at most 50 times a second"), for guarding one
 /// shared resource, or for any loop that needs pacing. A check skips the hash,
 /// the shard lookup, and the shard lock entirely and runs the algorithm's
-/// accounting directly, so it is the cheapest check the crate offers.
+/// accounting directly, so it is the cheapest check the crate offers. (The
+/// accounting is still the algorithm's own: one compare-and-swap for the token
+/// bucket, leaky bucket, and fixed window; a short mutex for the
+/// sliding-window algorithms.)
 ///
 /// It runs any [`Algorithm`] (the token bucket by default) on an injectable
 /// [`Clock`]. Without the standard library, [`Gcra`](crate::Gcra) is the

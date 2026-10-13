@@ -377,7 +377,9 @@ pub async fn try_until_ready_n(&self, n: u32) -> Result<(), InsufficientCapacity
 pub fn metrics(&self) -> Metrics                                                 // feature `metrics`
 ```
 
-One allowance, no keys: no hash, no shard lookup, no lock. For client-side
+One allowance, no keys: no hash, no shard lookup, no shard lock (the
+algorithm's own accounting remains — a compare-and-swap, or a short mutex for
+the sliding windows). For client-side
 throttling, pacing a loop, or guarding one shared resource. Runs any
 [`Algorithm`](#algorithm) on any clock. Without `std`, [`Gcra`](#gcra) is the
 clock-free equivalent.

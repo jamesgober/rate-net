@@ -42,7 +42,7 @@ per-key accounting, and the clock read — not the denial branch.
   1,048,576-key cap) filled to its cap, a new key every call: the unique-key
   flood steady state at realistic scale.
 - **`check/direct`**, **`check/direct_coarse_clock`** — a
-  [`DirectLimiter`](./API.md#directlimiter): no key, no map, no lock.
+  [`DirectLimiter`](./API.md#directlimiter): no key, no map, no shard lock.
 - **`peek/existing_key`** — reading a snapshot for `RateLimit-*` headers.
 
 Recorded on Windows 11 x86_64 (32 logical CPUs), Rust 1.95.0, Criterion `bench`
@@ -128,7 +128,9 @@ with no automatic eviction. The many-key gap is the same cost.
 - **Many-key** costs about what a single key does: unrelated keys land in
   different shards and take only a read lock.
 - **Contended single-key** scales: four threads on one key share the read lock
-  and settle on the bucket's atomic, with no other shared write.
+  and settle on the bucket's atomic. The remaining shared writes are the read
+  lock's own reader count (an atomic increment and decrement per check) and the
+  bucket's compare-and-swap; the eviction marks are not rewritten.
 - **Eviction** is the cold path — the write lock plus a bounded CLOCK step — paid
   only when a new key displaces an old one, and constant whatever the shard
   size.
