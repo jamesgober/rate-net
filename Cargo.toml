@@ -202,7 +202,7 @@ required-features = ["std"]
 
 [[example]]
 name              = "algorithms"
-required-features = ["algorithms"]
+required-features = ["std", "algorithms"]
 
 [[example]]
 name              = "async_wait"
