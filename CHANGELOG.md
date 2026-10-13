@@ -12,13 +12,155 @@
 
 ## [Unreleased]
 
-### Added
+---
 
-### Changed
+## [1.1.0] — 2026-10-13
+
+**Correctness, hardening, and the HTTP surface.** A minor release: every change
+is additive or a bug fix, and the `1.0` API is untouched apart from one
+deprecation. It fixes a real-clock over-admission in the default token bucket,
+an O(n) eviction scan that a unique-key flood could turn into a CPU and latency
+denial of service, and a set of window-algorithm bugs; it adds validated
+construction, `peek` snapshots and HTTP header helpers, key management, a
+direct (un-keyed) limiter and a `no_std` core, tagged and IP-prefix keys, a
+fast coarse clock, optional metrics, and an object-safe limiter trait. Several
+documentation claims that were not true of `1.0.0` are corrected.
+
+### Security
+
+- **Token-bucket over-admission under contention (RN-COR-01).** With two or
+  more threads on one key and a real clock, a thread holding a slightly stale
+  timestamp read the negative gap as a ~49.7-day refill: the default limiter
+  admitted 20x–600x its quota. Fixed in `better-bucket` 1.1, which rate-net now
+  requires (`better-bucket = "1.1"`). A real-clock, multi-thread regression test
+  (`tests/real_clock.rs`) and a `loom` model of the real bucket guard it here.
+- **O(n) eviction under the shard write lock (RN-SEC-01).** At capacity every
+  new key scanned its whole shard (~329 µs per insert at the default cap; one
+  existing-key check waited 608 ms during a flood), and an idle TTL ran a full
+  `retain` on every insert. Eviction is now CLOCK (second chance) with a scan
+  bounded at 32 slots, and the idle TTL is drained by an incremental sweep of
+  8 slots per insert: an insert at the default cap costs ~0.36 µs.
+- **Key collisions across key types (RN-SEC-04).** New tagged constructors —
+  `Key::id`, `Key::ip`, `Key::ipv4_prefix`, `Key::ipv6_prefix`,
+  `Key::ip_prefix` — carry their kind in the key's identity, so a tagged key can
+  never equal an attacker-chosen string with the same bytes. The `From`
+  conversions keep their `1.0` (raw, byte-identity) behaviour.
+- **Key bytes in logs (RN-SEC-05).** `Key`'s `Debug` now shows only the kind and
+  length, never the bytes.
+- **Sliding-window log memory amplification (RN-SEC-03).** Units admitted at the
+  same instant share one record, so a single `check_n` of any size costs 16
+  bytes instead of 8 bytes per unit (a `check_n(50_000_000)` used to allocate
+  ~400 MB).
+- `cargo audit` / `cargo deny` are clean again: the lockfile resolves
+  `crossbeam-epoch` ≥ 0.9.20 (RUSTSEC-2026-0204, dev-only via `criterion`).
 
 ### Fixed
 
-### Security
+- **Fixed-window overflow (RN-COR-02).** `base + n` overflowed `u32` once
+  `limit > u32::MAX / 2`: a debug-build panic and a release-build over-admit.
+  The sum is now widened.
+- **Fixed-window rollback by a late thread (RN-COR-03).** A thread carrying a
+  timestamp from a window another thread had already closed wrote its older
+  window back, wiping the newer window's count. A `latest` window number now
+  makes a late thread count against the newer window. The sliding-window
+  counter and log treat a late thread the same way (never judging against an
+  already-rolled window, never unsorting the log).
+- **Degenerate configurations failed open (RN-COR-04).** A zero period admitted
+  everything under every algorithm except the token bucket. Every algorithm now
+  fails closed: a zero limit, period, or burst denies everything.
+- **Leaky-bucket truncation (RN-COR-05).** The emission interval was a truncated
+  whole number of nanoseconds: 600 M/s admitted 1 G/s (1.67x), and above
+  1 G/s the interval reached zero and everything was admitted. Time is now
+  accounted in exact emission intervals (no drift at any rate), and a rate
+  above one unit per nanosecond is clamped to it.
+- **`until_ready` returned as if admitted when it gave up (RN-COR-06).** See
+  `try_until_ready` below; `until_ready` / `until_ready_n` are deprecated.
+- **An idle TTL shorter than the quota reset a key early (RN-COR-07).** The
+  effective TTL is now raised to the quota's recovery time (the time a key needs
+  to regain its full allowance), so idle eviction can never hand out a fresh
+  quota early; `try_build` rejects the shorter TTL outright.
+- **Token-bucket capacity ceiling and the 49.7-day wrap (RN-COR-05, RN-COR-08).**
+  With `better-bucket` 1.1 the ~4.29M-token capacity cap and the
+  under-refill after a 49.7-day idle gap are gone.
+- `cargo test --no-default-features` failed: every example and bench now
+  declares its required features.
+- The README Quick Start did not compile (`E0004`, missing wildcard arm on the
+  `#[non_exhaustive]` `Decision`). The README and the API reference are now
+  compiled and run as doctests.
+- The examples floored `Retry-After` (`as_secs().max(1)`), sending clients back
+  early; they now round up.
+
+### Added
+
+- `Builder::try_build` / `Builder::try_build_direct` — validate the
+  configuration and return a `RateLimiterError`. New variants: `ZeroBurst`,
+  `RateTooHigh`, `LimitTooLarge`, `IdleTtlTooShort`. `MAX_SLIDING_LOG_LIMIT`.
+  `Builder::new`, `Default`, and `Debug` for `Builder`.
+- `RateLimiter::peek` → `Snapshot` (`limit`, `remaining`, `reset_after`,
+  `reset_after_secs`, `is_exhausted`, `headers`) — read an allowance without
+  spending it or creating state.
+- Key management: `RateLimiter::reset`, `remove`, `clear`, `retain_recent`
+  (forget keys whose allowance has fully recovered — lossless), and
+  `shrink_to_fit`.
+- HTTP helpers: `Decision::retry_after_secs` (rounded up, at least 1),
+  `Decision::is_impossible`, `Snapshot::headers` (`RateLimit-Limit`,
+  `RateLimit-Remaining`, `RateLimit-Reset`), and the `headers` module of header
+  names.
+- `DirectLimiter` — an un-keyed limiter for one stream (any algorithm, any
+  clock; `check`, `check_n`, `peek`, `reset`), built directly or with
+  `Builder::build_direct`.
+- `Gcra` — the `no_std`, clock-free, lock-free single-key core (caller-supplied
+  time), available in every build with 64-bit atomics. With `std` off the crate
+  now exposes `Gcra`, `Quota`, `Decision`, `Snapshot`, `RateLimiterError`,
+  `InsufficientCapacity`, and `headers` (previously only `VERSION`).
+- `CoarseClock` (and `MIN_COARSE_RESOLUTION`) — a monotonic clock read with one
+  atomic load, ticked by a background thread (`spawn`) or by the caller
+  (`tick`). Roughly halves the cost of a token-bucket check.
+- `AsyncLimiter::try_until_ready` / `try_until_ready_n`, and the same on
+  `DirectLimiter` (feature `async`) — return `InsufficientCapacity` instead of
+  returning as if admitted. Cancel-safe. `Debug` for `AsyncLimiter`.
+- `metrics` feature: `RateLimiter::metrics` / `DirectLimiter::metrics` →
+  `Metrics` (`allowed`, `denied`, `keys_inserted`, `keys_evicted`,
+  `keys_expired`, `keys_removed`). Compiled out entirely without the feature.
+- `DynLimiter` — an object-safe face of `Limiter` (`Box<dyn DynLimiter>`,
+  `Arc<dyn DynLimiter + Send + Sync>`), implemented for every `Limiter`; the
+  trait objects implement `Limiter` again. `Limiter` is also implemented for
+  `&L`, `Arc<L>`, and `Box<L>`.
+- `Key`: `From<&String>`, `From<Ipv4Addr>`, `From<Ipv6Addr>`, `From<SocketAddr>`
+  (the port is dropped), `From<&Key>`.
+- Tests: real-clock multi-thread contention for every algorithm
+  (`tests/real_clock.rs`), `loom` models of the production limiter, key
+  management across every algorithm, a per-key memory budget
+  (`tests/memory.rs`), metrics, the `no_std` core, and store-index property
+  tests.
+- Benchmarks: insert at the default cap, the direct limiter, the coarse clock,
+  and `peek`; the `governor` comparison gains direct and coarse-clock groups and
+  moves to `governor` 0.10.
+- `examples/direct.rs`; `retry_after` and `gatekeeper` show `RateLimit-*`
+  headers and IPv6 `/64` keys.
+
+### Changed
+
+- The store is a `hashbrown::HashTable` index over dense per-shard slots: one
+  hash pass per check (was two), no per-check `fetch_add` on a shared sequence
+  counter, eviction marks written only when they change, and shards padded to
+  their own cache lines. Per-key heap at the default cap fell from ~516 B to
+  ~202 B (~514 MiB → ~202 MiB at the default cap).
+- New dependency `hashbrown` 0.17 (default features off, no transitive
+  dependencies). `error-forge` requirement raised to 1.0.2 (drops `thiserror`).
+- `RateLimiterError` and `InsufficientCapacity` implement `core::error::Error`
+  in every build.
+- Documentation corrected where `1.0.0` overstated: the check path is not
+  lock-free (a shard read lock plus atomic accounting; the sliding algorithms
+  take a per-key mutex); the `loom` suite now checks the real code rather than a
+  copy; eviction no longer blocks the check path; the benchmark numbers are
+  re-measured; the CI platform list is stated as tested.
+
+### Deprecated
+
+- `AsyncLimiter::until_ready` / `until_ready_n` — they return as if the caller
+  were admitted when the request can never fit. Use `try_until_ready` /
+  `try_until_ready_n`; the old methods remain until `2.0`.
 
 ---
 
@@ -419,7 +561,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/rate-net/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/rate-net/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/rate-net/compare/v0.9.0...v0.9.5
 [0.9.0]: https://github.com/jamesgober/rate-net/compare/v0.8.0...v0.9.0
