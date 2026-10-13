@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rate_net::{Algorithm, RateLimiter};
+use rate_net::{Algorithm, CoarseClock, RateLimiter};
 
 /// Window length for every run: short, so a run spans several windows.
 const PERIOD: Duration = Duration::from_millis(100);
@@ -97,6 +97,47 @@ fn assert_bounded(algorithm: Algorithm, ceiling: impl Fn(Duration) -> u64) {
 #[test]
 fn test_token_bucket_real_clock_contention_never_over_admits() {
     assert_bounded(Algorithm::TokenBucket, bucket_ceiling);
+}
+
+#[test]
+fn test_coarse_clock_contention_never_over_admits() {
+    // A coarse clock lags real time by up to one tick, so the bound gains one
+    // tick of refill — once, not per tick.
+    const TICK: Duration = Duration::from_millis(1);
+    let clock = CoarseClock::spawn(TICK).expect("spawn the ticker");
+    for threads in THREADS {
+        let start = Instant::now();
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .quota(LIMIT, PERIOD)
+                .clock(clock.clone())
+                .try_build()
+                .expect("a valid quota"),
+        );
+        let admitted = Arc::new(AtomicU64::new(0));
+        thread::scope(|scope| {
+            for _ in 0..threads {
+                let limiter = Arc::clone(&limiter);
+                let admitted = Arc::clone(&admitted);
+                let _worker = scope.spawn(move || {
+                    let mut local = 0u64;
+                    while start.elapsed() < RUN {
+                        if limiter.check("hot").is_allow() {
+                            local += 1;
+                        }
+                    }
+                    let _total = admitted.fetch_add(local, Ordering::Relaxed);
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        let admitted = admitted.load(Ordering::Relaxed);
+        let bound = bucket_ceiling(elapsed + clock.lag().max(TICK) + TICK);
+        assert!(
+            admitted <= bound,
+            "coarse clock, {threads} threads: admitted {admitted} in {elapsed:?}, bound {bound}"
+        );
+    }
 }
 
 #[cfg(feature = "algorithms")]

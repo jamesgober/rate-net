@@ -112,6 +112,8 @@ mod algorithm;
 mod async_limiter;
 #[cfg(feature = "std")]
 mod builder;
+#[cfg(feature = "std")]
+mod coarse_clock;
 mod decision;
 #[cfg(feature = "std")]
 mod direct;
@@ -137,6 +139,8 @@ pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};
 pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
 pub use crate::builder::Builder;
+#[cfg(feature = "std")]
+pub use crate::coarse_clock::{CoarseClock, MIN_COARSE_RESOLUTION};
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
 pub use crate::direct::DirectLimiter;
