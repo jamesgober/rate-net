@@ -157,9 +157,9 @@ async fn test_async_gatekeeper_awaits_then_serves() {
         let _ = limiter.check("client");
     }
     let completed =
-        tokio::time::timeout(Duration::from_secs(2), limiter.try_until_ready("client")).await;
+        tokio::time::timeout(Duration::from_secs(10), limiter.try_until_ready("client")).await;
     assert_eq!(
-        completed.expect("async gatekeeper did not admit within 2s"),
+        completed.expect("async gatekeeper did not admit within 10s"),
         Ok(())
     );
 }

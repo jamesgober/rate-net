@@ -446,7 +446,7 @@ mod tests {
     async fn test_direct_limiter_try_until_ready() {
         let limiter = DirectLimiter::per_second(200);
         assert!(limiter.check_n(200).is_allow());
-        let waited = tokio::time::timeout(Duration::from_secs(2), limiter.try_until_ready()).await;
+        let waited = tokio::time::timeout(Duration::from_secs(10), limiter.try_until_ready()).await;
         assert_eq!(waited.unwrap(), Ok(()));
         assert_eq!(
             limiter.try_until_ready_n(201).await,

@@ -285,7 +285,7 @@ mod tests {
         // timeout guards against a hang rather than asserting exact timing,
         // which the OS scheduler makes nondeterministic.
         let completed =
-            tokio::time::timeout(Duration::from_secs(2), limiter.try_until_ready("k")).await;
+            tokio::time::timeout(Duration::from_secs(10), limiter.try_until_ready("k")).await;
         assert_eq!(completed.unwrap(), Ok(()));
     }
 

@@ -792,21 +792,31 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "a timing bound is meaningless under Miri")]
     fn test_insert_at_capacity_is_constant_time() {
-        // At a 65_536-key single-shard cap the old full-shard scan cost close
-        // to a millisecond per insert (20 s for this loop); the CLOCK sweep is
-        // O(1). The bound is generous enough for a debug build on a slow host.
-        let store = make_store(1, Eviction::capacity(65_536));
+        // Compares inserts into a full shard (each one evicts) with inserts
+        // into an empty one, on the same host at the same moment, so a loaded
+        // machine slows both alike. A full-shard scan per eviction made the
+        // first ~1000x the second; CLOCK keeps them within a small factor.
+        // The 16,384-key shard is the largest a capped store creates.
+        let full = make_store(1, Eviction::capacity(16_384));
+        let empty = make_store(1, Eviction::unbounded());
         let make = token_state(10);
-        for k in 0..65_536u64 {
-            let _ = store.check(Key::from(k), 1, at(0), &make);
+        for k in 0..16_384u64 {
+            let _ = full.check(Key::from(k), 1, at(0), &make);
         }
-        let start = Instant::now();
-        for k in 65_536..85_536u64 {
-            let _ = store.check(Key::from(k), 1, at(0), &make);
-        }
-        let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
-        assert!(store.len() <= 65_536);
+        let time = |store: &Store<SystemClock>, from: u64| {
+            let start = Instant::now();
+            for k in from..from + 20_000 {
+                let _ = store.check(Key::from(k), 1, at(0), &make);
+            }
+            start.elapsed()
+        };
+        let baseline = time(&empty, 0);
+        let at_cap = time(&full, 16_384);
+        assert!(
+            at_cap < baseline * 20 + Duration::from_millis(200),
+            "inserts at capacity took {at_cap:?}, empty-store inserts {baseline:?}"
+        );
+        assert_eq!(full.len(), 16_384);
     }
 
     #[test]
