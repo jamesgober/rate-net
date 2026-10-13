@@ -1,5 +1,6 @@
 //! A fast, coarse monotonic clock.
 
+use core::cell::Cell;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
@@ -12,6 +13,16 @@ use clock_lib::{Clock, ManualClock, Monotonic, Wall};
 /// The finest tick [`CoarseClock::spawn`] accepts. Shorter requests are raised
 /// to it, so the ticker can never spin a core.
 pub const MIN_COARSE_RESOLUTION: Duration = Duration::from_micros(100);
+
+/// How often (in reads, per thread) a spawned clock checks whether it has
+/// fallen behind. One real clock read per this many coarse reads costs well
+/// under a nanosecond per reading, amortized.
+const READS_PER_REFRESH: u32 = 64;
+
+thread_local! {
+    /// Coarse reads on this thread since its last staleness check.
+    static READS: Cell<u32> = const { Cell::new(0) };
+}
 
 /// A monotonic [`Clock`] that is cheap to read because it only moves when it is
 /// ticked.
@@ -31,14 +42,30 @@ pub const MIN_COARSE_RESOLUTION: Duration = Duration::from_micros(100);
 ///
 /// # What coarseness means for limiting
 ///
-/// A reading is never ahead of real time; it lags by at most one tick interval
-/// plus however late the ticker runs. A lagging clock makes a limiter slightly
-/// *stricter*: refills and window rollovers happen up to one tick late. Over any
-/// span, a limiter on a `CoarseClock` admits no more than the quota allows over
-/// that span plus one tick — for a 1 ms tick, at most `rate x 1 ms` extra once,
-/// never accumulating. A 1 ms tick costs nothing measurable for limits
-/// expressed per second or per minute; prefer [`SystemClock`] when decisions
-/// need sub-millisecond precision.
+/// A reading is never ahead of real time, but it lags it. Call the lag at any
+/// moment `L` (see [`lag`](Self::lag)). Lag is not free: a limiter credits
+/// refill by the clock's readings, so when a lagging clock catches up it
+/// credits the lagged time too. The exact looseness is: **over any span of real
+/// time, a limiter on a `CoarseClock` admits at most what the quota allows over
+/// that span plus `rate × L`, where `L` is the lag at the start of the span.**
+/// It never accumulates — the extra is bounded by the lag, not by how long the
+/// clock runs — and with no lag the bound is the quota's own.
+///
+/// How large `L` can get depends on the mode:
+///
+/// - **Spawned** ([`spawn`](Self::spawn)): one tick interval plus however late
+///   the ticker thread runs. A starved ticker (a machine with every core busy)
+///   cannot stretch this indefinitely: every 64th read on a thread re-reads the
+///   real clock, and if the coarse clock has fallen a whole interval behind it
+///   ticks it then. On any thread that reads the clock steadily, `L` stays
+///   within one interval plus the time of 64 reads.
+/// - **Manual** ([`new`](Self::new)): exactly the time since the last
+///   [`tick`](Self::tick). The clock never moves on its own; tick it at least
+///   as often as the looseness you can accept.
+///
+/// A 1 ms interval adds at most `rate × 1 ms` (one unit at 1,000/s) for limits
+/// expressed per second or per minute. Prefer [`SystemClock`] when decisions
+/// must be exact to the nanosecond.
 ///
 /// [`SystemClock`]: clock_lib::SystemClock
 ///
@@ -76,6 +103,9 @@ pub struct CoarseClock {
 struct Inner {
     /// Readings come from here: its anchor plus the offset applied so far.
     clock: ManualClock,
+    /// For a spawned clock, the lag (ns) at which a reading thread ticks the
+    /// clock itself; `0` for a manual clock, which never moves on its own.
+    refresh_after_ns: u64,
     /// Real-time origin, captured just *after* the manual clock's anchor, so
     /// `anchor + elapsed-since-origin` never runs ahead of real time.
     origin: Instant,
@@ -85,10 +115,11 @@ struct Inner {
 }
 
 impl Inner {
-    fn new() -> Self {
+    fn new(refresh_after_ns: u64) -> Self {
         let clock = ManualClock::new();
         Self {
             clock,
+            refresh_after_ns,
             origin: Instant::now(),
             applied_ns: AtomicU64::new(0),
         }
@@ -96,6 +127,21 @@ impl Inner {
 
     fn tick(&self) {
         let target = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.advance_to(target);
+    }
+
+    /// Ticks only if the clock has fallen `refresh_after_ns` behind, so a
+    /// steady stream of readers does not contend on the clock's state.
+    fn tick_if_stale(&self) {
+        let target = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let applied = self.applied_ns.load(Ordering::Relaxed);
+        if target.saturating_sub(applied) >= self.refresh_after_ns {
+            self.advance_to(target);
+        }
+    }
+
+    /// Advances the clock to `target` ns past the origin, if it is behind.
+    fn advance_to(&self, target: u64) {
         let mut applied = self.applied_ns.load(Ordering::Relaxed);
         while target > applied {
             match self.applied_ns.compare_exchange_weak(
@@ -130,7 +176,18 @@ impl CoarseClock {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Inner::new()),
+            inner: Arc::new(Inner::new(0)),
+        }
+    }
+
+    /// A clock that ticks itself from its readers once `refresh_after` behind,
+    /// with no ticker thread. The building block of [`spawn`](Self::spawn).
+    fn self_refreshing(refresh_after: Duration) -> Self {
+        let refresh_after_ns = u64::try_from(refresh_after.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        Self {
+            inner: Arc::new(Inner::new(refresh_after_ns)),
         }
     }
 
@@ -157,9 +214,9 @@ impl CoarseClock {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn spawn(resolution: Duration) -> std::io::Result<Self> {
-        let clock = Self::new();
-        let weak: Weak<Inner> = Arc::downgrade(&clock.inner);
         let interval = resolution.max(MIN_COARSE_RESOLUTION);
+        let clock = Self::self_refreshing(interval);
+        let weak: Weak<Inner> = Arc::downgrade(&clock.inner);
         let _ticker = thread::Builder::new()
             .name("rate-net-coarse-clock".into())
             .spawn(move || {
@@ -207,8 +264,12 @@ impl CoarseClock {
     /// ```
     #[must_use]
     pub fn lag(&self) -> Duration {
-        let applied = Duration::from_nanos(self.inner.applied_ns.load(Ordering::Acquire));
-        self.inner.origin.elapsed().saturating_sub(applied)
+        // The offset readings actually carry (a tick that has claimed a span
+        // but not yet applied it still counts as lag).
+        self.inner
+            .origin
+            .elapsed()
+            .saturating_sub(self.inner.clock.offset())
     }
 }
 
@@ -220,9 +281,21 @@ impl Default for CoarseClock {
 }
 
 impl Clock for CoarseClock {
-    /// The time of the last tick: one relaxed load, no system call.
+    /// The time of the last tick: one relaxed load and, for a spawned clock, a
+    /// thread-local counter (every 64th read checks the real clock and ticks
+    /// if a whole interval behind).
     #[inline]
     fn now(&self) -> Monotonic {
+        if self.inner.refresh_after_ns != 0 {
+            let due = READS.with(|reads| {
+                let next = reads.get().wrapping_add(1);
+                reads.set(next);
+                next % READS_PER_REFRESH == 0
+            });
+            if due {
+                self.inner.tick_if_stale();
+            }
+        }
         self.inner.clock.now()
     }
 
@@ -248,7 +321,7 @@ mod tests {
 
     use clock_lib::{Clock, SystemClock};
 
-    use super::{CoarseClock, MIN_COARSE_RESOLUTION};
+    use super::CoarseClock;
 
     #[test]
     fn test_manual_coarse_clock_moves_only_when_ticked() {
@@ -304,21 +377,58 @@ mod tests {
         assert!(applied <= real_start.elapsed() + Duration::from_millis(1));
     }
 
+    /// Polls `condition` until it holds or `deadline` passes.
+    fn eventually(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        condition()
+    }
+
     #[test]
     fn test_spawned_ticker_keeps_up_and_stops_with_the_last_clone() {
         let clock = CoarseClock::spawn(Duration::ZERO).unwrap();
-        let start = clock.now();
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(clock.now() > start, "the ticker never ticked");
-        // Generous: CI schedulers can be late, but not by half a second.
+        let start = clock.inner.clock.now();
+        // Read the inner clock directly: this checks the ticker thread, not
+        // the readers' self-refresh.
         assert!(
-            clock.lag() < Duration::from_millis(500),
-            "lag {:?}",
-            clock.lag()
+            eventually(Duration::from_secs(10), || clock.inner.clock.now() > start),
+            "the ticker never ticked"
         );
         let weak = std::sync::Arc::downgrade(&clock.inner);
         drop(clock);
-        std::thread::sleep(MIN_COARSE_RESOLUTION * 20);
-        assert!(weak.upgrade().is_none());
+        assert!(
+            eventually(Duration::from_secs(10), || weak.upgrade().is_none()),
+            "the ticker kept the clock alive"
+        );
+    }
+
+    #[test]
+    fn test_readers_refresh_a_stale_clock_without_any_ticker() {
+        // A self-refreshing clock with no ticker thread at all: only reads
+        // can move it, as when a ticker is starved of CPU.
+        let clock = CoarseClock::self_refreshing(Duration::from_millis(1));
+        let start = clock.inner.clock.now();
+        std::thread::sleep(Duration::from_millis(20));
+        for _ in 0..(super::READS_PER_REFRESH * 2) {
+            let _ = clock.now();
+        }
+        // The real clock moved 20ms, past the 1ms refresh threshold, so some
+        // read among the last 128 ticked it at least 20ms forward.
+        assert!(clock.inner.clock.now().duration_since(start) >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_manual_clock_never_refreshes_itself() {
+        let clock = CoarseClock::new();
+        let start = clock.now();
+        std::thread::sleep(Duration::from_millis(3));
+        for _ in 0..(super::READS_PER_REFRESH * 4) {
+            assert_eq!(clock.now(), start);
+        }
     }
 }

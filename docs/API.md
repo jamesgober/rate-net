@@ -731,8 +731,12 @@ A `clock_lib::Clock` read with one atomic load instead of a system call. It
 holds the time of its last tick: `spawn` starts one background thread that ticks
 every `resolution` (at least [`MIN_COARSE_RESOLUTION`](#constants)) and exits
 once every clone is dropped; `new` has no thread and moves only on `tick`.
-Readings never run ahead of real time and lag by at most one tick, so a limiter
-on it is slightly stricter, never looser.
+Readings never run ahead of real time but lag it by `L` (`lag()`), and a
+limiter on the clock may admit up to `rate × L` beyond the quota over any span
+(the lagged time is credited when the clock catches up). For a spawned clock
+`L` is about one interval: every 64th read on a thread re-reads the real clock
+and ticks if a whole interval behind, so a starved ticker cannot stretch it. A
+manual clock lags by the time since its last `tick`.
 
 ```rust
 use clock_lib::Clock;

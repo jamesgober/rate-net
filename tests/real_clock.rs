@@ -101,12 +101,16 @@ fn test_token_bucket_real_clock_contention_never_over_admits() {
 
 #[test]
 fn test_coarse_clock_contention_never_over_admits() {
-    // A coarse clock lags real time by up to one tick, so the bound gains one
-    // tick of refill — once, not per tick.
-    const TICK: Duration = Duration::from_millis(1);
-    let clock = CoarseClock::spawn(TICK).expect("spawn the ticker");
+    // A coarse clock lags real time, and the limiter credits the lagged time
+    // when the clock catches up: over a run, it may admit the quota's bound
+    // plus `rate x L`, where `L` is the lag when the run starts. Measuring `L`
+    // just before building the limiter makes the bound exact, not a guess:
+    // every reading the limiter makes is at least `start - L` and at most the
+    // real time, however late the ticker runs during the run.
+    let clock = CoarseClock::spawn(Duration::from_millis(1)).expect("spawn the ticker");
     for threads in THREADS {
         let start = Instant::now();
+        let lag_at_start = clock.lag();
         let limiter = Arc::new(
             RateLimiter::builder()
                 .quota(LIMIT, PERIOD)
@@ -132,10 +136,10 @@ fn test_coarse_clock_contention_never_over_admits() {
         });
         let elapsed = start.elapsed();
         let admitted = admitted.load(Ordering::Relaxed);
-        let bound = bucket_ceiling(elapsed + clock.lag().max(TICK) + TICK);
+        let bound = bucket_ceiling(elapsed + lag_at_start);
         assert!(
             admitted <= bound,
-            "coarse clock, {threads} threads: admitted {admitted} in {elapsed:?}, bound {bound}"
+            "coarse clock, {threads} threads: admitted {admitted} in {elapsed:?}              (lag at start {lag_at_start:?}), bound {bound}"
         );
     }
 }
