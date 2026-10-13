@@ -56,7 +56,7 @@ impl<C: Clock> AlgoState<C> {
         match algorithm {
             Algorithm::TokenBucket => Self::TokenBucket(token_bucket(quota, clock)),
             #[cfg(feature = "algorithms")]
-            Algorithm::LeakyBucket => Self::LeakyBucket(LeakyBucket::new(quota, now)),
+            Algorithm::LeakyBucket => Self::LeakyBucket(LeakyBucket::new(quota)),
             #[cfg(feature = "algorithms")]
             Algorithm::FixedWindow => Self::FixedWindow(FixedWindow::new(quota, now)),
             #[cfg(feature = "algorithms")]
