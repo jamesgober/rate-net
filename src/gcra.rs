@@ -46,7 +46,8 @@ fn nanos(now: Duration) -> u64 {
 /// — a check is a few multiplies and one compare-and-swap. Time is passed in by
 /// the caller on every call as a [`Duration`] since any fixed origin, so the
 /// type needs no clock and no standard library: it is what the crate offers
-/// with the `std` feature off.
+/// with the `std` feature off. With `std` on, prefer
+/// `DirectLimiter`, which reads a clock for you and can run any algorithm.
 ///
 /// Times must come from one monotonic source. A reading earlier than one
 /// already used (a late thread, or a source that steps back) is handled

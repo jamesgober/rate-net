@@ -113,6 +113,8 @@ mod async_limiter;
 #[cfg(feature = "std")]
 mod builder;
 mod decision;
+#[cfg(feature = "std")]
+mod direct;
 mod error;
 #[cfg(feature = "std")]
 mod eviction;
@@ -135,6 +137,8 @@ pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
 pub use crate::builder::Builder;
 pub use crate::decision::Decision;
+#[cfg(feature = "std")]
+pub use crate::direct::DirectLimiter;
 pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
 pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};

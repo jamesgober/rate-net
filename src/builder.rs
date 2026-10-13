@@ -6,6 +6,7 @@ use std::time::Duration;
 use clock_lib::{Clock, SystemClock};
 
 use crate::algorithm::Algorithm;
+use crate::direct::DirectLimiter;
 use crate::error::RateLimiterError;
 use crate::eviction::Eviction;
 use crate::limiter::{RateLimiter, default_shard_count};
@@ -330,6 +331,53 @@ impl<C: Clock + Clone> Builder<C> {
         Ok(self.build())
     }
 
+    /// Builds a [`DirectLimiter`] — one un-keyed allowance — from the
+    /// algorithm, quota, burst, and clock, failing closed exactly like
+    /// [`build`](Self::build). The shard count and eviction policy describe
+    /// the keyed store and are ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder().per_second(50).burst(5).build_direct();
+    /// assert!(limiter.check_n(5).is_allow());
+    /// assert!(limiter.check().is_deny());
+    /// ```
+    #[must_use]
+    pub fn build_direct(self) -> DirectLimiter<C> {
+        let quota = self.quota_value();
+        DirectLimiter::build(self.algorithm, quota, self.clock)
+    }
+
+    /// Validates the algorithm and quota, then builds a [`DirectLimiter`].
+    ///
+    /// # Errors
+    ///
+    /// The quota errors of [`try_build`](Self::try_build): a zero limit,
+    /// period, or burst, or a rate or limit beyond the algorithm's ceiling.
+    /// The eviction policy is not consulted (a direct limiter has no store).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{RateLimiter, RateLimiterError};
+    ///
+    /// let limiter = RateLimiter::builder().per_second(10).try_build_direct()?;
+    /// assert!(limiter.check().is_allow());
+    ///
+    /// assert_eq!(
+    ///     RateLimiter::builder().try_build_direct().unwrap_err(),
+    ///     RateLimiterError::ZeroQuota,
+    /// );
+    /// # Ok::<(), RateLimiterError>(())
+    /// ```
+    pub fn try_build_direct(self) -> Result<DirectLimiter<C>, RateLimiterError> {
+        self.algorithm.validate(&self.quota_value())?;
+        Ok(self.build_direct())
+    }
+
     /// The configured quota, with the burst defaulting to the limit.
     fn quota_value(&self) -> Quota {
         let burst = self.burst.unwrap_or(self.limit);
@@ -490,6 +538,36 @@ mod tests {
         // A new key triggers the idle sweep; the drained key must survive it.
         let _ = limiter.check("other");
         assert!(limiter.check("victim").is_deny());
+    }
+
+    #[test]
+    fn test_direct_builders_validate_and_fail_closed() {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_second(3)
+            .clock(Arc::clone(&clock))
+            .try_build_direct()
+            .unwrap();
+        assert!(limiter.check_n(3).is_allow());
+        assert!(limiter.check().is_deny());
+        assert_eq!(
+            RateLimiter::builder()
+                .per_second(3)
+                .burst(0)
+                .try_build_direct()
+                .unwrap_err(),
+            RateLimiterError::ZeroBurst
+        );
+        // The eviction policy is irrelevant to a direct limiter.
+        assert!(
+            RateLimiter::builder()
+                .per_minute(1)
+                .eviction(Eviction::idle(Duration::from_millis(1)))
+                .try_build_direct()
+                .is_ok()
+        );
+        let closed = RateLimiter::builder().build_direct();
+        assert!(closed.check().is_deny());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use core::fmt;
 /// A limit configuration rejected at construction time.
 ///
 /// Returned by [`Quota::rate`](crate::Quota::rate) and by the validating
-/// constructors — `Builder::try_build` and
+/// constructors — `Builder::try_build`, `Builder::try_build_direct`, and
 /// [`Gcra::try_new`](crate::Gcra::try_new) — when the supplied values cannot
 /// describe a working rate limit. Each variant names exactly which constraint
 /// was violated so the caller can correct the specific field.

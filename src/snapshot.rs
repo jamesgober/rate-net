@@ -4,7 +4,7 @@ use core::time::Duration;
 
 /// How much of its allowance a key has left, read without consuming any.
 ///
-/// Returned by `RateLimiter::peek` and
+/// Returned by `RateLimiter::peek`, `DirectLimiter::peek`, and
 /// [`Gcra::peek_at`](crate::Gcra::peek_at). It answers what rate-limit response
 /// headers need — the capacity, what is left of it, and when it is whole again
 /// — for allowed responses as well as denied ones, without touching the key's
