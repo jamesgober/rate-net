@@ -126,7 +126,7 @@ mod limiter;
 mod quota;
 #[cfg(feature = "std")]
 mod store;
-#[cfg(all(feature = "std", feature = "algorithms"))]
+#[cfg(feature = "std")]
 mod sync;
 
 #[cfg(feature = "std")]

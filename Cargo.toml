@@ -94,6 +94,7 @@ std = [
     "clock-lib/std",
     "dep:error-forge",
     "dep:ahash",
+    "dep:hashbrown",
 ]
 
 # The full algorithm suite beyond the default token bucket: leaky bucket,
@@ -121,6 +122,12 @@ error-forge   = { version = "1.0", optional = true }
 # per-store seed (runtime-rng) keeps it collision-attack resistant on hostile
 # keys; required by `std` for the hot path.
 ahash         = { version = "0.8", optional = true }
+# The per-shard index. `HashTable` stores slot indices and takes the one
+# precomputed hash, which is what makes O(1) swap-remove eviction possible
+# without storing every key twice, and keeps a check to a single hash pass.
+# It is std's own map implementation (rust-lang maintained, MSRV 1.85); with
+# default features off it pulls in no dependencies of its own.
+hashbrown     = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
 # Optional async-friendly wrapper layer; additive only. Only the timer is used.
 tokio         = { version = "1", default-features = false, features = ["time"], optional = true }
 
