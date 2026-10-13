@@ -8,10 +8,10 @@
 //! It ignores the quota's `burst`.
 
 use core::time::Duration;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::sync::{self, Mutex};
 
 /// Clamps a duration-since-epoch to nanoseconds.
 fn nanos(now: Duration) -> u64 {
@@ -62,7 +62,7 @@ impl SlidingCounter {
         let now_ns = nanos(now);
         let window_number = now_ns / self.period_ns;
         let offset = now_ns % self.period_ns;
-        let mut state = self.lock();
+        let mut state = sync::lock(&self.state);
 
         // Roll the windows forward if time has moved into a later window.
         if window_number > state.window {
@@ -98,10 +98,6 @@ impl SlidingCounter {
         Decision::Deny {
             retry_after: Duration::from_nanos(wait_ns),
         }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

@@ -7,10 +7,10 @@
 //! ignores the quota's `burst`.
 
 use core::time::Duration;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::sync::{AtomicU64, Ordering};
 
 /// Clamps a duration-since-epoch to nanoseconds.
 fn nanos(now: Duration) -> u64 {

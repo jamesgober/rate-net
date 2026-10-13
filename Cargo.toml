@@ -124,6 +124,12 @@ ahash         = { version = "0.8", optional = true }
 # Optional async-friendly wrapper layer; additive only. Only the timer is used.
 tokio         = { version = "1", default-features = false, features = ["time"], optional = true }
 
+# `loom` replaces the limiter's own atomics and locks (`src/sync.rs`) under
+# `cfg(loom)` model-checking builds, so the loom suite drives the production
+# code. Never part of a normal build.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 
 
 # DEV DEPENDENCIES
@@ -131,10 +137,6 @@ tokio         = { version = "1", default-features = false, features = ["time"], 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-
-# `loom` is only pulled in under `cfg(loom)` model-checking builds.
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 # A minimal runtime to drive the `async` wrapper's tests and example. Excluded
 # under `cfg(loom)`: a global `--cfg loom` switches tokio's internals to its own

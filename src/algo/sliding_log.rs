@@ -8,10 +8,10 @@
 
 use core::time::Duration;
 use std::collections::VecDeque;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::sync::{self, Mutex};
 
 /// Clamps a duration-since-epoch to nanoseconds.
 fn nanos(now: Duration) -> u64 {
@@ -45,7 +45,7 @@ impl SlidingLog {
         }
 
         let now_ns = nanos(now);
-        let mut log = self.lock();
+        let mut log = sync::lock(&self.log);
 
         // Drop every timestamp at least `period` old — it has aged out of the
         // trailing window. Comparing `ts + period <= now` (rather than a
@@ -75,10 +75,6 @@ impl SlidingLog {
         Decision::Deny {
             retry_after: Duration::from_nanos(expire_at.saturating_sub(now_ns)),
         }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, VecDeque<u64>> {
-        self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

@@ -126,6 +126,8 @@ mod limiter;
 mod quota;
 #[cfg(feature = "std")]
 mod store;
+#[cfg(all(feature = "std", feature = "algorithms"))]
+mod sync;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::Algorithm;
