@@ -125,7 +125,8 @@ documentation claims that were not true of `1.0.0` are corrected.
 - `DynLimiter` — an object-safe face of `Limiter` (`Box<dyn DynLimiter>`,
   `Arc<dyn DynLimiter + Send + Sync>`), implemented for every `Limiter`; the
   trait objects implement `Limiter` again. `Limiter` is also implemented for
-  `&L`, `Arc<L>`, and `Box<L>`.
+  `Arc<L>` (not `&L` / `Box<L>`, which 1.0 users may implement themselves;
+  `tests/downstream_impls.rs` guards that).
 - `Key`: `From<&String>`, `From<Ipv4Addr>`, `From<Ipv6Addr>`, `From<SocketAddr>`
   (the port is dropped), `From<&Key>`.
 - Tests: real-clock multi-thread contention for every algorithm

@@ -113,21 +113,12 @@ impl Limiter for dyn DynLimiter + Send + Sync + '_ {
     }
 }
 
-impl<L: Limiter + ?Sized> Limiter for &L {
-    #[inline]
-    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
-        (**self).check_n(key, n)
-    }
-}
-
+// `Arc<L>` is not a fundamental type, so no downstream crate could have
+// implemented `Limiter` for `Arc<TheirType>`; this blanket impl is additive.
+// (`&L` and `Box<L>` are fundamental: a 1.0 user may implement `Limiter` for
+// `&TheirType` or `Box<TheirType>`, so blanket impls for them would break that
+// code and are left for 2.0.)
 impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
-    #[inline]
-    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
-        (**self).check_n(key, n)
-    }
-}
-
-impl<L: Limiter + ?Sized> Limiter for Box<L> {
     #[inline]
     fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
         (**self).check_n(key, n)
@@ -945,15 +936,14 @@ mod tests {
     }
 
     #[test]
-    fn test_limiter_is_implemented_for_references_and_smart_pointers() {
+    fn test_limiter_is_implemented_for_arc() {
         fn admit<L: Limiter>(limiter: L) -> bool {
             limiter.check("k").is_allow()
         }
         let limiter = Arc::new(RateLimiter::per_second(2));
-        assert!(admit(&*limiter));
         assert!(admit(Arc::clone(&limiter)));
-        assert!(admit(Box::new(RateLimiter::per_second(1))));
-        assert!(!admit(&limiter));
+        assert!(admit(Arc::clone(&limiter)));
+        assert!(!admit(limiter));
     }
 
     #[test]

@@ -451,8 +451,9 @@ pub trait DynLimiter {
 ```
 
 `Limiter` is the shared surface generic code depends on; implementors provide
-`check_n`. It is implemented for `RateLimiter`, and for `&L`, `Arc<L>`, and
-`Box<L>` of any limiter. Its methods are generic, so `dyn Limiter` is not
+`check_n`. It is implemented for `RateLimiter` and for `Arc<L>` of any limiter
+(not for `&L` or `Box<L>`: code written against 1.0 may implement `Limiter`
+for references and boxes of its own types, and blanket impls would conflict). Its methods are generic, so `dyn Limiter` is not
 possible; `DynLimiter` is the object-safe face: every `Limiter` implements it,
 and `dyn DynLimiter` (with or without `+ Send + Sync`) implements `Limiter`
 again, so the generic helpers stay available on trait objects.
