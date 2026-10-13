@@ -147,7 +147,10 @@ documentation claims that were not true of `1.0.0` are corrected.
 - The store is a `hashbrown::HashTable` index over dense per-shard slots: one
   hash pass per check (was two), no per-check `fetch_add` on a shared sequence
   counter, eviction marks written only when they change, and shards padded to
-  their own cache lines. Per-key heap at the default cap fell from ~516 B to
+  their own cache lines. A capped shard holds at most 16,384 keys — the
+  shard count is raised as needed (`shards()` may exceed the request) — so the
+  amortized index growth or rehash that remains is a short pass, not the
+  ~200 ms a single 1M-key shard took. Per-key heap at the default cap fell from ~516 B to
   ~202 B (~514 MiB → ~202 MiB at the default cap).
 - New dependency `hashbrown` 0.17 (default features off, no transitive
   dependencies). `error-forge` requirement raised to 1.0.2 (drops `thiserror`).

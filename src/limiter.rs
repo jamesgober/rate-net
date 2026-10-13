@@ -504,12 +504,25 @@ impl<C: Clock + Clone> RateLimiter<C> {
 
     /// The number of shards the per-key store is split across (a power of two).
     ///
+    /// This is the requested count rounded up to a power of two, raised if
+    /// needed so that no shard's share of the capacity cap exceeds 16,384 keys
+    /// (a shard occasionally grows or rehashes its index in one pass, and small
+    /// shards keep that pass short), and never above
+    /// [`MAX_SHARDS`](crate::MAX_SHARDS).
+    ///
     /// # Examples
     ///
     /// ```
-    /// use rate_net::RateLimiter;
+    /// use rate_net::{Eviction, RateLimiter};
     ///
-    /// assert_eq!(RateLimiter::per_second(1).with_shards(32).shards(), 32);
+    /// assert_eq!(RateLimiter::per_second(1).with_shards(128).shards(), 128);
+    ///
+    /// // A million-key cap spread over 4 shards would put 250,000 keys in each;
+    /// // the store uses 64 shards of at most 16,384 instead.
+    /// let big = RateLimiter::per_second(1)
+    ///     .with_shards(4)
+    ///     .with_eviction(Eviction::capacity(1_000_000));
+    /// assert_eq!(big.shards(), 64);
     /// ```
     #[must_use]
     pub fn shards(&self) -> usize {
@@ -878,7 +891,9 @@ mod tests {
 
     #[test]
     fn test_with_shards_rounds_to_power_of_two() {
-        let limiter = RateLimiter::per_second(1).with_shards(5);
+        let limiter = RateLimiter::per_second(1)
+            .with_shards(5)
+            .with_eviction(Eviction::unbounded());
         assert_eq!(limiter.shards(), 8);
     }
 

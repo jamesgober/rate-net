@@ -256,10 +256,10 @@ advisory count, bounded by the eviction policy.
 ```rust
 use rate_net::{Algorithm, RateLimiter};
 
-let limiter = RateLimiter::per_second(50).with_shards(16);
+let limiter = RateLimiter::per_second(50).with_shards(128);
 assert_eq!(limiter.quota().limit(), 50);
 assert_eq!(limiter.algorithm(), Algorithm::TokenBucket);
-assert_eq!(limiter.shards(), 16);
+assert_eq!(limiter.shards(), 128);
 let _ = limiter.check("a");
 assert_eq!(limiter.tracked_keys(), 1);
 ```
@@ -932,8 +932,15 @@ Eviction runs only while inserting a new key and does bounded work:
 - **Idle TTL — incremental.** Each insert examines the next 8 slots from a
   second cursor and reclaims idle ones.
 
-Removal is a swap-remove plus two index updates, so the whole insert path is
-O(1). The cap is enforced per shard (`max_keys / shards`, rounded up), so the
+Removal is a swap-remove plus two index updates, so eviction is O(1), but a shard's index and slot vector still grow (and
+the index occasionally rehashes) in one pass under the shard's write lock,
+amortized over many inserts. To keep that pass short the store raises its shard
+count until no shard's share of the capacity cap exceeds 16,384 keys, so a
+growth or rehash touches at most that many entries (a few milliseconds at
+worst, against ~200 ms for one 1M-key shard). An unbounded store keeps the
+requested shard count; give it enough shards.
+
+The cap is enforced per shard (`max_keys / shards`, rounded up), so the
 live count stays within one key per shard of the configured maximum. An
 evicted key that returns starts fresh; the idle TTL never causes that, because
 it is raised to the quota's recovery time.

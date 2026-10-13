@@ -62,8 +62,10 @@
 //!   read lock, each shard on its own cache lines.
 //! - **Bounded memory, bounded work.** Eviction runs only when a new key is
 //!   inserted and does a fixed amount of work: a CLOCK sweep of at most 32
-//!   slots for the capacity cap, and 8 slots of incremental idle sweep. No
-//!   insert ever scans a whole shard.
+//!   slots for the capacity cap, and 8 slots of incremental idle sweep. The
+//!   only shard-wide pass left is the amortized growth or rehash of a shard's
+//!   index, and capped shards are kept at 16,384 keys or fewer so it stays
+//!   short.
 //! - **Zero-allocation steady state.** A `check` on an existing key allocates
 //!   nothing; allocation happens only the first time a key is seen.
 //! - **Fail closed.** The infallible constructors turn a degenerate

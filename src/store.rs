@@ -37,6 +37,13 @@
 //!
 //! Removal is a swap-remove from the slot vector plus two table updates, so
 //! evicting is O(1).
+//!
+//! The one shard-wide pass that remains is amortized growth: the slot vector
+//! and the index grow by doubling, and the index occasionally rehashes in place
+//! to clear tombstones left by removals. Both run under the write lock and
+//! touch every key in the shard, so the store keeps capped shards small —
+//! the shard count is raised until each holds at most [`MAX_KEYS_PER_SHARD`]
+//! keys — and the pass stays short.
 
 use core::time::Duration;
 
@@ -72,6 +79,12 @@ const SHARD_SHIFT: u32 = 40;
 /// assert_eq!(RateLimiter::per_second(1).with_shards(usize::MAX).shards(), MAX_SHARDS);
 /// ```
 pub const MAX_SHARDS: usize = 1 << 16;
+
+/// The most keys a capped shard may hold. A shard's index and slot vector
+/// occasionally grow or rehash in one pass under its write lock, so the store
+/// raises its shard count until every shard's share of the cap fits here:
+/// that pass then touches at most this many keys (well under a millisecond).
+pub(crate) const MAX_KEYS_PER_SHARD: usize = 1 << 14;
 
 /// The most slots the CLOCK hand examines to evict one entry.
 pub(crate) const CLOCK_SCAN: usize = 32;
@@ -337,13 +350,17 @@ pub(crate) struct Store<C: Clock> {
 }
 
 impl<C: Clock> Store<C> {
-    /// Builds a store with `shards` shards (clamped to `1..=MAX_SHARDS`, then
+    /// Builds a store with `shards` shards (clamped to `1..=MAX_SHARDS`, raised
+    /// so no capped shard holds more than `MAX_KEYS_PER_SHARD` keys, then
     /// rounded up to a power of two) and the given eviction policy. An idle
     /// TTL shorter than `min_idle` is raised to it.
     pub(crate) fn new(shards: usize, eviction: Eviction, min_idle: Duration) -> Self {
+        let for_cap = eviction
+            .max_keys()
+            .map_or(1, |max| max.div_ceil(MAX_KEYS_PER_SHARD));
         // `MAX_SHARDS` is a power of two, so rounding a clamped value up never
         // passes it (and never overflows).
-        let shard_count = shards.clamp(1, MAX_SHARDS).next_power_of_two();
+        let shard_count = shards.max(for_cap).clamp(1, MAX_SHARDS).next_power_of_two();
         // Spread a total cap evenly across shards; at least one key per shard so
         // a tiny cap with many shards still admits keys.
         let per_shard_cap = eviction.max_keys().map_or(MAX_SLOTS, |max| {
@@ -652,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_ttl_reclaims_idle_keys_on_later_insert() {
-        let store = make_store(1, Eviction::idle(Duration::from_millis(1000)));
+        let store = make_store(1, Eviction::new(1_000, Duration::from_millis(1000)));
         let make = token_state(10);
 
         let _ = store.check(Key::from("idle"), 1, at(0), &make);
@@ -665,7 +682,7 @@ mod tests {
 
     #[test]
     fn test_ttl_sweep_is_incremental_and_eventually_complete() {
-        let store = make_store(1, Eviction::idle(Duration::from_millis(1000)));
+        let store = make_store(1, Eviction::new(1_000, Duration::from_millis(1000)));
         let make = token_state(10);
         for k in 0..100u64 {
             let _ = store.check(Key::from(k), 1, at(0), &make);
@@ -764,7 +781,25 @@ mod tests {
         }
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
-        assert_eq!(store.len(), 65_536);
+        assert!(store.len() <= 65_536);
+    }
+
+    #[test]
+    fn test_large_caps_raise_the_shard_count() {
+        use super::MAX_KEYS_PER_SHARD;
+        // One shard requested, a million-key cap: shards are added until each
+        // holds at most MAX_KEYS_PER_SHARD, so no shard-wide pass is large.
+        let store = make_store(1, Eviction::capacity(1_000_000));
+        assert_eq!(store.shard_count(), 64);
+        assert!(store.per_shard_cap <= MAX_KEYS_PER_SHARD);
+        // Small caps and unbounded stores keep the requested count.
+        assert_eq!(make_store(2, Eviction::capacity(1_000)).shard_count(), 2);
+        assert_eq!(make_store(2, Eviction::unbounded()).shard_count(), 2);
+        // An absurd cap stops at the shard ceiling.
+        assert_eq!(
+            make_store(1, Eviction::capacity(usize::MAX)).shard_count(),
+            super::MAX_SHARDS
+        );
     }
 
     #[test]

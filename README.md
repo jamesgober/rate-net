@@ -24,7 +24,7 @@
         Built for <b>throughput</b>, <b>low overhead</b>, and <b>correctness under hostile traffic</b> on <b>Linux</b>, <b>macOS</b>, and <b>Windows</b>.
     </p>
     <p>
-        Per-key state lives in a <b>sharded store</b>: an existing key costs one shard read lock plus the algorithm's atomic accounting, so unrelated keys rarely contend. Memory is <b>bounded</b> by O(1) eviction: a flood of unique keys hits a cap instead of growing without limit, and no single insert ever scans the store — the difference between a rate limiter and a denial-of-service vector you built yourself.
+        Per-key state lives in a <b>sharded store</b>: an existing key costs one shard read lock plus the algorithm's atomic accounting, so unrelated keys rarely contend. Memory is <b>bounded</b> by O(1) eviction: a flood of unique keys hits a cap instead of growing without limit, and eviction never scans the store — the difference between a rate limiter and a denial-of-service vector you built yourself.
     </p>
     <p>
         The common case is one line — <code>RateLimiter::per_second(100)</code> then <code>limiter.check(key)</code>. Power users pick the algorithm, quota, burst, shard count, eviction policy, and clock through a validating builder. rate-net does not reimplement token-bucket math; it consumes <a href="https://crates.io/crates/better-bucket"><code>better-bucket</code></a> for that and adds the per-key, multi-algorithm, retry-after machinery around it.
@@ -52,7 +52,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 
 - **Atomic accounting, sharded locking.** The token bucket, leaky bucket, and fixed window account each key with a single compare-and-swap; the sliding-window algorithms hold a short per-key lock. Keys are found under a per-shard read lock, so checks of unrelated keys proceed in parallel.
 - **Never over-admits.** Admissions for a key never exceed its algorithm's documented bound, under any interleaving of threads, on a real clock. Checked by `loom` against the production code, property-tested per algorithm, and regression-tested by many threads hammering one key on the OS clock.
-- **Bounded memory, O(1) eviction.** A capacity cap evicts by CLOCK (second chance) with a bounded scan, and an idle TTL drains incrementally. No insert ever walks a whole shard.
+- **Bounded memory, O(1) eviction.** A capacity cap evicts by CLOCK (second chance) with a bounded scan, and an idle TTL drains incrementally. Capped shards are kept to 16,384 keys, so even the occasional amortized index growth stays short.
 - **Five algorithms, one trait.** Token bucket, leaky bucket (GCRA), fixed window, sliding-window log, sliding-window counter — swap the strategy without touching call sites.
 - **HTTP-ready.** Denials carry an honest `retry-after`; `retry_after_secs()` rounds it **up** for the header, and `peek` feeds the `RateLimit-*` headers on every response.
 - **Safe keys.** Tagged keys (`Key::id`, `Key::ip`) cannot collide with attacker-chosen strings, and `Key::ipv6_prefix(addr, 64)` stops a client rotating through its own `/64`.
@@ -435,8 +435,17 @@ first time a key is seen.
 Memory is **bounded by eviction**, which runs only while inserting a new key and
 does a fixed amount of work: a CLOCK hand evicts the first key not checked since
 its last pass (examining at most 32 slots), and an idle TTL is drained by an
-incremental sweep (8 slots per insert). A flood of unique keys reaches the cap
-and stays there, and a key checked at least once per revolution of the hand
+incremental sweep (8 slots per insert).
+
+Eviction itself is O(1), but a shard's index and slot vector still grow (and
+the index occasionally rehashes) in one pass under the shard's write lock,
+amortized over many inserts. To keep that pass short the store raises its shard
+count until no shard's share of the capacity cap exceeds 16,384 keys, so a
+growth or rehash touches at most that many entries (a few milliseconds at
+worst, against ~200 ms for one 1M-key shard). An unbounded store keeps the
+requested shard count; give it enough shards.
+
+A flood of unique keys reaches the cap and stays there, and a key checked at least once per revolution of the hand
 keeps its state through it. A tracked key costs about 200–300 bytes of heap
 (token bucket; ~202 B measured at the default cap), so the default cap of
 1,048,576 keys bounds the store at roughly 200 MiB. Size the cap to your real
