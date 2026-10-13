@@ -67,6 +67,23 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
 
+  miri:
+    name: Miri (atomic algorithm state and the store)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Miri makes weak compare-and-swap fail spuriously, which native x86 runs
+      # never do; it is what exercises the CAS retry paths.
+      - name: Miri
+        run: cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
+        env:
+          RUSTFLAGS: ""
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
   no-std:
     name: no_std (thumbv7em-none-eabihf)
     runs-on: ubuntu-latest

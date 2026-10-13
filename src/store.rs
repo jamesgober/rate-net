@@ -732,6 +732,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a timing bound is meaningless under Miri")]
     fn test_insert_at_capacity_is_constant_time() {
         // At a 65_536-key single-shard cap the old full-shard scan cost close
         // to a millisecond per insert (20 s for this loop); the CLOCK sweep is

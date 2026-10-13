@@ -525,6 +525,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a million checks is too slow under Miri")]
     fn test_high_rate_does_not_over_admit_from_truncation() {
         // 6e8 per second (interval 1.67ns) used to round down to 1ns and admit
         // ~1.67x the rate. Over 1ms it must admit at most burst + 600_000.
