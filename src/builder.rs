@@ -1,10 +1,12 @@
 //! The Tier-2 builder.
 
+use std::fmt;
 use std::time::Duration;
 
 use clock_lib::{Clock, SystemClock};
 
 use crate::algorithm::Algorithm;
+use crate::error::RateLimiterError;
 use crate::eviction::Eviction;
 use crate::limiter::{RateLimiter, default_shard_count};
 use crate::quota::Quota;
@@ -14,12 +16,23 @@ use crate::quota::Quota;
 ///
 /// Start it with [`RateLimiter::builder`], chain the knobs you care about —
 /// algorithm, quota, burst, shard count, eviction policy, clock — and call
-/// [`build`](Self::build). Anything left unset keeps a sane default: the token
-/// bucket, default sharding, and the bounded-memory [`Eviction`] default. The
-/// quota defaults to a limit of `0` (which denies everything), so set it.
+/// [`try_build`](Self::try_build) (or [`build`](Self::build)). Anything left
+/// unset keeps a sane default: the token bucket, default sharding, and the
+/// bounded-memory [`Eviction`] default. The quota defaults to a limit of `0`
+/// (which denies everything), so set it.
 ///
-/// `build` is infallible: a zero limit produces a deny-everything limiter, and a
-/// zero period a degenerate one, rather than an error.
+/// Two ways to finish:
+///
+/// - [`try_build`](Self::try_build) validates the configuration and returns a
+///   [`RateLimiterError`] naming the first problem — a zero limit, period, or
+///   burst, a rate or limit beyond the algorithm's ceiling, or an idle TTL
+///   shorter than the quota's recovery time. Prefer it whenever the values come
+///   from configuration.
+/// - [`build`](Self::build) is infallible and **fails closed**: a zero limit,
+///   zero period, or zero burst yields a limiter that denies everything (for
+///   every algorithm), a leaky-bucket rate above one unit per nanosecond is
+///   clamped down to it, and an idle TTL is raised to the recovery time. It
+///   never produces a limiter that admits more than configured.
 ///
 /// # Examples
 ///
@@ -51,8 +64,18 @@ pub struct Builder<C: Clock + Clone = SystemClock> {
 
 impl Builder<SystemClock> {
     /// Creates a builder with default settings, driven by the OS monotonic
-    /// clock. Reached through [`RateLimiter::builder`].
-    pub(crate) fn new() -> Self {
+    /// clock. Usually reached through [`RateLimiter::builder`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Builder;
+    ///
+    /// let limiter = Builder::new().per_second(10).try_build()?;
+    /// assert_eq!(limiter.quota().limit(), 10);
+    /// # Ok::<(), rate_net::RateLimiterError>(())
+    /// ```
+    pub fn new() -> Self {
         Self {
             algorithm: Algorithm::default(),
             limit: 0,
@@ -62,6 +85,28 @@ impl Builder<SystemClock> {
             eviction: Eviction::default(),
             clock: SystemClock::new(),
         }
+    }
+}
+
+impl Default for Builder<SystemClock> {
+    /// Same as [`Builder::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: Clock + Clone> fmt::Debug for Builder<C> {
+    /// Shows the configuration; the clock is omitted (clocks need not be
+    /// `Debug`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Builder")
+            .field("algorithm", &self.algorithm)
+            .field("limit", &self.limit)
+            .field("period", &self.period)
+            .field("burst", &self.burst)
+            .field("shards", &self.shards)
+            .field("eviction", &self.eviction)
+            .finish_non_exhaustive()
     }
 }
 
@@ -135,7 +180,8 @@ impl<C: Clock + Clone> Builder<C> {
     }
 
     /// Sets the burst ceiling. Defaults to the quota's limit. Applies to the
-    /// token and leaky buckets; window algorithms ignore it.
+    /// token and leaky buckets; the window algorithms admit at most `limit` per
+    /// period and ignore it.
     ///
     /// # Examples
     ///
@@ -206,7 +252,15 @@ impl<C: Clock + Clone> Builder<C> {
         }
     }
 
-    /// Builds the configured limiter.
+    /// Builds the configured limiter without validation, failing closed.
+    ///
+    /// A configuration that cannot describe a working limit — a zero limit,
+    /// period, or burst — produces a limiter that denies every request, for
+    /// every algorithm. A leaky-bucket rate finer than one unit per nanosecond
+    /// is clamped to it, and an idle TTL shorter than the quota's recovery time
+    /// is raised to it (see [`try_build`](Self::try_build) for the rules). The
+    /// result never admits more than configured; use `try_build` to be told
+    /// about the problem instead.
     ///
     /// # Examples
     ///
@@ -216,13 +270,82 @@ impl<C: Clock + Clone> Builder<C> {
     ///
     /// let limiter = RateLimiter::builder().quota(10, Duration::from_secs(1)).build();
     /// assert!(limiter.check("k").is_allow());
+    ///
+    /// // A zero period fails closed rather than admitting everything.
+    /// let degenerate = RateLimiter::builder().quota(10, Duration::ZERO).build();
+    /// assert!(degenerate.check("k").is_deny());
     /// ```
     #[must_use]
     pub fn build(self) -> RateLimiter<C> {
-        let burst = self.burst.unwrap_or(self.limit);
-        let quota = Quota::from_parts(self.limit, self.period, burst);
+        let quota = self.quota_value();
         let shards = self.shards.unwrap_or_else(default_shard_count);
         RateLimiter::build(self.algorithm, quota, self.clock, shards, self.eviction)
+    }
+
+    /// Validates the configuration, then builds the limiter.
+    ///
+    /// # Errors
+    ///
+    /// - [`RateLimiterError::ZeroQuota`] — the limit is `0` (or no quota was
+    ///   set).
+    /// - [`RateLimiterError::ZeroPeriod`] — the period is zero.
+    /// - [`RateLimiterError::ZeroBurst`] — the burst is `0` for the token or
+    ///   leaky bucket.
+    /// - [`RateLimiterError::RateTooHigh`] — a leaky-bucket rate above one unit
+    ///   per nanosecond.
+    /// - [`RateLimiterError::LimitTooLarge`] — a sliding-window-log limit above
+    ///   [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT).
+    /// - [`RateLimiterError::IdleTtlTooShort`] — an idle TTL shorter than the
+    ///   time a key needs to recover its full allowance (`burst / limit`
+    ///   periods for the buckets, one period for the fixed window and log, two
+    ///   for the sliding-window counter). Evicting sooner would reset a key's
+    ///   quota early.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Eviction, RateLimiter, RateLimiterError};
+    /// use std::time::Duration;
+    ///
+    /// let limiter = RateLimiter::builder().per_second(100).try_build()?;
+    /// assert_eq!(limiter.quota().limit(), 100);
+    ///
+    /// // Forgot the quota.
+    /// assert_eq!(
+    ///     RateLimiter::builder().try_build().unwrap_err(),
+    ///     RateLimiterError::ZeroQuota,
+    /// );
+    ///
+    /// // A 1 s idle TTL would reset a 10-per-minute key after one idle second.
+    /// let err = RateLimiter::builder()
+    ///     .per_minute(10)
+    ///     .eviction(Eviction::idle(Duration::from_secs(1)))
+    ///     .try_build()
+    ///     .unwrap_err();
+    /// assert_eq!(err, RateLimiterError::IdleTtlTooShort);
+    /// # Ok::<(), RateLimiterError>(())
+    /// ```
+    pub fn try_build(self) -> Result<RateLimiter<C>, RateLimiterError> {
+        self.validate()?;
+        Ok(self.build())
+    }
+
+    /// The configured quota, with the burst defaulting to the limit.
+    fn quota_value(&self) -> Quota {
+        let burst = self.burst.unwrap_or(self.limit);
+        Quota::from_parts(self.limit, self.period, burst)
+    }
+
+    /// The strict checks behind [`try_build`](Self::try_build).
+    fn validate(&self) -> Result<(), RateLimiterError> {
+        let quota = self.quota_value();
+        self.algorithm.validate(&quota)?;
+        if let Some(ttl) = self.eviction.idle_ttl() {
+            if ttl < self.algorithm.recovery_time(&quota) {
+                return Err(RateLimiterError::IdleTtlTooShort);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -235,7 +358,9 @@ mod tests {
 
     use clock_lib::ManualClock;
 
+    use super::Builder;
     use crate::algorithm::Algorithm;
+    use crate::error::RateLimiterError;
     use crate::eviction::Eviction;
     use crate::limiter::RateLimiter;
 
@@ -282,6 +407,150 @@ mod tests {
     fn test_unset_quota_denies() {
         let limiter = RateLimiter::builder().build();
         assert!(limiter.check("k").is_deny());
+    }
+
+    #[test]
+    fn test_try_build_accepts_a_valid_configuration() {
+        let limiter = RateLimiter::builder()
+            .per_minute(600)
+            .burst(50)
+            .eviction(Eviction::idle(Duration::from_secs(60)))
+            .try_build()
+            .unwrap();
+        assert_eq!(limiter.quota().limit(), 600);
+        assert!(limiter.check("k").is_allow());
+    }
+
+    #[test]
+    fn test_try_build_rejects_each_degenerate_field() {
+        assert_eq!(
+            RateLimiter::builder().try_build().unwrap_err(),
+            RateLimiterError::ZeroQuota
+        );
+        assert_eq!(
+            RateLimiter::builder()
+                .quota(10, Duration::ZERO)
+                .try_build()
+                .unwrap_err(),
+            RateLimiterError::ZeroPeriod
+        );
+        assert_eq!(
+            RateLimiter::builder()
+                .per_second(10)
+                .burst(0)
+                .try_build()
+                .unwrap_err(),
+            RateLimiterError::ZeroBurst
+        );
+    }
+
+    #[test]
+    fn test_try_build_rejects_ttl_shorter_than_recovery() {
+        // A burst of 20 at 10/s takes two seconds to recover.
+        let short = RateLimiter::builder()
+            .per_second(10)
+            .burst(20)
+            .eviction(Eviction::idle(Duration::from_millis(1_999)));
+        assert_eq!(
+            short.try_build().unwrap_err(),
+            RateLimiterError::IdleTtlTooShort
+        );
+        let exact = RateLimiter::builder()
+            .per_second(10)
+            .burst(20)
+            .eviction(Eviction::idle(Duration::from_secs(2)));
+        assert!(exact.try_build().is_ok());
+    }
+
+    #[test]
+    fn test_build_fails_closed_on_zero_period_and_burst() {
+        let zero_period = RateLimiter::builder().quota(10, Duration::ZERO).build();
+        let zero_burst = RateLimiter::builder().per_second(10).burst(0).build();
+        for _ in 0..100 {
+            assert!(zero_period.check("k").is_deny());
+            assert!(zero_burst.check("k").is_deny());
+        }
+    }
+
+    #[test]
+    fn test_build_raises_a_short_ttl_to_the_recovery_time() {
+        // per_minute(10) with a 1s idle TTL used to reset a drained key after
+        // one idle second; the effective TTL is now the full minute.
+        let clock = Arc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_minute(10)
+            .shards(1)
+            .eviction(Eviction::idle(Duration::from_secs(1)))
+            .clock(Arc::clone(&clock))
+            .build();
+        for _ in 0..10 {
+            assert!(limiter.check("victim").is_allow());
+        }
+        clock.advance(Duration::from_secs(2));
+        // A new key triggers the idle sweep; the drained key must survive it.
+        let _ = limiter.check("other");
+        assert!(limiter.check("victim").is_deny());
+    }
+
+    #[test]
+    fn test_builder_default_and_debug() {
+        let builder = Builder::default().per_second(3);
+        let rendered = format!("{builder:?}");
+        assert!(rendered.contains("Builder"));
+        assert!(rendered.contains("limit: 3"));
+        assert_eq!(builder.build().quota().limit(), 3);
+    }
+
+    #[cfg(feature = "algorithms")]
+    #[test]
+    fn test_build_fails_closed_for_every_algorithm() {
+        for algorithm in [
+            Algorithm::TokenBucket,
+            Algorithm::LeakyBucket,
+            Algorithm::FixedWindow,
+            Algorithm::SlidingWindowLog,
+            Algorithm::SlidingWindowCounter,
+        ] {
+            let zero_period = RateLimiter::builder()
+                .algorithm(algorithm)
+                .quota(10, Duration::ZERO)
+                .build();
+            let admitted = (0..1_000)
+                .filter(|_| zero_period.check("k").is_allow())
+                .count();
+            assert_eq!(admitted, 0, "{algorithm:?} failed open on a zero period");
+        }
+    }
+
+    #[cfg(feature = "algorithms")]
+    #[test]
+    fn test_try_build_applies_algorithm_ceilings() {
+        assert_eq!(
+            RateLimiter::builder()
+                .algorithm(Algorithm::LeakyBucket)
+                .per_second(2_000_000_000)
+                .try_build()
+                .unwrap_err(),
+            RateLimiterError::RateTooHigh
+        );
+        assert_eq!(
+            RateLimiter::builder()
+                .algorithm(Algorithm::SlidingWindowLog)
+                .per_second(crate::MAX_SLIDING_LOG_LIMIT + 1)
+                .try_build()
+                .unwrap_err(),
+            RateLimiterError::LimitTooLarge
+        );
+        // The sliding-window counter needs two periods to forget a window.
+        assert_eq!(
+            RateLimiter::builder()
+                .algorithm(Algorithm::SlidingWindowCounter)
+                .per_second(10)
+                .eviction(Eviction::idle(Duration::from_millis(1_500)))
+                .try_build()
+                .unwrap_err(),
+            RateLimiterError::IdleTtlTooShort
+        );
     }
 
     #[cfg(feature = "algorithms")]

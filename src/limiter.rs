@@ -211,7 +211,9 @@ impl<C: Clock + Clone> RateLimiter<C> {
         eviction: Eviction,
     ) -> Self {
         let epoch = clock.now();
-        let store = Store::new(shards, eviction);
+        // An idle TTL never evicts a key before it could have recovered its
+        // full allowance; evicting sooner would hand out a fresh quota early.
+        let store = Store::new(shards, eviction, algorithm.recovery_time(&quota));
         // The token bucket reads its own clock and capacity-only eviction orders
         // by a logical counter, so that combination needs no clock read here.
         let reads_clock = algorithm != Algorithm::TokenBucket || eviction.idle_ttl().is_some();

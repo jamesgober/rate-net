@@ -73,8 +73,9 @@ pub(crate) struct Store<C: Clock> {
 
 impl<C: Clock> Store<C> {
     /// Builds a store with `shards` shards (rounded up to a power of two, at
-    /// least one) and the given eviction policy.
-    pub(crate) fn new(shards: usize, eviction: Eviction) -> Self {
+    /// least one) and the given eviction policy. An idle TTL shorter than
+    /// `min_idle` is raised to it.
+    pub(crate) fn new(shards: usize, eviction: Eviction, min_idle: Duration) -> Self {
         let shard_count = shards.max(1).next_power_of_two();
         // Spread a total cap evenly across shards; at least one key per shard so
         // a tiny cap with many shards still admits keys.
@@ -83,7 +84,7 @@ impl<C: Clock> Store<C> {
             .map(|max| max.div_ceil(shard_count).max(1));
         let idle_ttl_ms = eviction
             .idle_ttl()
-            .map(|ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+            .map(|ttl| u64::try_from(ttl.max(min_idle).as_millis()).unwrap_or(u64::MAX));
 
         let shards = (0..shard_count)
             .map(|_| Shard::new())
@@ -237,7 +238,7 @@ mod tests {
     use crate::key::Key;
 
     fn make_store(shards: usize, eviction: Eviction) -> Store<SystemClock> {
-        Store::new(shards, eviction)
+        Store::new(shards, eviction, Duration::ZERO)
     }
 
     fn token_state(rate: u32) -> impl Fn() -> AlgoState<SystemClock> {
@@ -317,7 +318,7 @@ mod tests {
     #[test]
     fn test_manual_clock_store_refills_across_window() {
         let clock = Arc::new(ManualClock::new());
-        let store: Store<Arc<ManualClock>> = Store::new(4, Eviction::unbounded());
+        let store: Store<Arc<ManualClock>> = Store::new(4, Eviction::unbounded(), Duration::ZERO);
         let clock_for_make = Arc::clone(&clock);
         let make = move || {
             AlgoState::TokenBucket(Bucket::per_second(3).with_clock(Arc::clone(&clock_for_make)))

@@ -130,7 +130,7 @@ mod store;
 mod sync;
 
 #[cfg(feature = "std")]
-pub use crate::algorithm::Algorithm;
+pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};
 #[cfg(feature = "async")]
 pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
@@ -138,7 +138,7 @@ pub use crate::builder::Builder;
 #[cfg(feature = "std")]
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
-pub use crate::error::RateLimiterError;
+pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
 pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
 #[cfg(feature = "std")]
