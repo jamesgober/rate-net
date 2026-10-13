@@ -138,11 +138,13 @@ impl<L: Limiter + ?Sized> Limiter for Box<L> {
 ///
 /// Tracks an independent allowance for every key it sees and answers
 /// [`check`](Self::check) in the time it takes to hash the key and run its
-/// bucket. Per-key state lives in a [sharded](Self::with_shards) concurrent
-/// store: unrelated keys land in different shards and never contend, an
-/// existing-key check takes only a shared read lock plus the bucket's atomic
-/// accounting, and memory is bounded by [eviction](Self::with_eviction) so a
-/// flood of unique keys hits a cap instead of growing without limit. The
+/// algorithm. Per-key state lives in a [sharded](Self::with_shards) concurrent
+/// store: unrelated keys usually land in different shards, an existing-key
+/// check takes only that shard's read lock plus the algorithm's accounting (one
+/// atomic compare-and-swap for the token bucket, leaky bucket, and fixed
+/// window; a short per-key mutex for the sliding windows), and memory is
+/// bounded by O(1) [eviction](Self::with_eviction) so a flood of unique keys
+/// hits a cap instead of growing without limit. The
 /// limiter is `Send + Sync` and is meant to be shared — behind an
 /// [`Arc`](std::sync::Arc), or as a `static` — across all the threads serving
 /// requests.

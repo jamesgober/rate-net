@@ -25,11 +25,12 @@ pub const MAX_SLIDING_LOG_LIMIT: u32 = 1 << 16;
 /// Selects the algorithm a limiter uses to decide a request.
 ///
 /// Every algorithm shares the same [`Limiter`](crate::Limiter) surface, so the
-/// strategy can change without touching call sites. This enum is the selector a
-/// future builder uses to pick between them.
+/// strategy can change without touching call sites. Pass it to
+/// [`Builder::algorithm`](crate::Builder::algorithm) or
+/// [`RateLimiter::with_algorithm`](crate::RateLimiter::with_algorithm).
 ///
-/// `#[non_exhaustive]`: algorithms are added over the `0.x` series, so a `match`
-/// must include a wildcard arm. [`TokenBucket`](Self::TokenBucket) — the default
+/// `#[non_exhaustive]`: future releases may add algorithms, so a `match` must
+/// include a wildcard arm. [`TokenBucket`](Self::TokenBucket) — the default
 /// — is always available; the leaky bucket and the window algorithms are
 /// compiled in under the `algorithms` feature, so their variants only exist when
 /// it is enabled.
