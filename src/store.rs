@@ -366,9 +366,14 @@ impl<C: Clock> Store<C> {
         let per_shard_cap = eviction.max_keys().map_or(MAX_SLOTS, |max| {
             max.div_ceil(shard_count).clamp(1, MAX_SLOTS)
         });
-        let idle_ttl_ms = eviction
-            .idle_ttl()
-            .map(|ttl| u64::try_from(ttl.max(min_idle).as_millis()).unwrap_or(u64::MAX));
+        // Idle time is measured between millisecond stamps, both floored, so
+        // a measured gap can exceed the true one by up to a millisecond. The
+        // TTL is rounded up and one millisecond added, so a key is only ever
+        // reclaimed once it has truly been idle for the whole TTL.
+        let idle_ttl_ms = eviction.idle_ttl().map(|ttl| {
+            let nanos = ttl.max(min_idle).as_nanos().div_ceil(1_000_000);
+            u64::try_from(nanos).unwrap_or(u64::MAX).saturating_add(1)
+        });
 
         let shards = (0..shard_count)
             .map(|_| Shard::new())
@@ -705,7 +710,27 @@ mod tests {
             Eviction::idle(Duration::from_millis(10)),
             Duration::from_secs(1),
         );
-        assert_eq!(store.idle_ttl_ms, Some(1_000));
+        // Rounded up and padded by a millisecond for the floored stamps.
+        assert_eq!(store.idle_ttl_ms, Some(1_001));
+    }
+
+    #[test]
+    fn test_idle_ttl_never_reclaims_a_key_before_the_full_ttl() {
+        // The verifier's case: a key last seen at 0.999ms and idle for
+        // 999.001ms has floored stamps 0 and 1000, a measured gap of the whole
+        // 1s TTL, although it has not been idle that long.
+        let store = make_store(1, Eviction::new(1_000, Duration::from_secs(1)));
+        let make = token_state(1_000);
+        let key = Key::from("k");
+        let _ = store.check(key.clone(), 1_000, Duration::from_micros(999), &make);
+        let _ = store.check(Key::from("other"), 1, Duration::from_millis(1_000), &make);
+        assert!(
+            store.peek(&key, Duration::ZERO).is_some(),
+            "reclaimed early"
+        );
+        // Once truly idle for longer than the TTL, it goes.
+        let _ = store.check(Key::from("later"), 1, Duration::from_millis(1_002), &make);
+        assert!(store.peek(&key, Duration::ZERO).is_none());
     }
 
     #[test]
