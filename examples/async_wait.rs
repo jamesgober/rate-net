@@ -20,6 +20,15 @@ async fn main() {
     println!("allowance spent; awaiting a refill...");
 
     let start = std::time::Instant::now();
-    limiter.until_ready("job-queue").await;
-    println!("admitted after {:?}", start.elapsed());
+    match limiter.try_until_ready("job-queue").await {
+        Ok(()) => println!("admitted after {:?}", start.elapsed()),
+        Err(impossible) => println!("never admissible: {impossible}"),
+    }
+
+    // A request larger than the burst can never fit; the wait says so at once
+    // instead of returning as if the caller had been admitted.
+    match limiter.try_until_ready_n("job-queue", 6).await {
+        Ok(()) => println!("admitted 6 units"),
+        Err(impossible) => println!("refused: {impossible}"),
+    }
 }
