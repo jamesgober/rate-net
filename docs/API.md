@@ -531,7 +531,8 @@ pub const fn headers(&self) -> [(&'static str, u64); 3]
 A read-only view of one key's allowance, from `RateLimiter::peek`,
 `DirectLimiter::peek`, or `Gcra::peek_at`. A limiter that admits nothing reports
 `limit() == 0` and `reset_after() == Duration::MAX`. `headers` returns
-`RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset`.
+`RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` (`0` for a
+limiter that admits nothing, rather than a 20-digit "never").
 
 ```rust
 use rate_net::RateLimiter;

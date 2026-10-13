@@ -166,10 +166,26 @@ impl Snapshot {
         crate::headers::ceil_secs(self.reset_after)
     }
 
+    /// The `RateLimit-Reset` value: the rounded-up reset time, or `0` for a
+    /// limiter that admits nothing (see [`headers`](Self::headers)).
+    const fn reset_header_secs(&self) -> u64 {
+        if self.limit == 0 {
+            0
+        } else {
+            self.reset_after_secs()
+        }
+    }
+
     /// The three `RateLimit-*` response headers as `(name, value)` pairs, ready
     /// for any HTTP framework: `RateLimit-Limit` ([`limit`](Self::limit)),
     /// `RateLimit-Remaining` ([`remaining`](Self::remaining)), and
     /// `RateLimit-Reset` ([`reset_after_secs`](Self::reset_after_secs)).
+    ///
+    /// A limiter that admits nothing (`limit() == 0`) has no reset to report:
+    /// its `reset_after` is [`Duration::MAX`], which as a header would be a
+    /// 20-digit number that 32-bit parsers reject. It reports
+    /// `RateLimit-Reset: 0` instead, beside `RateLimit-Limit: 0`, which is what
+    /// tells a client nothing will be admitted.
     ///
     /// See [`headers`](crate::headers) for the header names and how they pair
     /// with `Retry-After`.
@@ -197,7 +213,7 @@ impl Snapshot {
         [
             (crate::headers::RATELIMIT_LIMIT, self.limit as u64),
             (crate::headers::RATELIMIT_REMAINING, self.remaining as u64),
-            (crate::headers::RATELIMIT_RESET, self.reset_after_secs()),
+            (crate::headers::RATELIMIT_RESET, self.reset_header_secs()),
         ]
     }
 }
@@ -227,6 +243,20 @@ mod tests {
             ]
         );
         assert_eq!(Snapshot::full(5).reset_after_secs(), 0);
+    }
+
+    #[test]
+    fn test_closed_snapshot_headers_report_no_reset() {
+        let closed = Snapshot::closed();
+        assert_eq!(closed.reset_after_secs(), u64::MAX);
+        assert_eq!(
+            closed.headers(),
+            [
+                ("RateLimit-Limit", 0),
+                ("RateLimit-Remaining", 0),
+                ("RateLimit-Reset", 0),
+            ]
+        );
     }
 
     #[test]
