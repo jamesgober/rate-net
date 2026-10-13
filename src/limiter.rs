@@ -447,8 +447,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
     ///
     /// Useful when a single request costs more than one unit (a batch, a
     /// weighted endpoint). Either all `n` units are admitted or none are.
-    /// Requesting `0` always succeeds; requesting more than the quota can never
-    /// succeed, and the denial's `retry_after` is [`Duration::MAX`].
+    /// Requesting `0` always succeeds; requesting more than the key's capacity
+    /// (the burst for the token and leaky buckets, the limit for the window
+    /// algorithms) can never succeed, and the denial's `retry_after` is
+    /// [`Duration::MAX`] ([`Decision::is_impossible`]).
     ///
     /// [`Duration::MAX`]: std::time::Duration::MAX
     ///
