@@ -62,6 +62,78 @@ pub trait Limiter {
     }
 }
 
+/// The object-safe face of [`Limiter`], for holding "any limiter" behind a
+/// pointer.
+///
+/// `Limiter`'s methods are generic over `impl Into<Key>`, which keeps call
+/// sites short but means `dyn Limiter` cannot exist. `DynLimiter` has one
+/// non-generic method, so `&dyn DynLimiter`, `Box<dyn DynLimiter>`, and
+/// `Arc<dyn DynLimiter + Send + Sync>` all work — the shape middleware wants
+/// when the limiter is chosen at runtime. Every [`Limiter`] implements it
+/// automatically, and the trait objects implement `Limiter` again, so the
+/// ergonomic `check` / `check_n` stay available on them.
+///
+/// # Examples
+///
+/// ```
+/// use rate_net::{DynLimiter, Limiter, RateLimiter};
+/// use std::sync::Arc;
+///
+/// // Pick an implementation at runtime and hold it as a trait object.
+/// let limiter: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(1));
+///
+/// assert!(limiter.check_key("user:42".into(), 1).is_allow());
+/// // The trait object is itself a `Limiter`, so the generic helpers work too.
+/// assert!(limiter.check("user:42").is_deny());
+/// ```
+pub trait DynLimiter {
+    /// Checks `n` units against `key`. The non-generic core of
+    /// [`Limiter::check_n`].
+    fn check_key(&self, key: Key, n: u32) -> Decision;
+}
+
+impl<L: Limiter> DynLimiter for L {
+    #[inline]
+    fn check_key(&self, key: Key, n: u32) -> Decision {
+        self.check_n(key, n)
+    }
+}
+
+impl Limiter for dyn DynLimiter + '_ {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        self.check_key(key.into(), n)
+    }
+}
+
+impl Limiter for dyn DynLimiter + Send + Sync + '_ {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        self.check_key(key.into(), n)
+    }
+}
+
+impl<L: Limiter + ?Sized> Limiter for &L {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        (**self).check_n(key, n)
+    }
+}
+
+impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        (**self).check_n(key, n)
+    }
+}
+
+impl<L: Limiter + ?Sized> Limiter for Box<L> {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        (**self).check_n(key, n)
+    }
+}
+
 /// A keyed rate limiter.
 ///
 /// Tracks an independent allowance for every key it sees and answers
@@ -673,10 +745,11 @@ mod tests {
 
     use clock_lib::ManualClock;
 
-    use super::{Limiter, RateLimiter};
+    use super::{DynLimiter, Limiter, RateLimiter};
     use crate::algorithm::Algorithm;
     use crate::decision::Decision;
     use crate::eviction::Eviction;
+    use crate::key::Key;
     use crate::quota::Quota;
 
     fn manual() -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
@@ -825,6 +898,37 @@ mod tests {
         }
         let limiter = RateLimiter::per_second(3);
         assert_eq!(count_admitted(&limiter, "k", 10), 3);
+    }
+
+    #[test]
+    fn test_dyn_limiter_holds_any_limiter_as_a_trait_object() {
+        let clock = Arc::new(ManualClock::new());
+        let limiters: Vec<Box<dyn DynLimiter>> = vec![
+            Box::new(RateLimiter::per_second(1)),
+            Box::new(RateLimiter::per_second(1).with_clock(Arc::clone(&clock))),
+        ];
+        for limiter in &limiters {
+            assert!(limiter.check_key(Key::from("k"), 1).is_allow());
+            // The boxed trait object is itself a `Limiter`.
+            assert!(limiter.check("k").is_deny());
+            assert!(limiter.check_n("other", 1).is_allow());
+        }
+        let shared: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(2));
+        assert!(shared.check("k").is_allow());
+        let by_ref: &dyn DynLimiter = &*limiters[0];
+        assert!(by_ref.check("fresh").is_allow());
+    }
+
+    #[test]
+    fn test_limiter_is_implemented_for_references_and_smart_pointers() {
+        fn admit<L: Limiter>(limiter: L) -> bool {
+            limiter.check("k").is_allow()
+        }
+        let limiter = Arc::new(RateLimiter::per_second(2));
+        assert!(admit(&*limiter));
+        assert!(admit(Arc::clone(&limiter)));
+        assert!(admit(Box::new(RateLimiter::per_second(1))));
+        assert!(!admit(&limiter));
     }
 
     #[test]

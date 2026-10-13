@@ -148,7 +148,7 @@ pub use crate::gcra::Gcra;
 #[cfg(feature = "std")]
 pub use crate::key::Key;
 #[cfg(feature = "std")]
-pub use crate::limiter::{Limiter, RateLimiter};
+pub use crate::limiter::{DynLimiter, Limiter, RateLimiter};
 pub use crate::quota::Quota;
 pub use crate::snapshot::Snapshot;
 
