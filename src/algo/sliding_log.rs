@@ -3,8 +3,17 @@
 //! Keeps the timestamp of every admitted unit in the trailing `period` and
 //! admits only while fewer than `limit` remain. This is the exact algorithm —
 //! the admitted count in any rolling window never exceeds `limit`, with no
-//! boundary burst — at the cost of up to `limit` timestamps of memory per key
+//! boundary burst — at the cost of per-key memory that grows with the traffic
 //! and a short per-key lock on each check. It ignores the quota's `burst`.
+//!
+//! # Memory
+//!
+//! Units admitted at the same instant share one record, so the log holds one
+//! 16-byte `(timestamp, running total)` record per *distinct admit time* in the
+//! trailing window: at most `limit` records, and a single `check_n` of any size
+//! costs one. The worst case per key is therefore `16 * limit` bytes, which is
+//! why the validating builder caps the limit at
+//! [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT).
 
 use core::time::Duration;
 use std::collections::VecDeque;
@@ -18,9 +27,64 @@ fn nanos(now: Duration) -> u64 {
     u64::try_from(now.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Sliding-log state for one key: admit timestamps (ns), oldest at the front.
+/// One coalesced record: every unit admitted at `at_ns`, and the running total
+/// of units ever admitted up to and including them.
+#[derive(Clone, Copy)]
+struct Run {
+    at_ns: u64,
+    total: u64,
+}
+
+/// The log: live records oldest first, plus the running total at the end of the
+/// newest record already aged out. `back.total - expired_total` is the number
+/// of units in the window, without walking the records.
+struct Log {
+    runs: VecDeque<Run>,
+    expired_total: u64,
+}
+
+impl Log {
+    /// The running total at the newest record (or at the last expiry when the
+    /// log is empty).
+    fn total(&self) -> u64 {
+        self.runs.back().map_or(self.expired_total, |run| run.total)
+    }
+
+    /// Units currently inside the window.
+    fn in_window(&self) -> u64 {
+        self.total() - self.expired_total
+    }
+
+    /// Drops every record at least `period_ns` old as of `now_ns`. Comparing
+    /// `ts + period <= now` (rather than a `now - period` window start) stays
+    /// correct when `now < period`, where a subtracted start would underflow.
+    fn expire(&mut self, now_ns: u64, period_ns: u64) {
+        while let Some(front) = self.runs.front().copied() {
+            if front.at_ns.saturating_add(period_ns) > now_ns {
+                break;
+            }
+            self.expired_total = front.total;
+            let _expired = self.runs.pop_front();
+        }
+    }
+
+    /// Records `n` units admitted at `now_ns`, coalescing with the newest
+    /// record when it carries the same timestamp.
+    fn record(&mut self, n: u32, now_ns: u64) {
+        let total = self.total().saturating_add(u64::from(n));
+        match self.runs.back_mut() {
+            Some(back) if back.at_ns == now_ns => back.total = total,
+            _ => self.runs.push_back(Run {
+                at_ns: now_ns,
+                total,
+            }),
+        }
+    }
+}
+
+/// Sliding-log state for one key.
 pub(crate) struct SlidingLog {
-    log: Mutex<VecDeque<u64>>,
+    log: Mutex<Log>,
     period_ns: u64,
     limit: u32,
 }
@@ -28,8 +92,11 @@ pub(crate) struct SlidingLog {
 impl SlidingLog {
     pub(crate) fn new(quota: &Quota) -> Self {
         Self {
-            log: Mutex::new(VecDeque::new()),
-            period_ns: nanos(quota.period()).max(1),
+            log: Mutex::new(Log {
+                runs: VecDeque::new(),
+                expired_total: 0,
+            }),
+            period_ns: nanos(quota.period()),
             limit: quota.limit(),
         }
     }
@@ -38,42 +105,44 @@ impl SlidingLog {
         if n == 0 {
             return Decision::Allow;
         }
-        if self.limit == 0 || n > self.limit {
+        // A zero period is degenerate (fail closed); a zero limit or `n > limit`
+        // can never fit.
+        if self.limit == 0 || self.period_ns == 0 || n > self.limit {
             return Decision::Deny {
                 retry_after: Duration::MAX,
             };
         }
 
-        let now_ns = nanos(now);
+        let real_now_ns = nanos(now);
         let mut log = sync::lock(&self.log);
+        // A late thread (its `now` read before another thread's newer record)
+        // is treated as arriving with that record: the log stays sorted and the
+        // window can never be judged against an older instant.
+        let now_ns = log
+            .runs
+            .back()
+            .map_or(real_now_ns, |back| back.at_ns.max(real_now_ns));
+        log.expire(now_ns, self.period_ns);
 
-        // Drop every timestamp at least `period` old — it has aged out of the
-        // trailing window. Comparing `ts + period <= now` (rather than a
-        // `now - period` window start) stays correct when `now < period`, where
-        // a subtracted start would underflow to zero.
-        while log
-            .front()
-            .is_some_and(|&ts| ts.saturating_add(self.period_ns) <= now_ns)
-        {
-            let _ = log.pop_front();
-        }
-
-        let count = log.len();
-        let n = n as usize;
-        if count + n <= self.limit as usize {
-            for _ in 0..n {
-                log.push_back(now_ns);
-            }
+        let in_window = log.in_window();
+        let wanted = u64::from(n);
+        let limit = u64::from(self.limit);
+        if in_window + wanted <= limit {
+            log.record(n, now_ns);
             return Decision::Allow;
         }
 
-        // Denied: `count + n - limit` of the oldest entries must age out before
-        // the request fits. That many expire once the (need_expire)-th oldest
-        // crosses `period`.
-        let need_expire = count + n - self.limit as usize;
-        let expire_at = log[need_expire - 1].saturating_add(self.period_ns);
+        // Denied: the oldest `in_window + n - limit` units must age out first.
+        // They have all left once the record whose running total reaches that
+        // many past the last expiry crosses `period`.
+        let target = log.expired_total + (in_window + wanted - limit);
+        let index = log.runs.partition_point(|run| run.total < target);
+        let expire_at = log
+            .runs
+            .get(index)
+            .map_or(now_ns, |run| run.at_ns.saturating_add(self.period_ns));
         Decision::Deny {
-            retry_after: Duration::from_nanos(expire_at.saturating_sub(now_ns)),
+            retry_after: Duration::from_nanos(expire_at.saturating_sub(real_now_ns)),
         }
     }
 }
@@ -124,6 +193,19 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_after_for_multi_unit_request_spans_coalesced_runs() {
+        let sl = SlidingLog::new(&Quota::per_second(10));
+        assert!(sl.acquire(4, at(0)).is_allow()); // one run of 4 at t=0
+        assert!(sl.acquire(4, at(200)).is_allow()); // one run of 4 at t=200
+        assert!(sl.acquire(2, at(400)).is_allow()); // full: 10 in window
+        // 6 more need 6 to age out: the t=0 run (4) and two of the t=200 run,
+        // so the wait ends when the t=200 run leaves at t=1200.
+        assert_eq!(sl.acquire(6, at(500)).retry_after(), Some(at(700)));
+        // 4 more need only the t=0 run to leave, at t=1000.
+        assert_eq!(sl.acquire(4, at(500)).retry_after(), Some(at(500)));
+    }
+
+    #[test]
     fn test_no_boundary_burst() {
         // Unlike a fixed window, a sliding log never admits more than `limit` in
         // any window: fill at the end of one notional window, none free at the
@@ -145,5 +227,34 @@ mod tests {
                 retry_after: Duration::MAX
             }
         );
+    }
+
+    #[test]
+    fn test_large_check_n_is_one_record() {
+        // A single huge request used to push one timestamp per unit (hundreds
+        // of megabytes for 50M units). Coalesced, it is one record.
+        let sl = SlidingLog::new(&Quota::per_second(u32::MAX));
+        assert!(sl.acquire(50_000_000, at(0)).is_allow());
+        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
+        assert!(sl.acquire(50_000_000, at(0)).is_allow());
+        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
+    }
+
+    #[test]
+    fn test_late_thread_never_unsorts_the_log() {
+        let sl = SlidingLog::new(&Quota::per_second(2));
+        assert!(sl.acquire(1, at(800)).is_allow());
+        // A late arrival stamped t=100 is recorded at t=800, so the window is
+        // still judged in order and the unit ages out with its neighbour.
+        assert!(sl.acquire(1, at(100)).is_allow());
+        assert!(sl.acquire(1, at(900)).is_deny());
+        assert!(sl.acquire(1, at(1_800)).is_allow());
+    }
+
+    #[test]
+    fn test_zero_period_denies_everything() {
+        let quota = Quota::from_parts(10, Duration::ZERO, 10);
+        let sl = SlidingLog::new(&quota);
+        assert_eq!(sl.acquire(1, at(0)).retry_after(), Some(Duration::MAX));
     }
 }

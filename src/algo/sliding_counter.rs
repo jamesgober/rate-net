@@ -31,16 +31,18 @@ struct State {
 /// Sliding-counter state for one key.
 pub(crate) struct SlidingCounter {
     state: Mutex<State>,
+    /// Window length in ns. Zero only for a degenerate (zero-period) quota,
+    /// which is denied before any division.
     period_ns: u64,
     limit: u32,
 }
 
 impl SlidingCounter {
     pub(crate) fn new(quota: &Quota, now: Duration) -> Self {
-        let period_ns = nanos(quota.period()).max(1);
+        let period_ns = nanos(quota.period());
         Self {
             state: Mutex::new(State {
-                window: nanos(now) / period_ns,
+                window: nanos(now).checked_div(period_ns).unwrap_or(0),
                 prev: 0,
                 curr: 0,
             }),
@@ -53,16 +55,22 @@ impl SlidingCounter {
         if n == 0 {
             return Decision::Allow;
         }
-        if self.limit == 0 || n > self.limit {
+        // A zero period is degenerate (fail closed); a zero limit or `n > limit`
+        // can never fit.
+        if self.limit == 0 || self.period_ns == 0 || n > self.limit {
             return Decision::Deny {
                 retry_after: Duration::MAX,
             };
         }
 
-        let now_ns = nanos(now);
+        let real_now_ns = nanos(now);
+        let mut state = sync::lock(&self.state);
+        // A late thread — its `now` read before another thread rolled the
+        // windows forward — is treated as arriving at the start of the current
+        // window, never as reaching back into a window already rolled past.
+        let now_ns = real_now_ns.max(state.window.saturating_mul(self.period_ns));
         let window_number = now_ns / self.period_ns;
         let offset = now_ns % self.period_ns;
-        let mut state = sync::lock(&self.state);
 
         // Roll the windows forward if time has moved into a later window.
         if window_number > state.window {
@@ -89,14 +97,17 @@ impl SlidingCounter {
         // Denied: estimate how long until the weighted count falls enough. While
         // the previous window still contributes, its term decays at `prev /
         // period` per nanosecond; otherwise wait for the next window boundary.
+        // A late thread waits from its own (earlier) instant. The wait is at
+        // least a nanosecond: a denial never tells the caller to retry at once.
         let deficit = estimated + f64::from(n) - f64::from(self.limit);
         let wait_ns = if state.prev > 0 {
             ((deficit * period / f64::from(state.prev)) as u64).min(self.period_ns)
         } else {
             self.period_ns - offset
         };
+        let late_by = now_ns - real_now_ns;
         Decision::Deny {
-            retry_after: Duration::from_nanos(wait_ns),
+            retry_after: Duration::from_nanos(wait_ns.saturating_add(late_by).max(1)),
         }
     }
 }
@@ -168,5 +179,25 @@ mod tests {
                 retry_after: Duration::MAX
             }
         );
+    }
+
+    #[test]
+    fn test_late_thread_is_judged_against_the_current_window() {
+        let sc = SlidingCounter::new(&Quota::per_second(4), at(0));
+        // Window 1 is opened and filled.
+        for _ in 0..4 {
+            assert!(sc.acquire(1, at(1_000)).is_allow());
+        }
+        // A late arrival stamped in window 0 must not escape window 1's count
+        // by using a window-0 offset against window-1 state.
+        assert!(sc.acquire(1, at(999)).is_deny());
+    }
+
+    #[test]
+    fn test_zero_period_denies_everything() {
+        let quota = Quota::from_parts(10, Duration::ZERO, 10);
+        let sc = SlidingCounter::new(&quota, at(0));
+        assert_eq!(sc.acquire(1, at(5)).retry_after(), Some(Duration::MAX));
+        assert_eq!(sc.acquire(0, at(5)), Decision::Allow);
     }
 }
