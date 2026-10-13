@@ -44,6 +44,18 @@ mod compare {
         group.finish();
     }
 
+    pub fn direct_coarse_clock(c: &mut Criterion) {
+        let clock = rate_net::CoarseClock::spawn(std::time::Duration::from_millis(1))
+            .expect("spawn the ticker");
+        let rn = rate_net::DirectLimiter::per_second(u32::MAX).with_clock(clock);
+        let gov = governor::RateLimiter::direct(governor::Quota::per_second(huge()));
+
+        let mut group = c.benchmark_group("compare/direct_coarse_clock");
+        let _ = group.bench_function("rate-net", |b| b.iter(|| black_box(&rn).check()));
+        let _ = group.bench_function("governor", |b| b.iter(|| black_box(&gov).check()));
+        group.finish();
+    }
+
     pub fn single_key_coarse_clock(c: &mut Criterion) {
         let clock = rate_net::CoarseClock::spawn(std::time::Duration::from_millis(1))
             .expect("spawn the ticker");
@@ -98,6 +110,7 @@ fn main() {
         compare::single_key(&mut criterion);
         compare::single_key_coarse_clock(&mut criterion);
         compare::direct(&mut criterion);
+        compare::direct_coarse_clock(&mut criterion);
         compare::many_keys(&mut criterion);
         criterion.final_summary();
     }

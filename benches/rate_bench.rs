@@ -16,6 +16,7 @@
 //!   default 1,048,576-key cap over the default shard count, full. Before the
 //!   CLOCK eviction this cost ~329 µs per insert.
 //! - `check/direct` — a [`DirectLimiter`]: no key, no map, no lock.
+//! - `check/direct_coarse_clock` — the same on a [`CoarseClock`].
 //! - `peek/existing_key` — reading an allowance for `RateLimit-*` headers.
 //!
 //! Run with `cargo bench --bench rate_bench`.
@@ -140,6 +141,15 @@ fn bench_direct(c: &mut Criterion) {
     });
 }
 
+fn bench_direct_coarse_clock(c: &mut Criterion) {
+    let clock = CoarseClock::spawn(Duration::from_millis(1)).expect("spawn the ticker");
+    let limiter = DirectLimiter::per_second(u32::MAX).with_clock(clock);
+
+    let _ = c.bench_function("check/direct_coarse_clock", |b| {
+        b.iter(|| black_box(&limiter).check());
+    });
+}
+
 fn bench_peek(c: &mut Criterion) {
     let limiter = permissive();
     let _ = limiter.check("user:42");
@@ -158,6 +168,7 @@ criterion_group!(
     bench_eviction_sweep,
     bench_insert_at_default_cap,
     bench_direct,
+    bench_direct_coarse_clock,
     bench_peek
 );
 criterion_main!(benches);
