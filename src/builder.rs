@@ -30,8 +30,9 @@ use crate::quota::Quota;
 ///   shorter than the quota's recovery time. Prefer it whenever the values come
 ///   from configuration.
 /// - [`build`](Self::build) is infallible and **fails closed**: a zero limit,
-///   zero period, or zero burst yields a limiter that denies everything (for
-///   every algorithm), a leaky-bucket rate above one unit per nanosecond is
+///   or zero period yields a limiter that denies everything (for every
+///   algorithm) and so does a zero burst for the token and leaky buckets (the
+///   window algorithms ignore the burst), a leaky-bucket rate above one unit per nanosecond is
 ///   clamped down to it, and an idle TTL is raised to the recovery time. It
 ///   never produces a limiter that admits more than configured.
 ///
@@ -256,9 +257,10 @@ impl<C: Clock + Clone> Builder<C> {
 
     /// Builds the configured limiter without validation, failing closed.
     ///
-    /// A configuration that cannot describe a working limit — a zero limit,
-    /// period, or burst — produces a limiter that denies every request, for
-    /// every algorithm. A leaky-bucket rate finer than one unit per nanosecond
+    /// A configuration that cannot describe a working limit — a zero limit or
+    /// period under any algorithm, or a zero burst under the token or leaky
+    /// bucket (the window algorithms ignore the burst) — produces a limiter
+    /// that denies every request. A leaky-bucket rate finer than one unit per nanosecond
     /// is clamped to it, and an idle TTL shorter than the quota's recovery time
     /// is raised to it (see [`try_build`](Self::try_build) for the rules). The
     /// result never admits more than configured; use `try_build` to be told

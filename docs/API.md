@@ -319,8 +319,9 @@ sharding, bounded eviction, `SystemClock`); the quota defaults to a limit of
   of `0` or above [`MAX_SHARDS`](#constants)), `IdleTtlTooShort` (an idle TTL below
   the quota's recovery time — `burst / limit` periods for the buckets, one period
   for the fixed window and log, two for the sliding-window counter).
-- **`build`** never fails and **fails closed**: a zero limit, period, or burst
-  denies everything for every algorithm; a too-fast leaky-bucket rate is clamped
+- **`build`** never fails and **fails closed**: a zero limit or period denies
+  everything for every algorithm, as does a zero burst for the token and leaky
+  buckets (the window algorithms ignore the burst); a too-fast leaky-bucket rate is clamped
   to one unit per nanosecond; a short idle TTL is raised to the recovery time;
   a shard count is clamped to `1..=MAX_SHARDS`.
 - **`try_build_direct` / `build_direct`** build a [`DirectLimiter`](#directlimiter)

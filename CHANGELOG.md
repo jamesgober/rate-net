@@ -69,7 +69,8 @@ documentation claims that were not true of `1.0.0` are corrected.
   already-rolled window, never unsorting the log).
 - **Degenerate configurations failed open (RN-COR-04).** A zero period admitted
   everything under every algorithm except the token bucket. Every algorithm now
-  fails closed: a zero limit, period, or burst denies everything.
+  fails closed: a zero limit or period denies everything, as does a zero burst
+  for the token and leaky buckets (the window algorithms ignore the burst).
 - **Leaky-bucket truncation (RN-COR-05).** The emission interval was a truncated
   whole number of nanoseconds: 600 M/s admitted 1 G/s (1.67x), and above
   1 G/s the interval reached zero and everything was admitted. Time is now

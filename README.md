@@ -123,8 +123,9 @@ One constructor, one method. The key can be anything that converts into a
 
 The builder selects the algorithm, quota, burst, shard count, eviction policy,
 and clock in one fluent surface. `try_build` validates it; `build` never fails
-and fails *closed* on a degenerate configuration (a zero period or burst
-denies everything rather than admitting everything):
+and fails *closed* on a degenerate configuration (a zero limit or period, or a
+zero burst for the buckets, denies everything rather than admitting
+everything):
 
 ```rust
 use rate_net::{Eviction, RateLimiter, RateLimiterError};
