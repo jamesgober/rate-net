@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use clock_lib::{Clock, Monotonic, SystemClock};
 
-use crate::algo::AlgoState;
+use crate::algo::{AlgoState, fresh_snapshot};
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
 use crate::key::Key;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::store::Store;
 
 /// Default shard count when the caller does not choose one: four shards per
@@ -466,6 +467,38 @@ impl<C: Clock + Clone> RateLimiter<C> {
     #[must_use]
     pub fn tracked_keys(&self) -> usize {
         self.store.len()
+    }
+
+    /// Reads `key`'s remaining allowance without consuming any.
+    ///
+    /// The [`Snapshot`] carries the key's capacity, what is left of it right
+    /// now, and the wait until it is whole again — what `RateLimit-*` response
+    /// headers report on every response, admitted or not. Peeking takes only
+    /// the shard read lock, never counts a unit, never creates state for an
+    /// unseen key (which reports its full allowance), and does not refresh the
+    /// key's eviction recency. Like any read of shared state it is advisory
+    /// under concurrency; the [`Decision`] from a check is the authority.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(10);
+    /// assert_eq!(limiter.peek("user:42").remaining(), 10); // unseen: full
+    ///
+    /// assert!(limiter.check_n("user:42", 4).is_allow());
+    /// let snapshot = limiter.peek("user:42");
+    /// assert_eq!(snapshot.limit(), 10);
+    /// assert_eq!(snapshot.remaining(), 6);
+    /// assert_eq!(limiter.tracked_keys(), 1); // peeking created nothing
+    /// ```
+    #[must_use]
+    pub fn peek(&self, key: impl Into<Key>) -> Snapshot {
+        let key = key.into();
+        self.store
+            .peek(&key, self.now())
+            .unwrap_or_else(|| fresh_snapshot(self.algorithm, &self.quota))
     }
 
     /// The shared check path: hand the key to the store as of the elapsed time,

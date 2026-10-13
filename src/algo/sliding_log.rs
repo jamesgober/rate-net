@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::sync::{self, Mutex};
 
 /// Clamps a duration-since-epoch to nanoseconds.
@@ -145,6 +146,27 @@ impl SlidingLog {
             retry_after: Duration::from_nanos(expire_at.saturating_sub(real_now_ns)),
         }
     }
+
+    /// Units still admissible right now, and the wait until every record has
+    /// aged out (the full allowance is back).
+    pub(crate) fn peek(&self, now: Duration) -> Snapshot {
+        if self.limit == 0 || self.period_ns == 0 {
+            return Snapshot::closed();
+        }
+        let real_now_ns = nanos(now);
+        let mut log = sync::lock(&self.log);
+        let now_ns = log
+            .runs
+            .back()
+            .map_or(real_now_ns, |back| back.at_ns.max(real_now_ns));
+        log.expire(now_ns, self.period_ns);
+        let used = u32::try_from(log.in_window()).unwrap_or(u32::MAX);
+        let reset_after = log.runs.back().map_or(Duration::ZERO, |newest| {
+            let full_at = newest.at_ns.saturating_add(self.period_ns);
+            Duration::from_nanos(full_at.saturating_sub(real_now_ns))
+        });
+        Snapshot::new(self.limit, self.limit.saturating_sub(used), reset_after)
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -152,6 +174,7 @@ mod tests {
     use super::SlidingLog;
     use crate::decision::Decision;
     use crate::quota::Quota;
+    use crate::snapshot::Snapshot;
     use core::time::Duration;
 
     fn at(ms: u64) -> Duration {
@@ -256,5 +279,21 @@ mod tests {
         let quota = Quota::from_parts(10, Duration::ZERO, 10);
         let sl = SlidingLog::new(&quota);
         assert_eq!(sl.acquire(1, at(0)).retry_after(), Some(Duration::MAX));
+        assert_eq!(sl.peek(at(0)), Snapshot::closed());
+    }
+
+    #[test]
+    fn test_peek_reports_remaining_and_full_recovery() {
+        let sl = SlidingLog::new(&Quota::per_second(5));
+        assert_eq!(sl.peek(at(0)), Snapshot::full(5));
+        assert!(sl.acquire(2, at(0)).is_allow());
+        assert!(sl.acquire(1, at(400)).is_allow());
+        // 3 in window; the newest (t=400) leaves at t=1400.
+        let snapshot = sl.peek(at(500));
+        assert_eq!((snapshot.remaining(), snapshot.reset_after()), (2, at(900)));
+        // At t=1000 the t=0 run has aged out.
+        let snapshot = sl.peek(at(1_000));
+        assert_eq!((snapshot.remaining(), snapshot.reset_after()), (4, at(400)));
+        assert_eq!(sl.peek(at(1_400)), Snapshot::full(5));
     }
 }

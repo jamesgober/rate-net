@@ -20,6 +20,7 @@ use core::time::Duration;
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::sync::{AtomicU64, Ordering};
 
 /// Clamps a duration-since-epoch to nanoseconds.
@@ -147,6 +148,25 @@ impl FixedWindow {
             core::hint::spin_loop();
         }
     }
+
+    /// What is left of the current window, and when it ends (zero if nothing
+    /// has been admitted in it).
+    pub(crate) fn peek(&self, now: Duration) -> Snapshot {
+        if self.deny_all {
+            return Snapshot::closed();
+        }
+        let now_ns = nanos(now);
+        let current = self.state.load(Ordering::Acquire);
+        let latest = self.latest.load(Ordering::Acquire);
+        let window = self.window_of(now_ns).max(latest);
+        let used = Self::count_in(window, current, latest).min(self.limit);
+        let reset_after = if used == 0 {
+            Duration::ZERO
+        } else {
+            self.until_end_of(window, now_ns)
+        };
+        Snapshot::new(self.limit, self.limit - used, reset_after)
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -251,6 +271,23 @@ mod tests {
     fn test_zero_limit_denies_everything() {
         let fw = FixedWindow::new(&Quota::per_second(0), at(0));
         assert!(fw.acquire(1, at(0)).is_deny());
+        assert_eq!(fw.peek(at(0)), crate::snapshot::Snapshot::closed());
+    }
+
+    #[test]
+    fn test_peek_reports_window_remaining_and_end() {
+        let fw = FixedWindow::new(&Quota::per_second(5), at(0));
+        assert_eq!(
+            fw.peek(at(100)),
+            crate::snapshot::Snapshot::full(5),
+            "an untouched window is full with nothing to wait for"
+        );
+        assert!(fw.acquire(2, at(100)).is_allow());
+        let snapshot = fw.peek(at(250));
+        assert_eq!(snapshot.remaining(), 3);
+        assert_eq!(snapshot.reset_after(), at(750));
+        // A new window is full again, without any check rolling it.
+        assert_eq!(fw.peek(at(1_000)).remaining(), 5);
     }
 
     #[test]

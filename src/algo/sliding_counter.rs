@@ -11,6 +11,7 @@ use core::time::Duration;
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::sync::{self, Mutex};
 
 /// Clamps a duration-since-epoch to nanoseconds.
@@ -65,29 +66,8 @@ impl SlidingCounter {
 
         let real_now_ns = nanos(now);
         let mut state = sync::lock(&self.state);
-        // A late thread — its `now` read before another thread rolled the
-        // windows forward — is treated as arriving at the start of the current
-        // window, never as reaching back into a window already rolled past.
-        let now_ns = real_now_ns.max(state.window.saturating_mul(self.period_ns));
-        let window_number = now_ns / self.period_ns;
-        let offset = now_ns % self.period_ns;
-
-        // Roll the windows forward if time has moved into a later window.
-        if window_number > state.window {
-            state.prev = if window_number == state.window + 1 {
-                state.curr
-            } else {
-                0
-            };
-            state.curr = 0;
-            state.window = window_number;
-        }
-
-        // The previous window's contribution fades linearly across the current
-        // window: full at the boundary, zero at the next.
-        let period = self.period_ns as f64;
-        let weight = (self.period_ns - offset) as f64 / period;
-        let estimated = f64::from(state.prev) * weight + f64::from(state.curr);
+        let (now_ns, offset) = self.roll(&mut state, real_now_ns);
+        let estimated = self.estimate(&state, offset);
 
         if estimated + f64::from(n) <= f64::from(self.limit) {
             state.curr = state.curr.saturating_add(n);
@@ -101,7 +81,7 @@ impl SlidingCounter {
         // least a nanosecond: a denial never tells the caller to retry at once.
         let deficit = estimated + f64::from(n) - f64::from(self.limit);
         let wait_ns = if state.prev > 0 {
-            ((deficit * period / f64::from(state.prev)) as u64).min(self.period_ns)
+            ((deficit * self.period_ns as f64 / f64::from(state.prev)) as u64).min(self.period_ns)
         } else {
             self.period_ns - offset
         };
@@ -110,6 +90,63 @@ impl SlidingCounter {
             retry_after: Duration::from_nanos(wait_ns.saturating_add(late_by).max(1)),
         }
     }
+
+    /// Rolls the windows forward to `real_now_ns` and returns the effective
+    /// instant and its offset into the current window.
+    ///
+    /// A late thread — its `now` read before another thread rolled the
+    /// windows forward — is treated as arriving at the start of the current
+    /// window, never as reaching back into a window already rolled past.
+    fn roll(&self, state: &mut State, real_now_ns: u64) -> (u64, u64) {
+        let now_ns = real_now_ns.max(state.window.saturating_mul(self.period_ns));
+        let window_number = now_ns / self.period_ns;
+        if window_number > state.window {
+            state.prev = if window_number == state.window + 1 {
+                state.curr
+            } else {
+                0
+            };
+            state.curr = 0;
+            state.window = window_number;
+        }
+        (now_ns, now_ns % self.period_ns)
+    }
+
+    /// The weighted count: the previous window's contribution fades linearly
+    /// across the current window — full at the boundary, zero at the next.
+    fn estimate(&self, state: &State, offset: u64) -> f64 {
+        let weight = (self.period_ns - offset) as f64 / self.period_ns as f64;
+        f64::from(state.prev) * weight + f64::from(state.curr)
+    }
+
+    /// Units admissible right now, and the wait until both windows' counts
+    /// have faded out (the full allowance is back).
+    pub(crate) fn peek(&self, now: Duration) -> Snapshot {
+        if self.limit == 0 || self.period_ns == 0 {
+            return Snapshot::closed();
+        }
+        let real_now_ns = nanos(now);
+        let mut state = sync::lock(&self.state);
+        let (now_ns, offset) = self.roll(&mut state, real_now_ns);
+        let estimated = self.estimate(&state, offset);
+        let remaining = (f64::from(self.limit) - estimated).floor().max(0.0) as u32;
+        let to_boundary = self.period_ns - offset;
+        let full_in = if state.curr > 0 {
+            // The current window's count fades out over the next one.
+            to_boundary.saturating_add(self.period_ns)
+        } else if state.prev > 0 {
+            to_boundary
+        } else {
+            0
+        };
+        let late_by = now_ns - real_now_ns;
+        let reset_after = if full_in == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(full_in.saturating_add(late_by))
+        };
+        Snapshot::new(self.limit, remaining, reset_after)
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -117,6 +154,7 @@ mod tests {
     use super::SlidingCounter;
     use crate::decision::Decision;
     use crate::quota::Quota;
+    use crate::snapshot::Snapshot;
     use core::time::Duration;
 
     fn at(ms: u64) -> Duration {
@@ -199,5 +237,20 @@ mod tests {
         let sc = SlidingCounter::new(&quota, at(0));
         assert_eq!(sc.acquire(1, at(5)).retry_after(), Some(Duration::MAX));
         assert_eq!(sc.acquire(0, at(5)), Decision::Allow);
+        assert_eq!(sc.peek(at(5)), Snapshot::closed());
+    }
+
+    #[test]
+    fn test_peek_reports_weighted_remaining_and_fade_out() {
+        let sc = SlidingCounter::new(&Quota::per_second(10), at(0));
+        assert_eq!(sc.peek(at(0)), Snapshot::full(10));
+        assert!(sc.acquire(4, at(200)).is_allow());
+        let snapshot = sc.peek(at(200));
+        assert_eq!(snapshot.remaining(), 6);
+        // The current window ends in 800ms and its count fades over the next.
+        assert_eq!(snapshot.reset_after(), at(1_800));
+        // Half way through the next window, half of the 4 still counts.
+        assert_eq!(sc.peek(at(1_500)).remaining(), 8);
+        assert_eq!(sc.peek(at(2_000)), Snapshot::full(10));
     }
 }

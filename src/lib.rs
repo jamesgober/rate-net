@@ -125,6 +125,8 @@ mod limiter;
 #[cfg(feature = "std")]
 mod quota;
 #[cfg(feature = "std")]
+mod snapshot;
+#[cfg(feature = "std")]
 mod store;
 #[cfg(feature = "std")]
 mod sync;
@@ -147,6 +149,8 @@ pub use crate::key::Key;
 pub use crate::limiter::{Limiter, RateLimiter};
 #[cfg(feature = "std")]
 pub use crate::quota::Quota;
+#[cfg(feature = "std")]
+pub use crate::snapshot::Snapshot;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///

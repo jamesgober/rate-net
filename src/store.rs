@@ -48,6 +48,7 @@ use crate::algo::AlgoState;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
 use crate::key::Key;
+use crate::snapshot::Snapshot;
 use crate::sync::{self, AtomicBool, AtomicU64, Ordering, RwLock};
 
 /// The hash bits that pick a shard. `hashbrown` takes the bucket index from the
@@ -354,6 +355,15 @@ impl<C: Clock> Store<C> {
         if map.slots.len() >= self.per_shard_cap {
             let _evicted = map.evict_one(now_ms, self.idle_ttl_ms);
         }
+    }
+
+    /// `key`'s remaining allowance as of `now`, or `None` if the key has no
+    /// state. Takes only the shard read lock, consumes nothing, and leaves the
+    /// key's eviction recency untouched.
+    pub(crate) fn peek(&self, key: &Key, now: Duration) -> Option<Snapshot> {
+        let hash = self.hasher.hash_one(key);
+        let map = sync::read(&self.shard(hash).map);
+        map.get(hash, key).map(|entry| entry.state.peek(now))
     }
 
     /// The number of keys with live state across all shards. A momentary,

@@ -22,6 +22,7 @@ use core::time::Duration;
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::sync::{AtomicU64, Ordering};
 
 /// Clamps a duration-since-epoch to nanoseconds, saturating rather than wrapping
@@ -141,6 +142,31 @@ impl LeakyBucket {
             };
         }
     }
+
+    /// Units that would conform right now, and the wait until the bucket has
+    /// drained back to its full burst.
+    pub(crate) fn peek(&self, now: Duration) -> Snapshot {
+        if self.deny_all {
+            return Snapshot::closed();
+        }
+        let burst = self.tolerance + 1;
+        let now_ns = nanos(now);
+        let now_iv = self.intervals_at(now_ns);
+        let tat = self.tat.load(Ordering::Acquire).max(now_iv);
+        // `k` units conform iff `tat + (k - 1) <= now + tolerance`.
+        let remaining = now_iv.saturating_add(burst).saturating_sub(tat);
+        let reset_after = if tat == now_iv {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(self.nanos_at(tat).saturating_sub(now_ns))
+        };
+        let burst = u32::try_from(burst).unwrap_or(u32::MAX);
+        Snapshot::new(
+            burst,
+            u32::try_from(remaining).unwrap_or(u32::MAX),
+            reset_after,
+        )
+    }
 }
 
 #[cfg(all(test, not(loom)))]
@@ -148,6 +174,7 @@ mod tests {
     use super::LeakyBucket;
     use crate::decision::Decision;
     use crate::quota::Quota;
+    use crate::snapshot::Snapshot;
     use core::time::Duration;
 
     fn at(ms: u64) -> Duration {
@@ -218,6 +245,19 @@ mod tests {
         assert_eq!(lb.acquire(1, at(0)).retry_after(), Some(Duration::MAX));
         let lb = LeakyBucket::new(&Quota::from_parts(5, Duration::ZERO, 5));
         assert_eq!(lb.acquire(1, at(0)).retry_after(), Some(Duration::MAX));
+    }
+
+    #[test]
+    fn test_peek_reports_conforming_units_and_drain_time() {
+        let lb = LeakyBucket::new(&Quota::per_second(10));
+        assert_eq!(lb.peek(at(0)), Snapshot::full(10));
+        assert!(lb.acquire(4, at(0)).is_allow());
+        let snapshot = lb.peek(at(0));
+        assert_eq!(snapshot.remaining(), 6);
+        // Four intervals of 100ms to drain back to empty.
+        assert_eq!(snapshot.reset_after(), at(400));
+        assert_eq!(lb.peek(at(150)).remaining(), 7);
+        assert_eq!(lb.peek(at(400)), Snapshot::full(10));
     }
 
     #[test]
