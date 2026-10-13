@@ -689,6 +689,27 @@ impl<C: Clock + Clone> RateLimiter<C> {
         self.store.shrink_to_fit();
     }
 
+    /// The limiter's cumulative counters: checks allowed and denied, and keys
+    /// inserted, evicted, expired, and removed. Requires the `metrics` feature;
+    /// see [`Metrics`](crate::Metrics) for what each counter means.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("a");
+    /// let _ = limiter.check("a");
+    /// let metrics = limiter.metrics();
+    /// assert_eq!((metrics.allowed, metrics.denied), (1, 1));
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn metrics(&self) -> crate::Metrics {
+        self.store.metrics()
+    }
+
     /// The shared check path: hand the key to the store as of the elapsed time,
     /// seeding fresh per-key state if this is the first time the key is seen.
     #[inline]

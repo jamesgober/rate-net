@@ -48,6 +48,8 @@ use crate::algo::AlgoState;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
 use crate::key::Key;
+#[cfg(feature = "metrics")]
+use crate::metrics::{Counters, Metrics};
 use crate::snapshot::Snapshot;
 use crate::sync::{self, AtomicBool, AtomicU64, Ordering, RwLock};
 
@@ -256,6 +258,53 @@ impl<C: Clock> ShardMap<C> {
 #[repr(align(128))]
 struct Shard<C: Clock> {
     map: RwLock<ShardMap<C>>,
+    /// This shard's counters, beside the lock word every check already
+    /// touches. Absent without the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    counters: Counters,
+}
+
+// The metrics hooks. Without the `metrics` feature they are empty and inline
+// away, so the counters cost nothing when off.
+impl<C: Clock> Shard<C> {
+    fn new() -> Self {
+        Self {
+            map: RwLock::new(ShardMap::new()),
+            #[cfg(feature = "metrics")]
+            counters: Counters::new(),
+        }
+    }
+
+    #[inline]
+    fn on_decision(&self, decision: Decision) -> Decision {
+        #[cfg(feature = "metrics")]
+        self.counters.decision(decision.is_allow());
+        decision
+    }
+
+    #[cfg_attr(not(feature = "metrics"), allow(clippy::unused_self))]
+    #[inline]
+    fn on_inserted(&self) {
+        #[cfg(feature = "metrics")]
+        self.counters.inserted();
+    }
+
+    #[cfg_attr(not(feature = "metrics"), allow(clippy::unused_self, unused_variables))]
+    #[inline]
+    fn on_reclaimed(&self, evicted: usize, expired: usize) {
+        #[cfg(feature = "metrics")]
+        {
+            self.counters.evicted(evicted);
+            self.counters.expired(expired);
+        }
+    }
+
+    #[cfg_attr(not(feature = "metrics"), allow(clippy::unused_self, unused_variables))]
+    #[inline]
+    fn on_removed(&self, count: usize) {
+        #[cfg(feature = "metrics")]
+        self.counters.removed(count);
+    }
 }
 
 /// The sharded per-key store.
@@ -289,9 +338,7 @@ impl<C: Clock> Store<C> {
             .map(|ttl| u64::try_from(ttl.max(min_idle).as_millis()).unwrap_or(u64::MAX));
 
         let shards = (0..shard_count)
-            .map(|_| Shard {
-                map: RwLock::new(ShardMap::new()),
-            })
+            .map(|_| Shard::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -331,7 +378,7 @@ impl<C: Clock> Store<C> {
             let map = sync::read(&shard.map);
             if let Some(entry) = map.get(hash, &key) {
                 entry.touch(now_ms, track_idle);
-                return entry.state.acquire(n, now);
+                return shard.on_decision(entry.state.acquire(n, now));
             }
         }
 
@@ -340,24 +387,27 @@ impl<C: Clock> Store<C> {
         let mut map = sync::write(&shard.map);
         if let Some(entry) = map.get(hash, &key) {
             entry.touch(now_ms, track_idle);
-            return entry.state.acquire(n, now);
+            return shard.on_decision(entry.state.acquire(n, now));
         }
-        self.make_room(&mut map, now_ms);
+        self.make_room(shard, &mut map, now_ms);
         let state = make_state();
         let outcome = state.acquire(n, now);
         map.insert(hash, key, Entry::new(state, now_ms));
-        outcome
+        shard.on_inserted();
+        shard.on_decision(outcome)
     }
 
     /// Makes room in a shard about to receive a new key: an incremental idle
     /// sweep, then a CLOCK eviction if the shard is full. Bounded work.
-    fn make_room(&self, map: &mut ShardMap<C>, now_ms: u64) {
-        if let Some(ttl_ms) = self.idle_ttl_ms {
-            let _reclaimed = map.sweep_idle(now_ms, ttl_ms, TTL_SWEEP);
-        }
-        if map.slots.len() >= self.per_shard_cap {
-            let _evicted = map.evict_one(now_ms, self.idle_ttl_ms);
-        }
+    fn make_room(&self, shard: &Shard<C>, map: &mut ShardMap<C>, now_ms: u64) {
+        let expired = match self.idle_ttl_ms {
+            Some(ttl_ms) => map.sweep_idle(now_ms, ttl_ms, TTL_SWEEP),
+            None => 0,
+        };
+        let evicted = usize::from(
+            map.slots.len() >= self.per_shard_cap && map.evict_one(now_ms, self.idle_ttl_ms),
+        );
+        shard.on_reclaimed(evicted, expired);
     }
 
     /// `key`'s remaining allowance as of `now`, or `None` if the key has no
@@ -383,16 +433,22 @@ impl<C: Clock> Store<C> {
     /// Forgets `key` entirely. Returns whether the key had state.
     pub(crate) fn remove(&self, key: &Key) -> bool {
         let hash = self.hasher.hash_one(key);
-        let mut map = sync::write(&self.shard(hash).map);
-        map.position(hash, key)
+        let shard = self.shard(hash);
+        let mut map = sync::write(&shard.map);
+        let removed = map
+            .position(hash, key)
             .and_then(|pos| map.remove_at(pos))
-            .is_some()
+            .is_some();
+        shard.on_removed(usize::from(removed));
+        removed
     }
 
     /// Forgets every key and releases the shards' memory.
     pub(crate) fn clear(&self) {
         for shard in self.shards.iter() {
-            *sync::write(&shard.map) = ShardMap::new();
+            let mut map = sync::write(&shard.map);
+            shard.on_removed(map.slots.len());
+            *map = ShardMap::new();
         }
     }
 
@@ -413,6 +469,7 @@ impl<C: Clock> Store<C> {
                 let mut map = sync::write(&shard.map);
                 cursor = cursor.min(map.slots.len());
                 let stop = cursor.saturating_sub(RETAIN_CHUNK);
+                let mut chunk_removed = 0;
                 while cursor > stop {
                     cursor -= 1;
                     let full = map
@@ -420,9 +477,11 @@ impl<C: Clock> Store<C> {
                         .get(cursor)
                         .is_some_and(|slot| slot.entry.state.is_full(now));
                     if full && map.remove_at(cursor).is_some() {
-                        removed += 1;
+                        chunk_removed += 1;
                     }
                 }
+                shard.on_removed(chunk_removed);
+                removed += chunk_removed;
                 if cursor == 0 {
                     break;
                 }
@@ -448,6 +507,16 @@ impl<C: Clock> Store<C> {
             .iter()
             .map(|shard| sync::read(&shard.map).slots.len())
             .sum()
+    }
+
+    /// The counters summed across every shard.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metrics(&self) -> Metrics {
+        let mut metrics = Metrics::default();
+        for shard in self.shards.iter() {
+            shard.counters.add_to(&mut metrics);
+        }
+        metrics
     }
 
     /// The number of shards (a power of two).

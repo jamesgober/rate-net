@@ -45,6 +45,9 @@ pub struct DirectLimiter<C: Clock + Clone = SystemClock> {
     /// The token bucket reads its own clock; every other algorithm needs the
     /// elapsed time passed in.
     reads_clock: bool,
+    /// Allowed / denied counters. Absent without the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    counters: crate::metrics::Counters,
 }
 
 impl DirectLimiter<SystemClock> {
@@ -114,6 +117,8 @@ impl<C: Clock + Clone> DirectLimiter<C> {
             clock,
             epoch,
             reads_clock: algorithm != Algorithm::TokenBucket,
+            #[cfg(feature = "metrics")]
+            counters: crate::metrics::Counters::new(),
         }
     }
 
@@ -195,7 +200,32 @@ impl<C: Clock + Clone> DirectLimiter<C> {
         } else {
             Duration::ZERO
         };
-        self.state.acquire(n, now)
+        let decision = self.state.acquire(n, now);
+        #[cfg(feature = "metrics")]
+        self.counters.decision(decision.is_allow());
+        decision
+    }
+
+    /// The limiter's cumulative allowed and denied counters (the key counters
+    /// stay zero: a direct limiter has no keys). Requires the `metrics`
+    /// feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::DirectLimiter;
+    ///
+    /// let limiter = DirectLimiter::per_second(1);
+    /// let _ = limiter.check();
+    /// let _ = limiter.check();
+    /// assert_eq!(limiter.metrics().denied, 1);
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn metrics(&self) -> crate::Metrics {
+        let mut metrics = crate::Metrics::default();
+        self.counters.add_to(&mut metrics);
+        metrics
     }
 
     /// Reads the remaining allowance without consuming any. See

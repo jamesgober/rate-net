@@ -127,6 +127,8 @@ pub mod headers;
 mod key;
 #[cfg(feature = "std")]
 mod limiter;
+#[cfg(feature = "metrics")]
+mod metrics;
 mod quota;
 mod snapshot;
 #[cfg(feature = "std")]
@@ -153,6 +155,8 @@ pub use crate::gcra::Gcra;
 pub use crate::key::Key;
 #[cfg(feature = "std")]
 pub use crate::limiter::{DynLimiter, Limiter, RateLimiter};
+#[cfg(feature = "metrics")]
+pub use crate::metrics::Metrics;
 pub use crate::quota::Quota;
 pub use crate::snapshot::Snapshot;
 
