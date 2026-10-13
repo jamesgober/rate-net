@@ -76,12 +76,20 @@ documentation claims that were not true of `1.0.0` are corrected.
   1 G/s the interval reached zero and everything was admitted. Time is now
   accounted in exact emission intervals (no drift at any rate), and a rate
   above one unit per nanosecond is clamped to it.
+- **Sliding-window counter `retry_after` was early.** It waited only to the
+  next window boundary (or capped the wait at one period), ignoring that the
+  current window's count then becomes the fading one: a client honouring
+  `Retry-After` was denied again. The counter now admits with exact integer
+  arithmetic and reports the exact earliest instant the request fits;
+  `tests/retry_honesty.rs` property-tests, for every algorithm, that retrying
+  after `retry_after` succeeds.
 - **`until_ready` returned as if admitted when it gave up (RN-COR-06).** See
   `try_until_ready` below; `until_ready` / `until_ready_n` are deprecated.
 - **An idle TTL shorter than the quota reset a key early (RN-COR-07).** The
   effective TTL is now raised to the quota's recovery time (the time a key needs
-  to regain its full allowance), so idle eviction can never hand out a fresh
-  quota early; `try_build` rejects the shorter TTL outright.
+  to regain its full allowance), and rounded up past the millisecond stamps'
+  truncation, so idle eviction can never hand out a fresh quota early;
+  `try_build` rejects the shorter TTL outright.
 - **Token-bucket capacity ceiling and the 49.7-day wrap (RN-COR-05, RN-COR-08).**
   With `better-bucket` 1.1 the ~4.29M-token capacity cap and the
   under-refill after a 49.7-day idle gap are gone.
@@ -120,7 +128,11 @@ documentation claims that were not true of `1.0.0` are corrected.
   `InsufficientCapacity`, and `headers` (previously only `VERSION`).
 - `CoarseClock` (and `MIN_COARSE_RESOLUTION`) — a monotonic clock read with one
   atomic load, ticked by a background thread (`spawn`) or by the caller
-  (`tick`). Roughly halves the cost of a token-bucket check.
+  (`tick`). Roughly halves the cost of a token-bucket check. A lagging clock
+  can admit up to `rate × lag` beyond the quota over a span (the lagged time is
+  credited when it catches up); a spawned clock bounds the lag to about one
+  interval even when the ticker is starved, because every 64th read on a
+  thread re-reads the real clock and ticks if a whole interval behind.
 - `AsyncLimiter::try_until_ready` / `try_until_ready_n`, and the same on
   `DirectLimiter` (feature `async`) — return `InsufficientCapacity` instead of
   returning as if admitted. Cancel-safe. `Debug` for `AsyncLimiter`.
