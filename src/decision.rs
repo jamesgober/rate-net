@@ -101,6 +101,61 @@ impl Decision {
             _ => None,
         }
     }
+
+    /// Returns `true` if the request was refused permanently: it asked for more
+    /// than the limit can ever grant at once, or the limiter admits nothing.
+    /// Its `retry_after` is [`Duration::MAX`] and no wait will help.
+    ///
+    /// An HTTP service should answer such a request with a client error (`400`
+    /// or `413`) rather than `429`, since retrying is pointless.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Decision;
+    /// use std::time::Duration;
+    ///
+    /// assert!(Decision::Deny { retry_after: Duration::MAX }.is_impossible());
+    /// assert!(!Decision::Deny { retry_after: Duration::from_secs(1) }.is_impossible());
+    /// assert!(!Decision::Allow.is_impossible());
+    /// ```
+    #[must_use]
+    pub fn is_impossible(&self) -> bool {
+        matches!(self, Self::Deny { retry_after } if *retry_after == Duration::MAX)
+    }
+
+    /// The HTTP `Retry-After` value for a denial: whole seconds, **rounded
+    /// up**, and at least `1`.
+    ///
+    /// Rounding up is what makes the header honest: a 1.9 s wait truncated to
+    /// `1` sends clients back early to be denied again. Returns `None` when
+    /// there is nothing to wait for — the request was allowed — or nothing
+    /// worth waiting for — it is [impossible](Self::is_impossible).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Decision;
+    /// use std::time::Duration;
+    ///
+    /// let denied = Decision::Deny { retry_after: Duration::from_millis(1_900) };
+    /// assert_eq!(denied.retry_after_secs(), Some(2));
+    ///
+    /// let soon = Decision::Deny { retry_after: Duration::from_millis(5) };
+    /// assert_eq!(soon.retry_after_secs(), Some(1));
+    ///
+    /// assert_eq!(Decision::Allow.retry_after_secs(), None);
+    /// assert_eq!(Decision::Deny { retry_after: Duration::MAX }.retry_after_secs(), None);
+    /// ```
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Deny { retry_after } if *retry_after != Duration::MAX => {
+                Some(crate::headers::ceil_secs(*retry_after).max(1))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -131,6 +186,24 @@ mod tests {
         assert!(allow.is_allow());
         assert!(!allow.is_deny());
         assert_eq!(allow.retry_after(), None);
+    }
+
+    #[test]
+    fn test_retry_after_secs_rounds_up_and_skips_impossible() {
+        let cases = [
+            (Duration::from_nanos(1), Some(1)),
+            (Duration::from_millis(999), Some(1)),
+            (Duration::from_secs(1), Some(1)),
+            (Duration::from_millis(1_001), Some(2)),
+            (Duration::ZERO, Some(1)),
+            (Duration::MAX, None),
+        ];
+        for (wait, expected) in cases {
+            let deny = Decision::Deny { retry_after: wait };
+            assert_eq!(deny.retry_after_secs(), expected, "{wait:?}");
+            assert_eq!(deny.is_impossible(), wait == Duration::MAX);
+        }
+        assert_eq!(Decision::Allow.retry_after_secs(), None);
     }
 
     #[test]

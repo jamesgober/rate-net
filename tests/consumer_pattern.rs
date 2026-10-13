@@ -33,8 +33,9 @@ enum Verdict {
 fn admit<L: Limiter>(limiter: &L, key: impl Into<rate_net::Key>) -> Verdict {
     match limiter.check(key) {
         Decision::Allow => Verdict::Serve,
-        Decision::Deny { retry_after } => Verdict::TooManyRequests {
-            retry_after_secs: retry_after.as_secs().max(1),
+        decision @ Decision::Deny { .. } => Verdict::TooManyRequests {
+            // Rounded up, so the hint never sends the client back early.
+            retry_after_secs: decision.retry_after_secs().unwrap_or(u64::MAX),
         },
         _ => Verdict::TooManyRequests {
             retry_after_secs: 1,

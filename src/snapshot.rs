@@ -146,6 +146,60 @@ impl Snapshot {
     pub const fn is_exhausted(&self) -> bool {
         self.remaining == 0
     }
+
+    /// [`reset_after`](Self::reset_after) in whole seconds, rounded up — the
+    /// `RateLimit-Reset` value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "std")] {
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_minute(60);
+    /// let _ = limiter.check("k"); // one token back in 1 s
+    /// assert_eq!(limiter.peek("k").reset_after_secs(), 1);
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn reset_after_secs(&self) -> u64 {
+        crate::headers::ceil_secs(self.reset_after)
+    }
+
+    /// The three `RateLimit-*` response headers as `(name, value)` pairs, ready
+    /// for any HTTP framework: `RateLimit-Limit` ([`limit`](Self::limit)),
+    /// `RateLimit-Remaining` ([`remaining`](Self::remaining)), and
+    /// `RateLimit-Reset` ([`reset_after_secs`](Self::reset_after_secs)).
+    ///
+    /// See [`headers`](crate::headers) for the header names and how they pair
+    /// with `Retry-After`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "std")] {
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(10);
+    /// let _ = limiter.check_n("k", 3);
+    /// assert_eq!(
+    ///     limiter.peek("k").headers(),
+    ///     [
+    ///         ("RateLimit-Limit", 10),
+    ///         ("RateLimit-Remaining", 7),
+    ///         ("RateLimit-Reset", 1),
+    ///     ],
+    /// );
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn headers(&self) -> [(&'static str, u64); 3] {
+        [
+            (crate::headers::RATELIMIT_LIMIT, self.limit as u64),
+            (crate::headers::RATELIMIT_REMAINING, self.remaining as u64),
+            (crate::headers::RATELIMIT_RESET, self.reset_after_secs()),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +212,21 @@ mod tests {
         let snapshot = Snapshot::new(5, 9, Duration::ZERO);
         assert_eq!(snapshot.remaining(), 5);
         assert_eq!(snapshot.limit(), 5);
+    }
+
+    #[test]
+    fn test_headers_report_limit_remaining_and_rounded_reset() {
+        let snapshot = Snapshot::new(10, 4, Duration::from_millis(2_500));
+        assert_eq!(snapshot.reset_after_secs(), 3);
+        assert_eq!(
+            snapshot.headers(),
+            [
+                ("RateLimit-Limit", 10),
+                ("RateLimit-Remaining", 4),
+                ("RateLimit-Reset", 3),
+            ]
+        );
+        assert_eq!(Snapshot::full(5).reset_after_secs(), 0);
     }
 
     #[test]

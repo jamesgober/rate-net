@@ -120,6 +120,7 @@ mod error;
 mod eviction;
 #[cfg(target_has_atomic = "64")]
 mod gcra;
+pub mod headers;
 #[cfg(feature = "std")]
 mod key;
 #[cfg(feature = "std")]
