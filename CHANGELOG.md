@@ -42,7 +42,9 @@ documentation claims that were not true of `1.0.0` are corrected.
   8 slots per insert: an insert at the default cap costs ~0.36 µs.
 - **Key collisions across key types (RN-SEC-04).** New tagged constructors —
   `Key::id`, `Key::ip`, `Key::ipv4_prefix`, `Key::ipv6_prefix`,
-  `Key::ip_prefix` — carry their kind in the key's identity, so a tagged key can
+  `Key::ip_prefix` — carry their kind in the key's identity (and unwrap
+  IPv4-mapped / IPv4-compatible addresses, so `ipv6_prefix` never lumps every
+  IPv4 client of a dual-stack socket into one `/64`), so a tagged key can
   never equal an attacker-chosen string with the same bytes. The `From`
   conversions keep their `1.0` (raw, byte-identity) behaviour.
 - **Key bytes in logs (RN-SEC-05).** `Key`'s `Debug` now shows only the kind and

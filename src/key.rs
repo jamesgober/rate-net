@@ -165,7 +165,7 @@ impl Key {
     /// ```
     #[must_use]
     pub fn ip(addr: IpAddr) -> Self {
-        match addr.to_canonical() {
+        match canonical(addr) {
             IpAddr::V4(v4) => Self::with_kind(Kind::Ip, &v4.octets()),
             IpAddr::V6(v6) => Self::with_kind(Kind::Ip, &v6.octets()),
         }
@@ -206,6 +206,14 @@ impl Key {
     /// caller — the standard defence. Keys with different prefix lengths never
     /// collide.
     ///
+    /// An IPv4 client reaching a dual-stack socket appears as an IPv4-mapped
+    /// address (`::ffff:a.b.c.d`), and every such address shares its first 96
+    /// bits — masking one to `/64` would put every IPv4 client in one key. So an
+    /// IPv4-mapped or IPv4-compatible address is keyed by its IPv4 address
+    /// instead, exactly as `Key::ipv4_prefix(v4, 32)`: one IPv4 address is the
+    /// counterpart of one IPv6 subnet. Use [`ip_prefix`](Self::ip_prefix) to
+    /// choose a different IPv4 prefix.
+    ///
     /// # Examples
     ///
     /// ```
@@ -220,6 +228,9 @@ impl Key {
     /// ```
     #[must_use]
     pub fn ipv6_prefix(addr: Ipv6Addr, prefix_len: u8) -> Self {
+        if let Some(v4) = embedded_ipv4(addr) {
+            return Self::ipv4_prefix(v4, 32);
+        }
         let len = prefix_len.min(128);
         let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
         let masked = (u128::from(addr) & mask).to_be_bytes();
@@ -247,7 +258,7 @@ impl Key {
     /// ```
     #[must_use]
     pub fn ip_prefix(addr: IpAddr, v4_prefix_len: u8, v6_prefix_len: u8) -> Self {
-        match addr.to_canonical() {
+        match canonical(addr) {
             IpAddr::V4(v4) => Self::ipv4_prefix(v4, v4_prefix_len),
             IpAddr::V6(v6) => Self::ipv6_prefix(v6, v6_prefix_len),
         }
@@ -277,6 +288,30 @@ impl Key {
         match &self.0 {
             Repr::Inline { kind, .. } | Repr::Heap { kind, .. } => *kind,
         }
+    }
+}
+
+/// The IPv4 address embedded in an IPv4-mapped (`::ffff:a.b.c.d`) or
+/// IPv4-compatible (`::a.b.c.d`) IPv6 address. The unspecified address `::` and
+/// loopback `::1` are genuine IPv6 addresses, not compatible ones.
+fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let bits = u128::from(addr);
+    if bits >> 32 == 0 && bits > 1 {
+        // The top 96 bits are zero, so the low 32 are the whole address.
+        return Some(Ipv4Addr::from(bits as u32));
+    }
+    None
+}
+
+/// `addr` with any embedded IPv4 address unwrapped, so one client never has
+/// two identities.
+fn canonical(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => embedded_ipv4(v6).map_or(addr, IpAddr::V4),
+        IpAddr::V4(_) => addr,
     }
 }
 
@@ -479,6 +514,44 @@ mod tests {
         assert_eq!(Key::ip_prefix(mapped, 24, 64), Key::ip_prefix(v4, 24, 64));
         // The raw conversion keeps the 1.0 bytes.
         assert_ne!(Key::from(v4), Key::from(mapped));
+    }
+
+    #[test]
+    fn test_ipv6_prefix_keys_embedded_ipv4_by_address() {
+        // Two unrelated IPv4 clients seen through a dual-stack socket must not
+        // share one /64 key.
+        let a = Ipv4Addr::new(198, 51, 100, 7);
+        let b = Ipv4Addr::new(203, 0, 113, 9);
+        assert_ne!(
+            Key::ipv6_prefix(a.to_ipv6_mapped(), 64),
+            Key::ipv6_prefix(b.to_ipv6_mapped(), 64)
+        );
+        assert_eq!(
+            Key::ipv6_prefix(a.to_ipv6_mapped(), 64),
+            Key::ipv4_prefix(a, 32)
+        );
+        // IPv4-compatible addresses too, and every IP constructor agrees.
+        assert_eq!(
+            Key::ipv6_prefix(a.to_ipv6_compatible(), 64),
+            Key::ipv4_prefix(a, 32)
+        );
+        assert_eq!(
+            Key::ip(IpAddr::V6(a.to_ipv6_compatible())),
+            Key::ip(IpAddr::V4(a))
+        );
+        assert_eq!(
+            Key::ip_prefix(IpAddr::V6(a.to_ipv6_compatible()), 24, 64),
+            Key::ipv4_prefix(a, 24)
+        );
+        // `::` and `::1` stay IPv6.
+        assert_ne!(
+            Key::ipv6_prefix(Ipv6Addr::LOCALHOST, 128),
+            Key::ipv4_prefix(Ipv4Addr::new(0, 0, 0, 1), 32)
+        );
+        assert_ne!(
+            Key::ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Key::ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
     }
 
     #[test]

@@ -692,9 +692,11 @@ allocation) and on the heap beyond. The `From` conversions make **raw** keys —
 identity is the bytes alone, so `Key::from(1u64)` equals the equivalent 8-byte
 slice. The constructors make **tagged** keys whose kind is part of the
 identity, so they never collide with raw keys or each other: `id` for numeric
-ids, `ip` for a canonical address (IPv4-mapped IPv6 equals the IPv4 address),
-and the `*_prefix` constructors for networks (lengths clamp to the address
-width and are part of the key). `From<SocketAddr>` drops the port. `Debug`
+ids, `ip` for a canonical address (an IPv4-mapped or IPv4-compatible IPv6
+address equals the IPv4 address), and the `*_prefix` constructors for networks
+(lengths clamp to the address width and are part of the key). `ipv6_prefix`
+keys an embedded IPv4 address by that address (as `ipv4_prefix(v4, 32)`), so
+IPv4 clients on a dual-stack socket do not all share one `/64`. `From<SocketAddr>` drops the port. `Debug`
 shows the kind and length only.
 
 ```rust
