@@ -23,10 +23,58 @@
 use std::sync::Arc as StdArc;
 use std::time::Duration;
 
-use clock_lib::ManualClock;
+use clock_lib::{Clock, ManualClock, Monotonic, Wall};
 use loom::sync::Arc;
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 use rate_net::{Eviction, RateLimiter};
+
+/// A manual clock whose reads and advances are loom operations.
+///
+/// `ManualClock` keeps its offset in a `std` atomic, which loom cannot see:
+/// a thread's clock read is then never a schedule point, and loom cannot
+/// interleave "read the time" and "act on it" the way a preempted thread does.
+/// Wrapping every read and advance in a loom atomic access makes each one a
+/// schedule point, so a model can reach a thread that reads the time, stalls,
+/// and acts after another thread has advanced the clock and committed — the
+/// RN-COR-01 race inside the token bucket's own `acquire`.
+#[derive(Clone)]
+struct LoomClock {
+    inner: StdArc<ManualClock>,
+    /// Advances published so far; read on every `now` to create a schedule
+    /// point in the reading thread.
+    advances: Arc<AtomicU64>,
+}
+
+impl LoomClock {
+    fn new() -> Self {
+        Self {
+            inner: StdArc::new(ManualClock::new()),
+            advances: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The schedule point comes first, so loom may let other threads read
+    /// the old time before it moves.
+    fn advance(&self, by: Duration) {
+        let _published = self.advances.fetch_add(1, Ordering::SeqCst);
+        self.inner.advance(by);
+    }
+}
+
+impl Clock for LoomClock {
+    fn now(&self) -> Monotonic {
+        let reading = self.inner.now();
+        // The schedule point sits after the read: loom may run other threads
+        // here, before this thread acts on its (now possibly stale) reading.
+        let _seen = self.advances.load(Ordering::SeqCst);
+        reading
+    }
+
+    fn wall(&self) -> Wall {
+        self.inner.wall()
+    }
+}
 
 /// A token-bucket limiter on a shared manual clock, one shard, no eviction.
 fn limiter(
@@ -70,21 +118,25 @@ fn loom_concurrent_first_touch_shares_one_allowance() {
 
 /// RN-COR-01: a thread that read the clock *before* another thread committed a
 /// later grant must not see a negative gap as a huge refill. One token per
-/// millisecond, burst 1: over the first millisecond at most two units fit (the
-/// burst, plus one refill).
+/// millisecond, burst 1: once the burst is spent, at most one more unit fits in
+/// the first millisecond. With `better-bucket` 1.0's logic this model fails.
 #[test]
 fn loom_token_bucket_stale_timestamp_never_over_grants() {
     loom::model(|| {
-        let (clock, limiter) = limiter(1_000, Duration::from_secs(1), 1);
+        let clock = LoomClock::new();
+        let limiter = RateLimiter::builder()
+            .quota(1_000, Duration::from_secs(1))
+            .burst(1)
+            .shards(1)
+            .eviction(Eviction::unbounded())
+            .clock(clock.clone())
+            .build();
         assert!(limiter.check("k").is_allow()); // spend the burst at t = 0
         let limiter = Arc::new(limiter);
         let other = Arc::clone(&limiter);
 
         // Reads the clock at t = 0 or t = 1ms, depending on the schedule.
         let handle = thread::spawn(move || u32::from(other.check("k").is_allow()));
-        // A schedule point: the other thread may read the clock (and stall)
-        // before time moves on.
-        thread::yield_now();
         clock.advance(Duration::from_millis(1));
         let here = u32::from(limiter.check("k").is_allow());
         let there = handle.join().expect("model thread panicked");
