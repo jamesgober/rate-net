@@ -94,8 +94,10 @@ impl<C: Clock> AlgoState<C> {
                 if capacity == 0 {
                     return Snapshot::closed();
                 }
-                let reset_after = bucket.time_until(capacity).unwrap_or(Duration::MAX);
-                Snapshot::new(capacity, bucket.available(), reset_after)
+                // One clock read for both halves of the snapshot.
+                let at = bucket.clock().now();
+                let reset_after = bucket.time_until_at(capacity, at).unwrap_or(Duration::MAX);
+                Snapshot::new(capacity, bucket.available_at(at), reset_after)
             }
             #[cfg(feature = "algorithms")]
             Self::LeakyBucket(state) => state.peek_at(now),
