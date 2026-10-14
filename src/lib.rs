@@ -6,7 +6,8 @@
 //! concurrency. Per-key state lives in a sharded store: an existing-key check
 //! takes one shard read lock plus the algorithm's atomic accounting, so
 //! unrelated keys rarely contend, and memory is bounded by O(1) eviction, so a
-//! flood of unique keys hits a cap instead of growing without limit.
+//! flood of unique keys hits a cap instead of growing without limit — and
+//! evicting a still-limited key keeps its debt instead of resetting it.
 //!
 //! rate-net does not reimplement token-bucket accounting. It consumes
 //! [`better-bucket`](https://crates.io/crates/better-bucket) (1.1 or newer) for
@@ -18,16 +19,18 @@
 //!
 //! ## Status
 //!
-//! **Stable (`1.1.0`).** The public API is frozen until `2.0`; `1.1` only adds
-//! to it. The five algorithms sit behind the one [`Limiter`] trait (and the
+//! **Stable (`1.2.0`).** The public API is frozen until `2.0`; each `1.x` only
+//! adds to it. The five algorithms sit behind the one [`Limiter`] trait (and the
 //! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
 //! window algorithms under the `algorithms` feature — with the validating
-//! [`Builder`], [`peek`](RateLimiter::peek) snapshots and HTTP
-//! [`headers`](mod@headers) helpers, key management, the un-keyed
-//! [`DirectLimiter`], the `no_std` [`Gcra`] core, the fast [`CoarseClock`], and
-//! optional `AsyncLimiter` (`async`) and `Metrics` (`metrics`) layers. The
-//! steady-state check is allocation-free, and every public type is
-//! `Send + Sync + 'static`, asserted at compile time.
+//! [`Builder`] (per-key quotas, key-length limits, long-key digests),
+//! [`peek`](RateLimiter::peek) snapshots and HTTP [`headers`](mod@headers)
+//! helpers, key management, the un-keyed [`DirectLimiter`], the `no_std`
+//! [`Gcra`] core, the fast [`CoarseClock`], and optional `AsyncLimiter`
+//! (`async`), `Metrics` (`metrics`), and `tower` middleware (`tower`) layers.
+//! Checking an already-tracked key allocates nothing when the key is passed
+//! by reference (`check_bytes`, `check_n_bytes`) or is at most 22 bytes, and
+//! every public type is `Send + Sync + 'static`, asserted at compile time.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -65,9 +68,20 @@
 //!   slots for the capacity cap, and 8 slots of incremental idle sweep. The
 //!   only shard-wide pass left is the amortized growth or rehash of a shard's
 //!   index, and capped shards are kept at 16,384 keys or fewer so it stays
-//!   short.
-//! - **Zero-allocation steady state.** A `check` on an existing key allocates
-//!   nothing; allocation happens only the first time a key is seen.
+//!   short. A token-bucket key costs about 138 bytes at the default cap; key
+//!   bytes beyond 22 can be bounded with a maximum length or a digest.
+//! - **Eviction does not reset a limit.** A key evicted before its allowance
+//!   recovered has its debt recorded, and resumes no more permissive than it
+//!   left — unconditionally while the still-limited evicted keys fit about
+//!   twice the cap. Past that, [`Overflow`] chooses: drop the debts that do
+//!   not fit (`Forget`, the default) or keep them all and fail closed for
+//!   some other keys (`FailClosed`, for identity-keyed limiters). See
+//!   [`Eviction`].
+//! - **Zero-allocation steady state.** A check on an existing key allocates
+//!   nothing: always through [`check_bytes`](RateLimiter::check_bytes), which
+//!   borrows the key, and through [`check`](RateLimiter::check) for keys of up
+//!   to 22 bytes (longer ones are copied into an owned [`Key`] first).
+//!   Allocation otherwise happens only the first time a key is seen.
 //! - **Fail closed.** The infallible constructors turn a degenerate
 //!   configuration into a limiter that denies everything; the validating
 //!   [`Builder::try_build`] reports it instead.
@@ -83,11 +97,17 @@
 //! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
 //! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
 //! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`]; compiled out when off. |
+//! | `tower`      | no  | `rate_net::tower` middleware: `RateLimitLayer` with key extractors and `429` responses. Adds `http`, `tower-layer`, `tower-service`, `pin-project-lite`. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
-#![deny(warnings)]
+// REPS: warnings are errors — except in the builds that run on a floating
+// nightly: docs.rs, Miri, and cargo-fuzz (`fuzzing`), where a lint added after
+// a release would otherwise fail the published docs or the CI jobs. Downstream
+// builds are unaffected either way (Cargo caps lints for dependencies), and CI
+// enforces `-D warnings` on the pinned stable and the MSRV.
+#![cfg_attr(not(any(docsrs, miri, fuzzing)), deny(warnings))]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
@@ -140,6 +160,9 @@ mod snapshot;
 #[cfg(feature = "std")]
 mod store;
 mod sync;
+#[cfg(feature = "tower")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tower")))]
+pub mod tower;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};
@@ -154,7 +177,7 @@ pub use crate::decision::Decision;
 pub use crate::direct::DirectLimiter;
 pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
-pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction, Overflow};
 #[cfg(target_has_atomic = "64")]
 pub use crate::gcra::Gcra;
 #[cfg(feature = "std")]
@@ -191,7 +214,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     doctest,
     feature = "algorithms",
     feature = "async",
-    feature = "metrics"
+    feature = "metrics",
+    feature = "tower"
 ))]
 #[doc = include_str!("../README.md")]
 mod readme_doctests {}
@@ -200,7 +224,8 @@ mod readme_doctests {}
     doctest,
     feature = "algorithms",
     feature = "async",
-    feature = "metrics"
+    feature = "metrics",
+    feature = "tower"
 ))]
 #[doc = include_str!("../docs/API.md")]
 mod api_doctests {}

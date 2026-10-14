@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f353f65778a5702c0c9d35617c756f4d6dd9dfcd68c3a1a530aa3796432c86b6 # shrinks to buckets_log = 1, ops = [(10, 1, 1, 2, true), (10, 1, 2, 2, false)]
+cc e59c538eaea5bb466b2c6ff3530cebb3e457c81ad8b057a23d5ef3a533107f29 # shrinks to buckets_log = 1, ops = [(27, 1, 1, 2, false), (17, 1, 1, 0, false), (0, 1, 1, 0, false), (1, 1, 30, 0, false), (17, 1, 1, 0, false), (12, 1, 1, 0, false), (19, 1, 30, 2, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (41, 1, 1, 2, false), (6, 1, 1, 0, false), (8, 1, 1, 0, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (8, 1, 1, 0, false), (45, 1, 1, 2, false), (24, 1, 1, 2, false), (0, 1, 1, 0, false), (25, 1, 1, 2, false), (0, 1, 1, 2, true), (6, 1, 1, 2, true), (1, 1, 1, 2, false), (5, 8, 46, 2, false), (0, 1, 8, 0, false), (6, 1, 1, 0, false), (0, 1, 1, 0, false), (5, 1, 88, 2, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (0, 1, 1, 0, false), (0, 1, 224, 0, false), (0, 1, 1, 0, false), (0, 1, 136, 0, false)]
+cc bb4fe9cb4a19e9ad2df2acc482197865875c76900ff0f0f30915611b6bccc7dd # shrinks to cap = 2, fail_closed = false, ops = [(15, 0, 1), (15, 903, 3), (0, 1097, 1), (15, 0, 3)]

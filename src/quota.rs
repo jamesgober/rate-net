@@ -203,6 +203,37 @@ impl Quota {
         self
     }
 
+    /// The value of a structured `RateLimit-Policy` field describing this
+    /// quota under the policy name `name`: `"name";q=<limit>;w=<period>`, the
+    /// period in whole seconds rounded up.
+    ///
+    /// Send it under [`headers::RATELIMIT_POLICY`](crate::headers::RATELIMIT_POLICY)
+    /// beside the `RateLimit` field from
+    /// [`Snapshot::ratelimit`](crate::Snapshot::ratelimit) with the same name.
+    /// The field has no burst parameter: a token or leaky bucket whose burst
+    /// differs from its limit is described by its sustained rate. It formats
+    /// with `Display` and never allocates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Quota;
+    ///
+    /// let quota = Quota::per_minute(600);
+    /// assert_eq!(quota.ratelimit_policy("api").to_string(), r#""api";q=600;w=60"#);
+    /// ```
+    #[must_use]
+    pub const fn ratelimit_policy<'a>(
+        &self,
+        name: &'a str,
+    ) -> crate::headers::RateLimitPolicyValue<'a> {
+        crate::headers::RateLimitPolicyValue::new(
+            name,
+            self.limit as u64,
+            crate::headers::ceil_secs(self.period),
+        )
+    }
+
     /// Assembles a quota from raw parts without validation, for the infallible
     /// [`Builder`](crate::Builder) path. A zero `limit`, `period`, or `burst`
     /// yields a limiter that admits nothing (every algorithm fails closed).

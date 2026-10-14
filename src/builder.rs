@@ -9,7 +9,8 @@ use crate::algorithm::Algorithm;
 use crate::direct::DirectLimiter;
 use crate::error::RateLimiterError;
 use crate::eviction::Eviction;
-use crate::limiter::{RateLimiter, default_shard_count};
+use crate::key::Key;
+use crate::limiter::{KeyOptions, RateLimiter, default_shard_count};
 use crate::quota::Quota;
 
 /// A fluent builder for a [`RateLimiter`] when the Tier-1 constructors are not
@@ -61,6 +62,7 @@ pub struct Builder<C: Clock + Clone = SystemClock> {
     burst: Option<u32>,
     shards: Option<usize>,
     eviction: Eviction,
+    options: KeyOptions,
     clock: C,
 }
 
@@ -85,6 +87,7 @@ impl Builder<SystemClock> {
             burst: None,
             shards: None,
             eviction: Eviction::default(),
+            options: KeyOptions::default(),
             clock: SystemClock::new(),
         }
     }
@@ -108,6 +111,7 @@ impl<C: Clock + Clone> fmt::Debug for Builder<C> {
             .field("burst", &self.burst)
             .field("shards", &self.shards)
             .field("eviction", &self.eviction)
+            .field("keys", &self.options)
             .finish_non_exhaustive()
     }
 }
@@ -230,6 +234,129 @@ impl<C: Clock + Clone> Builder<C> {
         self
     }
 
+    /// Refuses keys longer than `len` bytes: a check of such a key is denied
+    /// as impossible (`retry_after == Duration::MAX`) and the key is never
+    /// stored.
+    ///
+    /// Eviction bounds how many keys a limiter holds, not how large they are:
+    /// without a limit, a caller who controls the key (a header, a path
+    /// segment) can make every stored key as long as the transport allows. A
+    /// maximum length makes the store's memory bound a bound in bytes. Keys at
+    /// or under the limit are unaffected. Off by default.
+    ///
+    /// To keep long keys working instead of refusing them, use
+    /// [`digest_keys_longer_than`](Self::digest_keys_longer_than); with both
+    /// set, keys over `len` are refused and the rest are digested above the
+    /// threshold.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder().per_second(10).max_key_len(64).build();
+    /// assert!(limiter.check("user:42").is_allow());
+    ///
+    /// let huge = "x".repeat(65);
+    /// assert!(limiter.check(huge.as_str()).is_impossible());
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    /// ```
+    pub fn max_key_len(mut self, len: usize) -> Self {
+        self.options.max_key_len = Some(len);
+        self
+    }
+
+    /// Stores keys longer than `len` bytes as a 16-byte keyed digest instead of
+    /// their bytes, so every stored key costs the same small, inline amount
+    /// however long the caller made it.
+    ///
+    /// The digest is 128 bits from two independently and randomly seeded
+    /// `ahash` hashers, fresh for every limiter. Two distinct long keys share a
+    /// digest — and so a limit — only by a 128-bit collision, and because the
+    /// seeds are secret and per limiter a caller cannot search for a key that
+    /// collides with someone else's. It is *not* a cryptographic hash: do not
+    /// rely on it where an attacker can observe the limiter's hash outputs.
+    /// Digested keys never equal a key built any other way. Keys at or under
+    /// `len` bytes are stored as they are. Off by default.
+    ///
+    /// A [`quota_for`](Self::quota_for) resolver still sees the original key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .per_second(2)
+    ///     .digest_keys_longer_than(32)
+    ///     .build();
+    /// let jwt_subject = "a".repeat(4_096);
+    /// assert!(limiter.check_n_bytes(&jwt_subject, 2).is_allow());
+    /// assert!(limiter.check_bytes(&jwt_subject).is_deny());
+    /// ```
+    pub fn digest_keys_longer_than(mut self, len: usize) -> Self {
+        self.options.digest_over = Some(len);
+        self
+    }
+
+    /// Gives chosen keys their own quota — tiered limits (free and paid
+    /// tenants, internal and external callers) from one limiter.
+    ///
+    /// `resolve` is called with a key when it is about to be stored (and when
+    /// an untracked key is [peeked](RateLimiter::peek) or its quota asked for
+    /// with [`RateLimiter::quota_of`]); `Some(quota)` gives the key that quota,
+    /// `None` the limiter's default. It is never called for a key that is
+    /// already tracked.
+    ///
+    /// **Rules for the resolver:**
+    ///
+    /// - It runs on the caller's thread, *before* the limiter takes any lock, so
+    ///   it never blocks other keys and may call back into the limiter
+    ///   (`peek`, `check`, or `quota_of` of *other* keys). It must not check
+    ///   the very key it is resolving — that recurses.
+    /// - It runs on the check path of every first-seen key, so it should be
+    ///   fast; a slow resolver delays only the requests of keys being stored.
+    /// - It must be deterministic for a key: a key that is evicted and returns
+    ///   is resolved again. A tier change takes effect for a tracked key after
+    ///   [`RateLimiter::remove`].
+    /// - A panic propagates to the caller of `check`; nothing is stored.
+    ///
+    /// An override is validated like [`try_build`](Self::try_build) validates
+    /// the default quota (zero limit, period, or bucket burst; a leaky-bucket
+    /// rate above one unit per nanosecond; a sliding-window-log limit above
+    /// [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT)). An invalid
+    /// override makes its key **fail closed** — every check is denied as
+    /// impossible and the key is never stored — rather than run with a quota
+    /// the limiter could not bound. The idle TTL is raised to the *default*
+    /// quota's recovery time; a key with a longer override that expires while
+    /// still limited has its debt recorded like any eviction.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Quota, RateLimiter};
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .per_second(10)
+    ///     .quota_for(|key| {
+    ///         key.as_bytes()
+    ///             .starts_with(b"pro:")
+    ///             .then(|| Quota::per_second(1_000))
+    ///     })
+    ///     .build();
+    ///
+    /// assert!(limiter.check_n("pro:acme", 1_000).is_allow());
+    /// assert!(limiter.check_n("free:bob", 11).is_impossible());
+    /// assert_eq!(limiter.peek("pro:other").limit(), 1_000);
+    /// ```
+    pub fn quota_for<F>(mut self, resolve: F) -> Self
+    where
+        F: Fn(&Key) -> Option<Quota> + Send + Sync + 'static,
+    {
+        self.options.quota_for = Some(crate::limiter::QuotaFn::new(resolve));
+        self
+    }
+
     /// Sets the time source, for deterministic tests with a `ManualClock`.
     ///
     /// # Examples
@@ -251,6 +378,7 @@ impl<C: Clock + Clone> Builder<C> {
             burst: self.burst,
             shards: self.shards,
             eviction: self.eviction,
+            options: self.options,
             clock,
         }
     }
@@ -283,7 +411,14 @@ impl<C: Clock + Clone> Builder<C> {
     pub fn build(self) -> RateLimiter<C> {
         let quota = self.quota_value();
         let shards = self.shards.unwrap_or_else(default_shard_count);
-        RateLimiter::build(self.algorithm, quota, self.clock, shards, self.eviction)
+        RateLimiter::build(
+            self.algorithm,
+            quota,
+            self.clock,
+            shards,
+            self.eviction,
+            self.options,
+        )
     }
 
     /// Validates the configuration, then builds the limiter.
@@ -609,6 +744,20 @@ mod tests {
             RateLimiter::per_second(1).with_shards(usize::MAX).shards(),
             crate::MAX_SHARDS
         );
+    }
+
+    #[test]
+    fn test_key_options_survive_the_with_rebuilds() {
+        let limiter = RateLimiter::builder()
+            .per_second(1)
+            .max_key_len(4)
+            .build()
+            .with_shards(2)
+            .with_eviction(Eviction::capacity(10));
+        assert!(limiter.check("abcde").is_impossible());
+        assert!(limiter.check("abcd").is_allow());
+        let rendered = format!("{limiter:?}");
+        assert!(rendered.contains("max_key_len: Some(4)"), "{rendered}");
     }
 
     #[test]

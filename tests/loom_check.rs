@@ -175,6 +175,104 @@ fn loom_eviction_races_a_concurrent_insert() {
     });
 }
 
+/// RN-005: a drained key evicted by a concurrent insert must come back
+/// drained. One thread re-checks the drained key "a" while another inserts "b"
+/// into the full one-key shard, evicting "a" (recording its debt) — in every
+/// interleaving "a" is refused: the record is written under the same write
+/// lock that removes the key, and consulted under the write lock that
+/// re-creates it.
+#[test]
+fn loom_evicted_drained_key_is_never_reset() {
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_minute(1)
+            .shards(1)
+            .eviction(Eviction::capacity(1))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("a").is_allow()); // "a" is drained
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        let handle = thread::spawn(move || other.check("b").is_allow());
+        let again = limiter.check("a").is_allow();
+        let inserted = handle.join().expect("model thread panicked");
+
+        assert!(!again, "eviction reset a drained key");
+        assert!(inserted, "a fresh key has its first unit");
+        assert!(limiter.check("a").is_deny(), "eviction reset a drained key");
+    });
+}
+
+/// Two drained keys taking turns in a one-key shard: each re-check evicts the
+/// other key (recording its debt) and re-creates itself from its own recorded
+/// debt (taking it). Run concurrently, in every interleaving both stay
+/// refused: recording and taking a debt never lose one, whichever order the
+/// two write locks are granted in.
+#[test]
+fn loom_concurrent_record_and_take_never_reset_a_debt() {
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_minute(1)
+            .shards(1)
+            .eviction(Eviction::capacity(1))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("a").is_allow()); // "a" is drained
+        assert!(limiter.check("b").is_allow()); // "b" is drained; "a" recorded
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        let handle = thread::spawn(move || other.check("a").is_allow());
+        let b_again = limiter.check("b").is_allow();
+        let a_again = handle.join().expect("model thread panicked");
+
+        assert!(!a_again && !b_again, "a recorded debt was lost");
+        assert!(limiter.check("a").is_deny(), "a recorded debt was lost");
+        assert!(limiter.check("b").is_deny(), "a recorded debt was lost");
+    });
+}
+
+/// RN3-001: an idle-expired key with a slow per-key quota, re-checked while a
+/// concurrent insert's idle sweep takes it. The key spent again after it was
+/// stored, so its stored recovery hint is stale; in every interleaving the
+/// re-check (before or after the sweep) is refused and the debt survives.
+#[test]
+fn loom_idle_sweep_racing_a_recheck_never_resets_a_slow_key() {
+    use rate_net::Quota;
+
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_second(10)
+            .quota_for(|key| (key.as_bytes() == b"pro").then(|| Quota::per_minute(10)))
+            .shards(1)
+            .eviction(Eviction::new(8, Duration::from_secs(1)))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("pro").is_allow());
+        clock.advance(Duration::from_millis(500));
+        assert!(limiter.check_n("pro", 9).is_allow());
+        clock.advance(Duration::from_secs(10));
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        // A new key's insert runs the idle sweep, which takes "pro".
+        let handle = thread::spawn(move || other.check("fresh").is_allow());
+        let again = limiter.check_n("pro", 10).is_allow();
+        let inserted = handle.join().expect("model thread panicked");
+
+        assert!(inserted, "a fresh key has its first unit");
+        assert!(!again, "an idle-expired slow key was reset");
+        assert!(
+            limiter.check_n("pro", 10).is_deny(),
+            "an idle-expired slow key was reset"
+        );
+    });
+}
+
 /// RN-COR-03: a thread whose timestamp falls in a window another thread has
 /// already closed must count against the newer window, never write its older
 /// window back and wipe the newer window's count.

@@ -10,6 +10,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Toolchains. `rust-toolchain.toml` pins the development toolchain (1.99.0);
+# every job below selects its toolchain explicitly — through RUSTUP_TOOLCHAIN,
+# which overrides the file, or `cargo +<toolchain>` — and prints `rustc -V`, so
+# a job never silently runs on a different compiler than its name says. Builds
+# use the committed Cargo.lock (`--locked`); the latest-deps workflow tests the
+# newest compatible versions instead.
+
 jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
@@ -18,53 +25,115 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, "1.85"]
+        rust: ["1.99.0", "1.85"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      # Default features = token bucket only; every optional feature is
-      # additive, so exercise the lean default build and the no_std core too.
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - name: Clippy (metrics only)
-        run: cargo clippy --all-targets --features metrics -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test (all features)
-        run: cargo test --all-features
-      - name: Test (default features)
-        run: cargo test
-      - name: Test (no default features)
-        run: cargo test --no-default-features
+        run: cargo test --locked --all-features
       - name: Doc (all features)
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-      # Feature-gated items must not leave broken intra-doc links in the
-      # always-compiled crate docs, so doc the lean default build too.
-      - name: Doc (default features)
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  loom:
-    name: Loom (model check of the production limiter)
+  # Every feature on its own (and none, and the default set): an optional
+  # feature must never depend on another to compile, and the lean builds must
+  # stay warning-free and documented. cargo-hack enumerates the set from
+  # Cargo.toml, so a new feature is covered without editing this file.
+  features:
+    name: Features (each, on ${{ matrix.rust }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.99.0", "1.85"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      - name: Clippy (each feature)
+        run: cargo hack clippy --locked --each-feature --all-targets -- -D warnings
+      - name: Test (each feature)
+        run: cargo hack test --locked --each-feature
+      - name: Doc (each feature)
+        run: cargo hack doc --locked --each-feature --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  pedantic:
+    name: Clippy pedantic (1.99.0)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      - name: Clippy pedantic (all features)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
+
+  # The real-clock contention, eviction, and liveness tests in release mode,
+  # where the check path is fast enough for threads to genuinely race on one key.
+  stress:
+    name: Stress (release, real clock, 1.99.0)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      - name: Real-clock, stress, eviction, and liveness tests, optimised
+        run: cargo test --locked --release --all-features --test real_clock --test stress --test eviction_bypass --test eviction_liveness
+
+  loom:
+    name: Loom (model check of the production limiter, 1.99.0)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
       # clock-lib 1.1.0 uses `loom` in library code under cfg(loom) but declares
       # it only as a dev-dependency, so it cannot build with --cfg loom; 1.0.0
-      # satisfies rate-net's (and better-bucket's) `clock-lib = "1.0"`.
+      # satisfies rate-net's `clock-lib = "1.0"`. This edits the job's copy of
+      # the lock only.
       - name: Pin clock-lib for the loom build
         run: cargo update -p clock-lib --precise 1.0.0
       - name: Loom
@@ -73,76 +142,163 @@ jobs:
           RUSTFLAGS: "--cfg loom"
 
   miri:
-    name: Miri (atomic algorithm state and the store)
+    name: Miri (atomic algorithm state and the store, nightly)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
       # Miri makes weak compare-and-swap fail spuriously, which native x86 runs
-      # never do; it is what exercises the CAS retry paths.
+      # never do; it is what exercises the CAS retry paths. The store tests
+      # cover eviction, the recovery table's exact records, cuckoo moves, and
+      # the overflow sketch (the saturation tests run tens of thousands of
+      # checks, too slow under miri; they run natively in every test job).
       - name: Miri
         run: |
-          cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
+          cargo miri test --locked --lib --all-features -- algo:: gcra:: metrics:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear store::tests::test_recovery store::tests::test_an_overloaded_recovery_table store::tests::test_newcomers_are_charged store::tests::test_a_spent_count store::tests::test_an_idle_expired
         env:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"
 
-  no-std:
-    name: no_std (thumbv7em-none-eabihf, wasm32-unknown-unknown)
+  fuzz:
+    name: Fuzz (smoke, nightly)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
         with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      # The corpus directories are not committed (fuzz/.gitignore), and
+      # libFuzzer will not create a missing corpus directory itself.
+      - name: Create the corpus directories
+        run: mkdir -p fuzz/corpus/limiter_ops fuzz/corpus/http_keys
+      # cargo-fuzz manages its own RUSTFLAGS (sanitizer instrumentation); clear
+      # the workflow-wide `-D warnings` so it does not fight the fuzz build.
+      # Pin the fuzz target to the gnu triple: the prebuilt cargo-fuzz binary is
+      # musl-static, so it would otherwise default to musl, whose std the
+      # nightly toolchain does not ship. New inputs go to corpus/, never seeds/.
+      - name: Fuzz limiter_ops (60s)
+        run: cargo +nightly fuzz run limiter_ops fuzz/corpus/limiter_ops fuzz/seeds/limiter_ops --target x86_64-unknown-linux-gnu -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""
+      - name: Fuzz http_keys (30s)
+        run: cargo +nightly fuzz run http_keys fuzz/corpus/http_keys fuzz/seeds/http_keys --target x86_64-unknown-linux-gnu -- -max_total_time=30
+        env:
+          RUSTFLAGS: ""
+
+  no-std:
+    name: no_std (thumbv7em-none-eabihf, wasm32-unknown-unknown, 1.99.0)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
           targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
       # thumbv7em has no 64-bit atomics, so this checks the data-type surface.
       - name: Build the no_std core for an embedded target
-        run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
+        run: cargo build --locked --lib --no-default-features --target thumbv7em-none-eabihf
       # wasm32 has 64-bit atomics: this builds `Gcra` itself without std.
       - name: Build the no_std Gcra core
-        run: cargo build --lib --no-default-features --target wasm32-unknown-unknown
+        run: cargo build --locked --lib --no-default-features --target wasm32-unknown-unknown
 
   i686:
-    name: 32-bit (i686-unknown-linux-gnu)
+    name: 32-bit (i686-unknown-linux-gnu, 1.99.0)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Install the 32-bit toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Toolchain
+        run: rustc -V && cargo -V
       - name: Test (all features, 32-bit)
-        run: cargo test --all-features --target i686-unknown-linux-gnu
+        run: cargo test --locked --all-features --target i686-unknown-linux-gnu
+
+  coverage:
+    name: Coverage (llvm-cov, 1.99.0)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      - name: Coverage summary
+        run: cargo llvm-cov --locked --all-features --summary-only
 
   semver:
-    name: SemVer (cargo-semver-checks)
+    name: SemVer (cargo-semver-checks, 1.99.0)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - name: Toolchain
+        run: rustc -V && cargo -V
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          rust-toolchain: manual
+          feature-group: all-features
 
+  # Audit and license/advisory checks against the committed Cargo.lock: what
+  # this repository builds and tests. The latest-deps workflow audits a fresh
+  # resolution.
   security:
-    name: Security (audit + deny)
+    name: Security (audit + deny, committed lock)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      # Libraries do not commit Cargo.lock; resolve the latest compatible tree
-      # so the audit sees what a fresh consumer would build.
-      - name: Generate lockfile
-        run: cargo generate-lockfile
+      - name: Toolchain
+        run: rustc -V && cargo -V
       - name: Audit
         run: cargo audit
       - name: Deny
-        run: cargo deny check
+        run: cargo deny --locked check

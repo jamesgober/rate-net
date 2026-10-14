@@ -112,14 +112,17 @@ impl SlidingCounter {
             // prev)`.
             let slack = (limit - n - curr) * period / prev;
             let fit_at = period - slack.min(period);
-            (fit_at as u64).saturating_sub(offset).max(1)
+            u64::try_from(fit_at)
+                .unwrap_or(u64::MAX)
+                .saturating_sub(offset)
+                .max(1)
         } else {
             // Only in the next window, where this window's count becomes the
             // fading one: `curr * (period - x) <= (limit - n) * period`, so
             // `x >= period - floor((limit - n) * period / curr)`.
             let slack = ((limit - n) * period).checked_div(curr).unwrap_or(period);
             let x = period - slack.min(period);
-            (self.period_ns - offset).saturating_add(x as u64)
+            (self.period_ns - offset).saturating_add(u64::try_from(x).unwrap_or(u64::MAX))
         }
     }
     /// Rolls the windows forward to `real_now_ns` and returns the effective
@@ -251,7 +254,7 @@ mod tests {
         let wait = sc.acquire(1, at(500)).retry_after().unwrap_or_default();
         assert_eq!(wait, at(600));
         assert!(
-            sc.acquire(1, at(500) + wait - Duration::from_nanos(1))
+            sc.acquire(1, (at(500) + wait).saturating_sub(Duration::from_nanos(1)))
                 .is_deny()
         );
         assert!(sc.acquire(1, at(500) + wait).is_allow());

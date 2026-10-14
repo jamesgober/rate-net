@@ -40,17 +40,18 @@ use crate::snapshot::Snapshot;
 /// assert_eq!(limiter.peek().remaining(), 49);
 /// ```
 pub struct DirectLimiter<C: Clock + Clone = SystemClock> {
-    state: AlgoState<C>,
+    state: AlgoState,
     algorithm: Algorithm,
     quota: Quota,
     clock: C,
     epoch: Monotonic,
-    /// The token bucket reads its own clock; every other algorithm needs the
-    /// elapsed time passed in.
-    reads_clock: bool,
     /// Allowed / denied counters. Absent without the `metrics` feature.
     #[cfg(feature = "metrics")]
     counters: crate::metrics::Counters,
+    /// The most jitter added to each sleep of the awaiting methods. Absent
+    /// without the `async` feature.
+    #[cfg(feature = "async")]
+    jitter: Duration,
 }
 
 impl DirectLimiter<SystemClock> {
@@ -112,16 +113,17 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// Assembles a direct limiter. Shared with the builder.
     pub(crate) fn build(algorithm: Algorithm, quota: Quota, clock: C) -> Self {
         let epoch = clock.now();
-        let state = AlgoState::new(algorithm, &quota, clock.clone(), Duration::ZERO);
+        let state = AlgoState::new(algorithm, &quota, Duration::ZERO);
         Self {
             state,
             algorithm,
             quota,
             clock,
             epoch,
-            reads_clock: algorithm != Algorithm::TokenBucket,
             #[cfg(feature = "metrics")]
             counters: crate::metrics::Counters::new(),
+            #[cfg(feature = "async")]
+            jitter: Duration::ZERO,
         }
     }
 
@@ -145,7 +147,13 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_clock<C2: Clock + Clone>(self, clock: C2) -> DirectLimiter<C2> {
-        DirectLimiter::build(self.algorithm, self.quota, clock)
+        #[cfg_attr(not(feature = "async"), allow(unused_mut))]
+        let mut next = DirectLimiter::build(self.algorithm, self.quota, clock);
+        #[cfg(feature = "async")]
+        {
+            next.jitter = self.jitter;
+        }
+        next
     }
 
     /// Selects the algorithm, resetting the allowance to full. The leaky
@@ -163,7 +171,13 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// ```
     #[must_use]
     pub fn with_algorithm(self, algorithm: Algorithm) -> Self {
-        Self::build(algorithm, self.quota, self.clock)
+        #[cfg_attr(not(feature = "async"), allow(unused_mut))]
+        let mut next = Self::build(algorithm, self.quota, self.clock);
+        #[cfg(feature = "async")]
+        {
+            next.jitter = self.jitter;
+        }
+        next
     }
 
     /// Checks a single unit. Equivalent to `check_n(1)`.
@@ -198,12 +212,7 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// ```
     #[inline]
     pub fn check_n(&self, n: u32) -> Decision {
-        let now = if self.reads_clock {
-            self.now()
-        } else {
-            Duration::ZERO
-        };
-        let decision = self.state.acquire(n, now);
+        let decision = self.state.acquire(n, self.now());
         #[cfg(feature = "metrics")]
         self.counters.decision(decision.is_allow());
         decision
@@ -261,7 +270,7 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// assert!(limiter.check().is_allow());
     /// ```
     pub fn reset(&self) {
-        self.state.reset();
+        self.state.reset(self.now());
     }
 
     /// The quota this limiter enforces, as configured.
@@ -346,17 +355,90 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// # }
     /// ```
     pub async fn try_until_ready_n(&self, n: u32) -> Result<(), crate::InsufficientCapacity> {
-        loop {
-            match self.check_n(n) {
-                Decision::Allow => return Ok(()),
-                Decision::Deny { retry_after } => {
-                    if retry_after == Duration::MAX {
-                        return Err(crate::InsufficientCapacity::new(n));
-                    }
-                    tokio::time::sleep(retry_after).await;
-                }
-            }
+        let decision = crate::async_limiter::wait(|| self.check_n(n), None, self.jitter).await;
+        if decision.is_allow() {
+            Ok(())
+        } else {
+            Err(crate::InsufficientCapacity::new(n))
         }
+    }
+
+    /// Awaits until a single unit is admitted, but never past `max_wait`.
+    /// Equivalent to `until_ready_n_within(1, max_wait)`. Requires the `async`
+    /// feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::DirectLimiter;
+    /// use std::time::Duration;
+    ///
+    /// # async fn demo() {
+    /// let limiter = DirectLimiter::per_minute(1);
+    /// assert!(limiter.until_ready_within(Duration::ZERO).await.is_allow());
+    /// // A minute away: denied at once, without sleeping out the budget.
+    /// assert!(limiter.until_ready_within(Duration::from_millis(10)).await.is_deny());
+    /// # }
+    /// ```
+    pub async fn until_ready_within(&self, max_wait: Duration) -> Decision {
+        self.until_ready_n_within(1, max_wait).await
+    }
+
+    /// Awaits until `n` units are admitted, but never past `max_wait`: it
+    /// sleeps only while the next admission falls within the remaining budget,
+    /// and otherwise returns the denial at once. See
+    /// [`AsyncLimiter::until_ready_n_within`](crate::AsyncLimiter::until_ready_n_within).
+    /// Cancel-safe. Requires the `async` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::DirectLimiter;
+    /// use std::time::Duration;
+    ///
+    /// # async fn demo() {
+    /// let limiter = DirectLimiter::per_second(100);
+    /// assert!(limiter.check_n(100).is_allow());
+    /// assert!(limiter.until_ready_n_within(1, Duration::from_secs(1)).await.is_allow());
+    /// # }
+    /// ```
+    pub async fn until_ready_n_within(&self, n: u32, max_wait: Duration) -> Decision {
+        crate::async_limiter::wait(|| self.check_n(n), Some(max_wait), self.jitter).await
+    }
+
+    /// Adds a random delay of up to `max` to every sleep of the awaiting
+    /// methods, so many tasks pacing on one limiter do not all wake at once.
+    /// See [`AsyncLimiter::with_jitter`](crate::AsyncLimiter::with_jitter).
+    /// Requires the `async` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::DirectLimiter;
+    /// use std::time::Duration;
+    ///
+    /// let limiter = DirectLimiter::per_second(10).with_jitter(Duration::from_millis(5));
+    /// assert_eq!(limiter.jitter(), Duration::from_millis(5));
+    /// ```
+    #[must_use]
+    pub const fn with_jitter(mut self, max: Duration) -> Self {
+        self.jitter = max;
+        self
+    }
+
+    /// The most jitter added to each sleep. Requires the `async` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::DirectLimiter;
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(DirectLimiter::per_second(1).jitter(), Duration::ZERO);
+    /// ```
+    #[must_use]
+    pub const fn jitter(&self) -> Duration {
+        self.jitter
     }
 }
 

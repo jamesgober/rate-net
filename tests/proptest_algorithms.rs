@@ -55,7 +55,7 @@ fn trailing(admits: &[u64], t: u64) -> usize {
 
 proptest! {
     #[test]
-    fn fixed_window_never_exceeds_limit_per_aligned_window(
+    fn prop_fixed_window_never_exceeds_limit_per_aligned_window(
         limit in 1u32..=50,
         steps in prop::collection::vec((0u64..=400, 0u32..=25), 0..40),
     ) {
@@ -73,7 +73,7 @@ proptest! {
     }
 
     #[test]
-    fn sliding_log_never_exceeds_limit_in_any_window(
+    fn prop_sliding_log_never_exceeds_limit_in_any_window(
         limit in 1u32..=50,
         steps in prop::collection::vec((0u64..=400, 0u32..=25), 0..40),
     ) {
@@ -88,7 +88,7 @@ proptest! {
     }
 
     #[test]
-    fn sliding_counter_stays_within_double_limit(
+    fn prop_sliding_counter_stays_within_double_limit(
         limit in 1u32..=50,
         steps in prop::collection::vec((0u64..=400, 0u32..=25), 0..40),
     ) {
@@ -104,7 +104,7 @@ proptest! {
     }
 
     #[test]
-    fn leaky_bucket_stays_within_burst_plus_limit(
+    fn prop_leaky_bucket_stays_within_burst_plus_limit(
         limit in 1u32..=50,
         steps in prop::collection::vec((0u64..=400, 0u32..=25), 0..40),
     ) {

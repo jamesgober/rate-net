@@ -1,4 +1,4 @@
-//! SemVer guard: implementations a 1.0 downstream crate could legally write
+//! `SemVer` guard: implementations a 1.0 downstream crate could legally write
 //! must keep compiling.
 //!
 //! `&T` and `Box<T>` are fundamental types, so under the orphan rules a crate
@@ -35,6 +35,10 @@ impl Limiter for Box<AlwaysAllow> {
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "taking the limiter by value is the point"
+)]
 fn admit<L: Limiter>(limiter: L) -> bool {
     limiter.check("k").is_allow()
 }

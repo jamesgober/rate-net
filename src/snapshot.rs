@@ -154,9 +154,11 @@ impl Snapshot {
     ///
     /// ```
     /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
     /// use rate_net::RateLimiter;
+    /// use std::sync::Arc;
     ///
-    /// let limiter = RateLimiter::per_minute(60);
+    /// let limiter = RateLimiter::per_minute(60).with_clock(Arc::new(ManualClock::new()));
     /// let _ = limiter.check("k"); // one token back in 1 s
     /// assert_eq!(limiter.peek("k").reset_after_secs(), 1);
     /// # }
@@ -194,9 +196,11 @@ impl Snapshot {
     ///
     /// ```
     /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
     /// use rate_net::RateLimiter;
+    /// use std::sync::Arc;
     ///
-    /// let limiter = RateLimiter::per_second(10);
+    /// let limiter = RateLimiter::per_second(10).with_clock(Arc::new(ManualClock::new()));
     /// let _ = limiter.check_n("k", 3);
     /// assert_eq!(
     ///     limiter.peek("k").headers(),
@@ -210,6 +214,42 @@ impl Snapshot {
     /// ```
     #[must_use]
     pub const fn headers(&self) -> [(&'static str, u64); 3] {
+        self.legacy_headers()
+    }
+
+    /// The value of the structured `RateLimit` field for the policy named
+    /// `policy`: `"policy";r=<remaining>;t=<reset>`, where `t` is
+    /// [`reset_after_secs`](Self::reset_after_secs) (or `0` for a limiter that
+    /// admits nothing, as in [`headers`](Self::headers)).
+    ///
+    /// This is the current IETF draft's single structured field (send it under
+    /// [`headers::RATELIMIT`](crate::headers::RATELIMIT)), beside a
+    /// `RateLimit-Policy` field from
+    /// [`Quota::ratelimit_policy`](crate::Quota::ratelimit_policy) with the same
+    /// name. The value formats with `Display` and never allocates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
+    /// use rate_net::{headers, RateLimiter};
+    /// use std::sync::Arc;
+    ///
+    /// let clock = Arc::new(ManualClock::new()); // frozen: exact numbers
+    /// let limiter = RateLimiter::per_minute(60).with_clock(clock);
+    /// let _ = limiter.check_n("k", 2);
+    /// let snapshot = limiter.peek("k");
+    /// assert_eq!(headers::RATELIMIT, "RateLimit");
+    /// assert_eq!(snapshot.ratelimit("default").to_string(), r#""default";r=58;t=2"#);
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn ratelimit<'a>(&self, policy: &'a str) -> crate::headers::RateLimitValue<'a> {
+        crate::headers::RateLimitValue::new(policy, self.remaining as u64, self.reset_header_secs())
+    }
+
+    const fn legacy_headers(&self) -> [(&'static str, u64); 3] {
         [
             (crate::headers::RATELIMIT_LIMIT, self.limit as u64),
             (crate::headers::RATELIMIT_REMAINING, self.remaining as u64),

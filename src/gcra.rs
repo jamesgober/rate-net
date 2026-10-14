@@ -340,6 +340,26 @@ impl Gcra {
     pub fn reset(&self) {
         self.tat.store(0, Ordering::Release);
     }
+
+    /// Makes the bucket no fuller than one that is whole again exactly at
+    /// `until` (a duration on the caller's time line): the theoretical arrival
+    /// time is raised to the first emission interval that begins at or after
+    /// it. Exact, with no rounding of fractional units, so a key restored
+    /// repeatedly loses nothing.
+    #[cfg(all(feature = "std", feature = "algorithms"))]
+    pub(crate) fn restore_until(&self, until: Duration) {
+        if self.deny_all {
+            return;
+        }
+        let until_ns = nanos(until);
+        let floor = self.intervals_at(until_ns);
+        let interval = if self.nanos_at(floor) >= until_ns {
+            floor
+        } else {
+            floor.saturating_add(1)
+        };
+        let _previous = self.tat.fetch_max(interval, Ordering::AcqRel);
+    }
 }
 
 impl fmt::Debug for Gcra {
@@ -418,7 +438,10 @@ mod tests {
             .retry_after()
             .unwrap_or_default();
         assert_eq!(wait, Duration::from_nanos(333_333_334));
-        assert!(lb.check_n_at(1, wait - Duration::from_nanos(1)).is_deny());
+        assert!(
+            lb.check_n_at(1, wait.saturating_sub(Duration::from_nanos(1)))
+                .is_deny()
+        );
         assert!(lb.check_n_at(1, wait).is_allow());
     }
 
@@ -552,7 +575,7 @@ mod tests {
             1_000_000_000,
             u64::MAX,
         ] {
-            let exact = (u128::from(ns) * 3 / 1_000_000_000) as u64;
+            let exact = u64::try_from(u128::from(ns) * 3 / 1_000_000_000).unwrap_or(u64::MAX);
             assert_eq!(lb.intervals_at(ns), exact, "ns={ns}");
         }
         let one_per_ns = Gcra::new(Quota::from_parts(1_000, Duration::from_micros(1), 1));

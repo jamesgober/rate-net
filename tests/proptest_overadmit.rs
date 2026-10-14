@@ -21,7 +21,7 @@ proptest! {
     /// never exceeds `limit * (elapsed_seconds + 1)`: the full initial burst
     /// plus one refill per elapsed second, which caps cumulative admission.
     #[test]
-    fn token_bucket_never_over_admits_single_key(
+    fn prop_token_bucket_never_over_admits_single_key(
         limit in 1u32..=64,
         steps in prop::collection::vec((0u32..=100, 0u64..=3), 0..40),
     ) {
@@ -54,7 +54,7 @@ proptest! {
     /// another key's allowance. With `k` distinct keys and a fresh limiter, each
     /// key must admit its full initial burst of `limit`.
     #[test]
-    fn distinct_keys_each_get_their_own_allowance(
+    fn prop_distinct_keys_each_get_their_own_allowance(
         limit in 1u32..=32,
         key_count in 1usize..=16,
     ) {

@@ -19,7 +19,7 @@ use clock_lib::ManualClock;
 use rate_net::{Eviction, RateLimiter};
 
 #[test]
-fn stress_many_keys_never_over_or_under_admit() {
+fn test_stress_many_keys_admit_exactly_their_quota() {
     const KEYS: u64 = 64;
     const LIMIT: u32 = 100;
     const THREADS: usize = 8;
@@ -44,7 +44,8 @@ fn stress_many_keys_never_over_or_under_admit() {
             for _ in 0..PASSES {
                 for key in 0..KEYS {
                     if limiter.check(key).is_allow() {
-                        let _ = admitted[key as usize].fetch_add(1, Ordering::Relaxed);
+                        let _ =
+                            admitted[usize::try_from(key).unwrap()].fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -55,7 +56,7 @@ fn stress_many_keys_never_over_or_under_admit() {
     }
 
     for key in 0..KEYS {
-        let count = admitted[key as usize].load(Ordering::Relaxed);
+        let count = admitted[usize::try_from(key).unwrap()].load(Ordering::Relaxed);
         assert_eq!(
             count, LIMIT,
             "key {key} admitted {count}, expected exactly {LIMIT} (frozen clock)"
@@ -71,7 +72,7 @@ fn stress_many_keys_never_over_or_under_admit() {
 /// no deadlock).
 #[cfg(feature = "algorithms")]
 #[test]
-fn stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
+fn test_stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
     use rate_net::Algorithm;
 
     const LIMIT: u32 = 200;
@@ -123,8 +124,9 @@ fn stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
 /// guarantees in at the *type* level so any regression surfaces at compile time
 /// rather than as a runtime test failure.
 #[test]
-fn public_types_are_send_sync_and_static() {
+fn test_public_types_are_send_sync_and_static() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
 
     assert_send_sync_static::<rate_net::RateLimiter>();
     assert_send_sync_static::<rate_net::Decision>();
@@ -145,4 +147,20 @@ fn public_types_are_send_sync_and_static() {
     assert_send_sync_static::<rate_net::AsyncLimiter>();
     #[cfg(feature = "metrics")]
     assert_send_sync_static::<rate_net::Metrics>();
+    // Unwind safety is part of the 1.x surface too (a per-key quota resolver
+    // must not take it away).
+    assert_unwind_safe::<rate_net::RateLimiter>();
+    assert_unwind_safe::<rate_net::Builder>();
+    #[cfg(feature = "async")]
+    assert_unwind_safe::<rate_net::AsyncLimiter>();
+    assert_send_sync_static::<rate_net::headers::RateLimitValue<'static>>();
+    assert_send_sync_static::<rate_net::headers::RateLimitPolicyValue<'static>>();
+    #[cfg(feature = "tower")]
+    {
+        use rate_net::tower::{ForwardedFor, HeaderKey, PeerIp, RateLimitLayer, RateLimited};
+        assert_send_sync_static::<RateLimitLayer<PeerIp>>();
+        assert_send_sync_static::<RateLimitLayer<ForwardedFor>>();
+        assert_send_sync_static::<RateLimitLayer<HeaderKey>>();
+        assert_send_sync_static::<RateLimited<(), PeerIp>>();
+    }
 }
