@@ -7,6 +7,12 @@
 //! checks' latency distribution (p50, p99, p99.9, max) with and without the
 //! flood, so the question "does a flood stall real users?" has a number.
 //!
+//! Three scenarios: no flood; a flood of keys that recover at once (each
+//! eviction is lossless); and a flood of keys that each drain a slow quota, so
+//! every eviction must record the key's debt in the recovery table — which the
+//! flood overloads, so records merge. The legitimate keys run on a quota they
+//! never exhaust (a per-key override), so every timed check is admitted.
+//!
 //! In `1.0.0` each flood insert scanned its whole shard under the shard's write
 //! lock, and a legitimate check landing in that shard waited for the scan.
 //! Eviction now does bounded work per insert, so the distribution should barely
@@ -25,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rate_net::{DEFAULT_MAX_KEYS, RateLimiter};
+use rate_net::{DEFAULT_MAX_KEYS, Quota, RateLimiter};
 
 /// Threads inserting unique keys during the flood scenario.
 const FLOOD_THREADS: u64 = 3;
@@ -54,15 +60,11 @@ fn main() {
             "{:<22} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}",
             "scenario", "p50", "p99", "p99.9", "max", "legit checks", "flood inserts"
         );
-        for flood in [false, true] {
+        for flood in [Flood::None, Flood::Recovering, Flood::Draining] {
             let report = run(flood, duration);
             println!(
                 "{:<22} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}",
-                if flood {
-                    "3-thread unique flood"
-                } else {
-                    "no flood"
-                },
+                flood.label(),
                 fmt(report.p50),
                 fmt(report.p99),
                 fmt(report.p999),
@@ -70,6 +72,29 @@ fn main() {
                 report.checks,
                 report.inserts,
             );
+        }
+    }
+}
+
+/// What the flood threads do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flood {
+    /// No flood.
+    None,
+    /// Unique keys on an unlimited quota: each has recovered by the time it
+    /// is evicted.
+    Recovering,
+    /// Unique keys that each spend a 1-per-minute quota: every eviction
+    /// records a debt.
+    Draining,
+}
+
+impl Flood {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "no flood",
+            Self::Recovering => "flood, recovered keys",
+            Self::Draining => "flood, drained keys",
         }
     }
 }
@@ -83,9 +108,20 @@ struct Report {
     inserts: u64,
 }
 
-fn run(flood: bool, duration: Duration) -> Report {
-    // A rate no legitimate key will exhaust, so every timed check is admitted.
-    let limiter = Arc::new(RateLimiter::per_second(u32::MAX));
+fn run(flood: Flood, duration: Duration) -> Report {
+    // A rate no legitimate key will exhaust, so every timed check is admitted;
+    // in the draining scenario, flood keys (below LEGIT_BASE) get one unit a
+    // minute instead.
+    let draining = flood == Flood::Draining;
+    let limiter = Arc::new(
+        RateLimiter::builder()
+            .per_second(u32::MAX)
+            .quota_for(move |key| {
+                let bytes: [u8; 8] = key.as_bytes().try_into().ok()?;
+                (draining && u64::from_be_bytes(bytes) < LEGIT_BASE).then(|| Quota::per_minute(1))
+            })
+            .build(),
+    );
     // Fill to the cap (twice over, so the store is in its evicting steady
     // state), then make the legitimate keys tracked and recently used.
     for key in 0..(DEFAULT_MAX_KEYS as u64 * 2) {
@@ -97,7 +133,11 @@ fn run(flood: bool, duration: Duration) -> Report {
 
     let stop = Arc::new(AtomicBool::new(false));
     let inserted = Arc::new(AtomicU64::new(0));
-    let flooders: Vec<_> = (0..if flood { FLOOD_THREADS } else { 0 })
+    let flooders: Vec<_> = (0..if flood == Flood::None {
+        0
+    } else {
+        FLOOD_THREADS
+    })
         .map(|thread_index| {
             let limiter = Arc::clone(&limiter);
             let stop = Arc::clone(&stop);
