@@ -223,6 +223,10 @@ required-features = ["std", "algorithms"]
 name              = "async_wait"
 required-features = ["async"]
 
+[[example]]
+name              = "tower_layer"
+required-features = ["tower"]
+
 
 
 # BENCHMARKS

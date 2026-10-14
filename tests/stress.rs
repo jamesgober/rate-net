@@ -19,7 +19,7 @@ use clock_lib::ManualClock;
 use rate_net::{Eviction, RateLimiter};
 
 #[test]
-fn stress_many_keys_never_over_or_under_admit() {
+fn test_stress_many_keys_admit_exactly_their_quota() {
     const KEYS: u64 = 64;
     const LIMIT: u32 = 100;
     const THREADS: usize = 8;
@@ -72,7 +72,7 @@ fn stress_many_keys_never_over_or_under_admit() {
 /// no deadlock).
 #[cfg(feature = "algorithms")]
 #[test]
-fn stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
+fn test_stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
     use rate_net::Algorithm;
 
     const LIMIT: u32 = 200;
@@ -124,7 +124,7 @@ fn stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
 /// guarantees in at the *type* level so any regression surfaces at compile time
 /// rather than as a runtime test failure.
 #[test]
-fn public_types_are_send_sync_and_static() {
+fn test_public_types_are_send_sync_and_static() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
 
     assert_send_sync_static::<rate_net::RateLimiter>();
@@ -146,4 +146,14 @@ fn public_types_are_send_sync_and_static() {
     assert_send_sync_static::<rate_net::AsyncLimiter>();
     #[cfg(feature = "metrics")]
     assert_send_sync_static::<rate_net::Metrics>();
+    assert_send_sync_static::<rate_net::headers::RateLimitValue<'static>>();
+    assert_send_sync_static::<rate_net::headers::RateLimitPolicyValue<'static>>();
+    #[cfg(feature = "tower")]
+    {
+        use rate_net::tower::{ForwardedFor, HeaderKey, PeerIp, RateLimitLayer, RateLimited};
+        assert_send_sync_static::<RateLimitLayer<PeerIp>>();
+        assert_send_sync_static::<RateLimitLayer<ForwardedFor>>();
+        assert_send_sync_static::<RateLimitLayer<HeaderKey>>();
+        assert_send_sync_static::<RateLimited<(), PeerIp>>();
+    }
 }

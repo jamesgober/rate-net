@@ -22,7 +22,7 @@ fn manual(limit: u32) -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
 }
 
 #[test]
-fn flood_of_unique_keys_stays_bounded_and_spares_a_live_key() {
+fn test_unique_key_flood_stays_bounded_and_spares_a_live_key() {
     let (clock, limiter) = {
         let clock = Arc::new(ManualClock::new());
         let limiter = RateLimiter::per_second(5)
@@ -65,7 +65,7 @@ fn flood_of_unique_keys_stays_bounded_and_spares_a_live_key() {
 }
 
 #[test]
-fn burst_storm_on_one_key_never_over_admits() {
+fn test_burst_storm_on_one_key_admits_exactly_the_quota() {
     let (_clock, limiter) = manual(50);
     // 10x the quota fired at the same instant.
     let admitted = (0..500).filter(|_| limiter.check("k").is_allow()).count();
@@ -76,14 +76,14 @@ fn burst_storm_on_one_key_never_over_admits() {
 }
 
 #[test]
-fn no_clock_advance_admits_exactly_the_quota() {
+fn test_frozen_clock_admits_exactly_the_quota() {
     let (_clock, limiter) = manual(7);
     let admitted = (0..1000).filter(|_| limiter.check("k").is_allow()).count();
     assert_eq!(admitted, 7);
 }
 
 #[test]
-fn large_clock_jump_refills_to_cap_not_beyond() {
+fn test_large_clock_jump_refills_to_cap_not_beyond() {
     let (clock, limiter) = manual(10);
     // Drain.
     for _ in 0..10 {
@@ -100,7 +100,7 @@ fn large_clock_jump_refills_to_cap_not_beyond() {
 }
 
 #[test]
-fn request_near_u32_max_denies_without_panic() {
+fn test_request_near_u32_max_is_denied_as_impossible() {
     let (_clock, limiter) = manual(100);
     assert_eq!(
         limiter.check_n("k", u32::MAX),
@@ -113,14 +113,19 @@ fn request_near_u32_max_denies_without_panic() {
 }
 
 #[test]
-fn huge_quota_does_not_panic() {
-    let limiter = RateLimiter::per_second(u32::MAX);
+fn test_huge_quota_admits_up_to_its_burst_without_panic() {
+    let clock = Arc::new(ManualClock::new());
+    let limiter = RateLimiter::per_second(u32::MAX).with_clock(Arc::clone(&clock));
     assert!(limiter.check("k").is_allow());
-    assert!(limiter.check_n("k", u32::MAX).is_allow() || limiter.check_n("k", u32::MAX).is_deny());
+    // One unit is spent and the clock is frozen: the whole burst no longer fits,
+    // and the rest of it does.
+    assert!(limiter.check_n("k", u32::MAX).is_deny());
+    assert!(limiter.check_n("k", u32::MAX - 1).is_allow());
+    assert!(limiter.check("k").is_deny());
 }
 
 #[test]
-fn zero_quota_denies_everything_without_panic() {
+fn test_zero_quota_denies_everything() {
     let limiter = RateLimiter::per_second(0);
     for _ in 0..100 {
         assert!(limiter.check("k").is_deny());
@@ -128,20 +133,27 @@ fn zero_quota_denies_everything_without_panic() {
 }
 
 #[test]
-fn rapid_reconfiguration_does_not_panic() {
+fn test_rapid_reconfiguration_starts_each_limiter_fresh() {
     let mut limiter = RateLimiter::per_second(10);
     for shards in [1usize, 2, 4, 8, 16, 32] {
         limiter = limiter
             .with_shards(shards)
             .with_eviction(Eviction::capacity(shards * 4))
             .with_eviction(Eviction::idle(Duration::from_secs(1)));
-        assert!(limiter.check("k").is_allow() || limiter.check("k").is_deny());
+        // Each `with_*` discards per-key state: the key starts with its whole
+        // allowance and is the only one tracked.
+        assert_eq!(limiter.tracked_keys(), 0);
+        assert!(limiter.check_n("k", 10).is_allow());
+        assert!(limiter.check("k").is_deny());
+        assert_eq!(limiter.tracked_keys(), 1);
+        // The idle policy keeps the default million-key cap, so the store
+        // raises the shard count to keep each shard at 16,384 keys or fewer.
+        assert_eq!(limiter.shards(), shards.max(64));
     }
-    assert!(limiter.tracked_keys() <= 1 || limiter.tracked_keys() >= 1);
 }
 
 #[test]
-fn unbounded_eviction_keeps_every_key() {
+fn test_unbounded_eviction_keeps_every_key() {
     let (_clock, limiter) = {
         let clock = Arc::new(ManualClock::new());
         let limiter = RateLimiter::per_second(1)
@@ -182,7 +194,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn every_algorithm_admits_zero_units() {
+    fn test_every_algorithm_admits_zero_units_when_drained() {
         for algorithm in ALL {
             let (_clock, lim) = limiter(algorithm, 1);
             // Drain, then a zero-unit check still succeeds and costs nothing.
@@ -192,7 +204,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn every_algorithm_admits_exactly_the_quota_in_a_window() {
+    fn test_every_algorithm_admits_exactly_the_quota_in_a_window() {
         for algorithm in ALL {
             let (_clock, lim) = limiter(algorithm, 5);
             let admitted = (0..100).filter(|_| lim.check("k").is_allow()).count();
@@ -204,7 +216,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn every_algorithm_refuses_a_request_larger_than_the_quota() {
+    fn test_every_algorithm_refuses_a_request_over_the_quota_as_impossible() {
         for algorithm in ALL {
             let (_clock, lim) = limiter(algorithm, 5);
             assert!(
@@ -220,7 +232,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn every_algorithm_refills_after_enough_time() {
+    fn test_every_algorithm_refills_after_two_periods() {
         for algorithm in ALL {
             let (clock, lim) = limiter(algorithm, 4);
             for _ in 0..4 {
@@ -237,7 +249,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn window_algorithms_handle_exact_boundary() {
+    fn test_window_algorithms_reopen_at_the_exact_boundary() {
         // At the exact window boundary the new window must be fresh.
         for algorithm in [Algorithm::FixedWindow, Algorithm::SlidingWindowLog] {
             let (clock, lim) = limiter(algorithm, 3);
@@ -252,7 +264,7 @@ mod algorithm_edges {
     }
 
     #[test]
-    fn every_algorithm_survives_a_burst_storm_with_no_time() {
+    fn test_every_algorithm_admits_exactly_the_quota_under_a_burst_storm() {
         for algorithm in ALL {
             let (_clock, lim) = limiter(algorithm, 20);
             let admitted = (0..1000).filter(|_| lim.check("k").is_allow()).count();
