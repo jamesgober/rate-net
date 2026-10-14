@@ -20,7 +20,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, "1.85"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
@@ -30,41 +30,77 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
-      # Default features = token bucket only; every optional feature is
-      # additive, so exercise the lean default build and the no_std core too.
-      - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
-      - name: Clippy (metrics only)
-        run: cargo clippy --all-targets --features metrics -- -D warnings
       - name: Test (all features)
         run: cargo test --all-features
-      - name: Test (default features)
-        run: cargo test
-      - name: Test (no default features)
-        run: cargo test --no-default-features
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
-      # Feature-gated items must not leave broken intra-doc links in the
-      # always-compiled crate docs, so doc the lean default build too.
-      - name: Doc (default features)
-        run: cargo doc --no-deps
+
+  # Every feature on its own (and none, and the default set): an optional
+  # feature must never depend on another to compile, and the lean builds must
+  # stay warning-free and documented. cargo-hack enumerates the set from
+  # Cargo.toml, so a new feature is covered without editing this file.
+  features:
+    name: Features (each, on ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Clippy (each feature)
+        run: cargo hack clippy --each-feature --all-targets -- -D warnings
+      - name: Test (each feature)
+        run: cargo hack test --each-feature
+      - name: Doc (each feature)
+        run: cargo hack doc --each-feature --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  pedantic:
+    name: Clippy pedantic (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy pedantic (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+
+  # The real-clock contention and eviction tests in release mode, where the
+  # check path is fast enough for threads to genuinely race on one key.
+  stress:
+    name: Stress (release, real clock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real-clock, stress, and eviction tests, optimised
+        run: cargo test --release --all-features --test real_clock --test stress --test eviction_bypass
 
   loom:
     name: Loom (model check of the production limiter)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # clock-lib 1.1.0 uses `loom` in library code under cfg(loom) but declares
       # it only as a dev-dependency, so it cannot build with --cfg loom; 1.0.0
-      # satisfies rate-net's (and better-bucket's) `clock-lib = "1.0"`.
+      # satisfies rate-net's `clock-lib = "1.0"`.
       - name: Pin clock-lib for the loom build
         run: cargo update -p clock-lib --precise 1.0.0
       - name: Loom
@@ -76,7 +112,7 @@ jobs:
     name: Miri (atomic algorithm state and the store)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -85,16 +121,43 @@ jobs:
       # never do; it is what exercises the CAS retry paths.
       - name: Miri
         run: |
-          cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
+          cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear metrics::
         env:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # cargo-fuzz manages its own RUSTFLAGS (sanitizer instrumentation); clear
+      # the workflow-wide `-D warnings` so it does not fight the fuzz build.
+      # Pin the fuzz target to the gnu triple: the prebuilt cargo-fuzz binary is
+      # musl-static, so it would otherwise default to musl, whose std the
+      # nightly toolchain does not ship. New inputs go to corpus/, never seeds/.
+      - name: Fuzz limiter_ops (60s)
+        run: cargo +nightly fuzz run limiter_ops fuzz/corpus/limiter_ops fuzz/seeds/limiter_ops --target x86_64-unknown-linux-gnu -- -max_total_time=60
+        env:
+          RUSTFLAGS: ""
+      - name: Fuzz http_keys (30s)
+        run: cargo +nightly fuzz run http_keys fuzz/corpus/http_keys fuzz/seeds/http_keys --target x86_64-unknown-linux-gnu -- -max_total_time=30
+        env:
+          RUSTFLAGS: ""
 
   no-std:
     name: no_std (thumbv7em-none-eabihf, wasm32-unknown-unknown)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
@@ -110,7 +173,7 @@ jobs:
     name: 32-bit (i686-unknown-linux-gnu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu
@@ -120,18 +183,36 @@ jobs:
       - name: Test (all features, 32-bit)
         run: cargo test --all-features --target i686-unknown-linux-gnu
 
+  coverage:
+    name: Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage summary
+        run: cargo llvm-cov --all-features --summary-only
+
   semver:
     name: SemVer (cargo-semver-checks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
 
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit and cargo-deny

@@ -2,10 +2,11 @@
 # operation sequences against an oracle, and the byte-facing HTTP surfaces.
 #
 # Run locally (needs nightly + cargo-fuzz):
-#   cargo +nightly fuzz run limiter_ops seeds/limiter_ops
-#   cargo +nightly fuzz run http_keys seeds/http_keys
+#   cargo +nightly fuzz run limiter_ops corpus/limiter_ops seeds/limiter_ops
+#   cargo +nightly fuzz run http_keys corpus/http_keys seeds/http_keys
 #
-# Seed inputs are committed under seeds/; the working corpus/ is not.
+# Seed inputs are committed under seeds/; the working corpus/ (listed first,
+# so new inputs land there) is not.
 # CI runs each target for a fixed time budget as a smoke check.
 [package]
 name    = "rate-net-fuzz"

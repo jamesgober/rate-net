@@ -75,7 +75,10 @@ fuzz_target!(|input: Input| {
                     assert!(decision.is_impossible());
                 }
                 if decision.is_allow() {
-                    admitted.entry(key).or_default().push((now_ms, u64::from(n)));
+                    admitted
+                        .entry(key)
+                        .or_default()
+                        .push((now_ms, u64::from(n)));
                 }
             }
             Op::Advance { ms } => {
