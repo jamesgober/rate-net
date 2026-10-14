@@ -333,7 +333,7 @@ impl<C: Clock + Clone> Builder<C> {
     where
         F: Fn(&Key) -> Option<Quota> + Send + Sync + 'static,
     {
-        self.options.quota_for = Some(std::sync::Arc::new(resolve));
+        self.options.quota_for = Some(crate::limiter::QuotaFn::new(resolve));
         self
     }
 

@@ -126,6 +126,7 @@ fn test_stress_every_algorithm_admits_exactly_the_quota_under_concurrency() {
 #[test]
 fn test_public_types_are_send_sync_and_static() {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
 
     assert_send_sync_static::<rate_net::RateLimiter>();
     assert_send_sync_static::<rate_net::Decision>();
@@ -146,6 +147,12 @@ fn test_public_types_are_send_sync_and_static() {
     assert_send_sync_static::<rate_net::AsyncLimiter>();
     #[cfg(feature = "metrics")]
     assert_send_sync_static::<rate_net::Metrics>();
+    // Unwind safety is part of the 1.x surface too (a per-key quota resolver
+    // must not take it away).
+    assert_unwind_safe::<rate_net::RateLimiter>();
+    assert_unwind_safe::<rate_net::Builder>();
+    #[cfg(feature = "async")]
+    assert_unwind_safe::<rate_net::AsyncLimiter>();
     assert_send_sync_static::<rate_net::headers::RateLimitValue<'static>>();
     assert_send_sync_static::<rate_net::headers::RateLimitPolicyValue<'static>>();
     #[cfg(feature = "tower")]

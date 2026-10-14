@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,29 @@ use crate::snapshot::Snapshot;
 use crate::store::{Keyed, Known};
 
 /// A per-key quota resolver: see [`Builder::quota_for`](crate::Builder::quota_for).
-pub(crate) type QuotaFn = Arc<dyn Fn(&Key) -> Option<Quota> + Send + Sync + 'static>;
+#[derive(Clone)]
+pub(crate) struct QuotaFn(Arc<Resolver>);
+
+/// The resolver closure behind a [`QuotaFn`].
+type Resolver = dyn Fn(&Key) -> Option<Quota> + Send + Sync + 'static;
+
+impl QuotaFn {
+    pub(crate) fn new(resolve: impl Fn(&Key) -> Option<Quota> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(resolve))
+    }
+
+    fn resolve(&self, key: &Key) -> Option<Quota> {
+        (self.0)(key)
+    }
+}
+
+// The limiter stays unwind-safe with a resolver, as it was without one. The
+// resolver runs only while a new key's state is being created, before the
+// store is modified, so a panic in it unwinds out of the check with every
+// shard consistent (and a poisoned shard lock is recovered on next use); the
+// limiter never observes the resolver's own state afterwards.
+impl UnwindSafe for QuotaFn {}
+impl RefUnwindSafe for QuotaFn {}
 
 /// The optional per-key behaviour a limiter carries beyond its quota: the
 /// key-length policy and the per-key quota resolver. Set through the
@@ -954,7 +977,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
         self.options
             .quota_for
             .as_ref()
-            .and_then(|resolve| resolve(&key.to_key()))
+            .and_then(|resolve| resolve.resolve(&key.to_key()))
             .unwrap_or(self.quota)
     }
 
