@@ -82,16 +82,14 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 default = ["std"]
 
 # Standard library. The keyed limiter — the sharded per-key store, the
-# token-bucket core (better-bucket's clock-driven surface), the injectable
+# token-bucket state (better-bucket's clock-free `BucketCore`), the injectable
 # clock, `DirectLimiter`, `CoarseClock`, and the error-forge integration —
-# requires std, so std gates `better-bucket`'s `clock` feature, `clock-lib`,
-# `error-forge`, `ahash`, and `hashbrown`. With std off the crate is no_std and
-# exposes the clock-free single-key core: `Gcra` (on targets with 64-bit
-# atomics), `Quota`, `Decision`, `Snapshot`, the error types, and the header
-# names.
+# requires std, so std gates `better-bucket`, `clock-lib`, `error-forge`,
+# `ahash`, and `hashbrown`. With std off the crate is no_std and exposes the
+# clock-free single-key core: `Gcra` (on targets with 64-bit atomics), `Quota`,
+# `Decision`, `Snapshot`, the error types, and the header names and values.
 std = [
     "dep:better-bucket",
-    "better-bucket/clock",
     "dep:clock-lib",
     "clock-lib/std",
     "dep:error-forge",
@@ -126,10 +124,11 @@ tower = ["std", "dep:http", "dep:tower-layer", "dep:tower-service", "dep:pin-pro
 # #################################
 [dependencies]
 # Token-bucket accounting (the single source of truth; we never re-implement it).
-# Pulled in by `std` with its `clock` feature, which exposes the `Bucket` surface.
-# 1.1 is the floor: 1.0 over-granted under multi-threaded contention on a real
-# clock (a stale timestamp read as a ~49.7-day refill), capped capacity at ~4.29M
-# tokens, and lacked `with_config_and_clock` / `time_until`.
+# Only the clock-free `BucketCore` is used — the limiter reads the clock once per
+# check and passes the time in — so no better-bucket feature is enabled and it
+# brings no dependencies of its own. 1.1 is the floor: 1.0 over-granted under
+# multi-threaded contention on a real clock (a stale timestamp read as a
+# ~49.7-day refill), capped capacity at ~4.29M tokens, and had no `BucketCore`.
 better-bucket = { version = "1.1", default-features = false, optional = true }
 # Monotonic, mockable time for deterministic tests and the clock-injection seam.
 clock-lib     = { version = "1.0", default-features = false, optional = true }
