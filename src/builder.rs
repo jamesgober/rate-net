@@ -302,14 +302,34 @@ impl<C: Clock + Clone> Builder<C> {
     /// Gives chosen keys their own quota — tiered limits (free and paid
     /// tenants, internal and external callers) from one limiter.
     ///
-    /// `resolve` is called with a key the first time it is stored (and when an
-    /// untracked key is [peeked](RateLimiter::peek)); `Some(quota)` gives the
-    /// key that quota, `None` the limiter's default. It is not called on the
-    /// check path of an already-tracked key, so it may do modest work, but it
-    /// must be deterministic for a key: a key that is evicted and returns is
-    /// resolved again. A tier change takes effect for a tracked key after
-    /// [`RateLimiter::remove`]. An override quota that admits nothing (a zero
-    /// limit, period, or bucket burst) makes that key fail closed.
+    /// `resolve` is called with a key when it is about to be stored (and when
+    /// an untracked key is [peeked](RateLimiter::peek) or its quota asked for
+    /// with [`RateLimiter::quota_of`]); `Some(quota)` gives the key that quota,
+    /// `None` the limiter's default. It is never called for a key that is
+    /// already tracked.
+    ///
+    /// **Rules for the resolver:**
+    ///
+    /// - It runs on the caller's thread, *before* the limiter takes any lock, so
+    ///   it never blocks other keys and may call back into the limiter
+    ///   (`peek`, `check`, or `quota_of` of *other* keys). It must not check
+    ///   the very key it is resolving — that recurses.
+    /// - It runs on the check path of every first-seen key, so it should be
+    ///   fast; a slow resolver delays only the requests of keys being stored.
+    /// - It must be deterministic for a key: a key that is evicted and returns
+    ///   is resolved again. A tier change takes effect for a tracked key after
+    ///   [`RateLimiter::remove`].
+    /// - A panic propagates to the caller of `check`; nothing is stored.
+    ///
+    /// An override is validated like [`try_build`](Self::try_build) validates
+    /// the default quota (zero limit, period, or bucket burst; a leaky-bucket
+    /// rate above one unit per nanosecond; a sliding-window-log limit above
+    /// [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT)). An invalid
+    /// override makes its key **fail closed** — every check is denied as
+    /// impossible and the key is never stored — rather than run with a quota
+    /// the limiter could not bound. The idle TTL is raised to the *default*
+    /// quota's recovery time; a key with a longer override that expires while
+    /// still limited has its debt recorded like any eviction.
     ///
     /// # Examples
     ///

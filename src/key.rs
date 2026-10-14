@@ -380,6 +380,48 @@ impl Hash for Key {
     }
 }
 
+/// Two independently seeded hashers whose outputs together form a key's
+/// 128-bit digest. Seeded at random per instance, so no caller can predict or
+/// aim at a digest.
+#[derive(Clone)]
+pub(crate) struct Digester {
+    high: ahash::RandomState,
+    low: ahash::RandomState,
+}
+
+impl Digester {
+    pub(crate) fn new() -> Self {
+        Self {
+            high: ahash::RandomState::new(),
+            low: ahash::RandomState::new(),
+        }
+    }
+
+    /// The 16-byte digest of `key` (kind and bytes).
+    pub(crate) fn digest(&self, key: KeyRef<'_>) -> [u8; 16] {
+        let high = self.high.hash_one(key).to_be_bytes();
+        let low = self.low.hash_one(key).to_be_bytes();
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&high);
+        out[8..].copy_from_slice(&low);
+        out
+    }
+
+    /// An owned digest key for `key`: never equal to any key built another
+    /// way, and always stored inline.
+    #[cfg(feature = "tower")]
+    pub(crate) fn digest_key(&self, key: KeyRef<'_>) -> Key {
+        KeyRef::digest(&self.digest(key)).to_key()
+    }
+}
+
+impl fmt::Debug for Digester {
+    /// The seeds are secret; only the type is shown.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Digester").finish_non_exhaustive()
+    }
+}
+
 /// A borrowed key: its kind and its bytes, without owning them.
 ///
 /// The store finds an existing key by this view, so a check never has to build

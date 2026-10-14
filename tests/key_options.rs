@@ -141,5 +141,97 @@ fn test_metrics_count_rejections_and_remembered_debts() {
     assert_eq!(metrics.denied, 2);
     assert_eq!(metrics.keys_remembered, 2);
     assert_eq!(metrics.keys_restored, 1);
-    assert_eq!(metrics.records_merged, 0);
+    assert_eq!((metrics.debts_overflowed, metrics.keys_refused), (0, 0));
+}
+
+#[test]
+fn test_resolver_may_call_back_into_the_limiter_without_deadlock() {
+    // RN2-003: the resolver runs before any lock is taken, so a resolver that
+    // reads other keys of the same limiter (here, inheriting a parent's tier)
+    // completes instead of deadlocking on the shard lock.
+    let cell: Arc<std::sync::OnceLock<Arc<RateLimiter>>> = Arc::new(std::sync::OnceLock::new());
+    let inner = Arc::clone(&cell);
+    let limiter = Arc::new(
+        RateLimiter::builder()
+            .per_second(5)
+            .shards(1)
+            .quota_for(move |key| {
+                let limiter = inner.get()?;
+                if key.as_bytes() == b"child" {
+                    let _ = limiter.peek("parent");
+                    let _ = limiter.check("other");
+                }
+                None
+            })
+            .build(),
+    );
+    let _ = limiter.check("parent");
+    let _ = cell.set(Arc::clone(&limiter));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&limiter);
+    let _thread = std::thread::spawn(move || {
+        let _ = tx.send(worker.check("child").is_allow());
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+}
+
+#[test]
+fn test_a_slow_resolver_does_not_block_tracked_keys() {
+    let limiter = Arc::new(
+        RateLimiter::builder()
+            .per_second(1_000_000)
+            .shards(1)
+            .quota_for(|key| {
+                if key.as_bytes().starts_with(b"slow") {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                None
+            })
+            .build(),
+    );
+    let _ = limiter.check("tracked");
+    let worker = Arc::clone(&limiter);
+    let slow = std::thread::spawn(move || worker.check("slow-new-key").is_allow());
+    std::thread::sleep(Duration::from_millis(50));
+    let start = std::time::Instant::now();
+    assert!(limiter.check("tracked").is_allow());
+    // Without the fix this check waited for the resolver (~350 ms).
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(slow.join().unwrap_or(false));
+}
+
+#[test]
+fn test_invalid_overrides_fail_closed() {
+    // RN2-010: an override try_build would reject is never run.
+    let limiter = RateLimiter::builder()
+        .per_second(10)
+        .quota_for(|key| match key.as_bytes() {
+            b"zero" => Some(Quota::per_second(0)),
+            b"burstless" => Some(Quota::per_second(5).with_burst(0)),
+            _ => None,
+        })
+        .build();
+    for key in ["zero", "burstless"] {
+        assert!(limiter.check(key).is_impossible(), "{key}");
+        assert_eq!(limiter.quota_of(key).limit(), 0);
+        assert_eq!(limiter.peek(key).limit(), 0);
+    }
+    assert_eq!(limiter.tracked_keys(), 0);
+    assert_eq!(limiter.quota_of("ok").limit(), 10);
+}
+
+#[cfg(feature = "algorithms")]
+#[test]
+fn test_an_override_above_the_sliding_log_ceiling_fails_closed() {
+    let limiter = RateLimiter::builder()
+        .algorithm(rate_net::Algorithm::SlidingWindowLog)
+        .per_second(10)
+        .quota_for(|_| Some(Quota::per_second(u32::MAX)))
+        .try_build()
+        .unwrap_or_else(|_| unreachable!("the default quota is valid"));
+    assert!(limiter.check("k").is_impossible());
 }

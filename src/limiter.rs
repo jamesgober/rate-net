@@ -6,14 +6,13 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahash::RandomState;
 use clock_lib::{Clock, Monotonic, SystemClock};
 
 use crate::algo::fresh_snapshot;
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
-use crate::key::{Key, KeyRef};
+use crate::key::{Digester, Key, KeyRef};
 use crate::quota::Quota;
 use crate::snapshot::Snapshot;
 use crate::store::{Keyed, Known};
@@ -72,33 +71,6 @@ impl fmt::Debug for KeyOptions {
             .field("digest_over", &self.digest_over)
             .field("quota_for", &self.quota_for.as_ref().map(|_| "<fn>"))
             .finish()
-    }
-}
-
-/// Two independently seeded hashers whose outputs together form a key's
-/// 128-bit digest. Seeded at random per limiter, so no caller can predict or
-/// aim at a digest.
-#[derive(Clone)]
-struct Digester {
-    high: RandomState,
-    low: RandomState,
-}
-
-impl Digester {
-    fn new() -> Self {
-        Self {
-            high: RandomState::new(),
-            low: RandomState::new(),
-        }
-    }
-
-    fn digest(&self, key: KeyRef<'_>) -> [u8; 16] {
-        let high = self.high.hash_one(key).to_be_bytes();
-        let low = self.low.hash_one(key).to_be_bytes();
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&high);
-        out[8..].copy_from_slice(&low);
-        out
     }
 }
 
@@ -805,8 +777,8 @@ impl<C: Clock + Clone> RateLimiter<C> {
     pub fn remove(&self, key: impl Into<Key>) -> bool {
         let key = key.into();
         match self.admit(key.as_key_ref()) {
-            Admitted::AsIs(key) => self.store.remove(key),
-            Admitted::Digest(digest) => self.store.remove(KeyRef::digest(&digest)),
+            Admitted::AsIs(key) => self.store.remove(key, self.now()),
+            Admitted::Digest(digest) => self.store.remove(KeyRef::digest(&digest), self.now()),
             Admitted::TooLong => false,
         }
     }
@@ -881,6 +853,30 @@ impl<C: Clock + Clone> RateLimiter<C> {
         self.store.shrink_to_fit();
     }
 
+    /// The quota `key` is limited by: its [`quota_for`](crate::Builder::quota_for)
+    /// override if it has a valid one, a quota that admits nothing (`limit`
+    /// `0`) if the override is invalid, otherwise [`quota`](Self::quota).
+    ///
+    /// Calls the resolver (it is not cached). For a `RateLimit-Policy` header
+    /// that describes the quota a key is actually under.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Quota, RateLimiter};
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .per_second(10)
+    ///     .quota_for(|key| (key.as_bytes() == b"vip").then(|| Quota::per_second(100)))
+    ///     .build();
+    /// assert_eq!(limiter.quota_of("vip").limit(), 100);
+    /// assert_eq!(limiter.quota_of("anyone").limit(), 10);
+    /// ```
+    #[must_use]
+    pub fn quota_of(&self, key: impl Into<Key>) -> Quota {
+        self.quota_of_ref(key.into().as_key_ref())
+    }
+
     /// The limiter's cumulative counters: checks allowed and denied, and keys
     /// inserted, evicted, expired, and removed. Requires the `metrics` feature;
     /// see [`Metrics`](crate::Metrics) for what each counter means.
@@ -912,7 +908,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
         if !self.options.limits_length() {
             return self
                 .store
-                .check(key, n, || self.now(), || self.quota_of(key));
+                .check(key, n, || self.now(), || self.quota_of_ref(key));
         }
         self.check_with_policy(key, n)
     }
@@ -921,14 +917,15 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// look a long one up by its digest.
     fn check_with_policy(&self, key: KeyRef<'_>, n: u32) -> Decision {
         match self.admit(key) {
-            Admitted::AsIs(key) => self
-                .store
-                .check(key, n, || self.now(), || self.quota_of(key)),
+            Admitted::AsIs(key) => {
+                self.store
+                    .check(key, n, || self.now(), || self.quota_of_ref(key))
+            }
             Admitted::Digest(digest) => self.store.check(
                 KeyRef::digest(&digest),
                 n,
                 || self.now(),
-                || self.quota_of(key),
+                || self.quota_of_ref(key),
             ),
             Admitted::TooLong => {
                 #[cfg(feature = "metrics")]
@@ -966,19 +963,23 @@ impl<C: Clock + Clone> RateLimiter<C> {
         };
         match known {
             Known::Tracked(snapshot) => snapshot,
-            Known::Owed(debt) => self.store.owed_snapshot(debt, &self.quota_of(key), now),
-            Known::Unknown => fresh_snapshot(self.algorithm, &self.quota_of(key)),
+            Known::Owed(debt) => self.store.owed_snapshot(debt, &self.quota_of_ref(key), now),
+            Known::Unknown => fresh_snapshot(self.algorithm, &self.quota_of_ref(key)),
         }
     }
 
-    /// The quota for `key`: the per-key override if the resolver gives one,
-    /// otherwise the limiter's quota.
-    fn quota_of(&self, key: KeyRef<'_>) -> Quota {
-        self.options
-            .quota_for
-            .as_ref()
-            .and_then(|resolve| resolve.resolve(&key.to_key()))
-            .unwrap_or(self.quota)
+    /// The quota for `key`: the per-key override if the resolver gives a
+    /// valid one, a quota that admits nothing if it gives an invalid one (fail
+    /// closed), otherwise the limiter's quota.
+    pub(crate) fn quota_of_ref(&self, key: KeyRef<'_>) -> Quota {
+        let Some(resolve) = self.options.quota_for.as_ref() else {
+            return self.quota;
+        };
+        match resolve.resolve(&key.to_key()) {
+            None => self.quota,
+            Some(quota) if self.algorithm.validate(&quota).is_ok() => quota,
+            Some(quota) => Quota::from_parts(0, quota.period(), 0),
+        }
     }
 
     /// Monotonic elapsed time since this limiter's epoch, the time every
