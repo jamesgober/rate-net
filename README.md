@@ -304,7 +304,7 @@ Readings never run ahead of real time, but they lag it, and lag has a price:
 when the clock catches up, the limiter credits the lagged time as refill. Over
 any span the limiter admits at most what the quota allows over that span plus
 `rate × L`, where `L` is the clock's lag at the start of the span. A spawned
-clock keeps `L` to about one tick (readers re-check the real clock every 64
+clock keeps `L` to about one tick (readers re-check the real clock every 61
 reads, so even a starved ticker cannot let it grow); a manual clock lags by the
 time since its last `tick()`.
 

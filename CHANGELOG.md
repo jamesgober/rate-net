@@ -131,7 +131,7 @@ documentation claims that were not true of `1.0.0` are corrected.
   (`tick`). Roughly halves the cost of a token-bucket check. A lagging clock
   can admit up to `rate × lag` beyond the quota over a span (the lagged time is
   credited when it catches up); a spawned clock bounds the lag to about one
-  interval even when the ticker is starved, because every 64th read on a
+  interval even when the ticker is starved, because every 61st read on a
   thread re-reads the real clock and ticks if a whole interval behind.
 - `AsyncLimiter::try_until_ready` / `try_until_ready_n`, and the same on
   `DirectLimiter` (feature `async`) — return `InsufficientCapacity` instead of

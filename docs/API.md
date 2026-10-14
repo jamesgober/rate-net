@@ -742,7 +742,7 @@ once every clone is dropped; `new` has no thread and moves only on `tick`.
 Readings never run ahead of real time but lag it by `L` (`lag()`), and a
 limiter on the clock may admit up to `rate × L` beyond the quota over any span
 (the lagged time is credited when the clock catches up). For a spawned clock
-`L` is about one interval: every 64th read on a thread re-reads the real clock
+`L` is about one interval: every 61st read on a thread re-reads the real clock
 and ticks if a whole interval behind, so a starved ticker cannot stretch it. A
 manual clock lags by the time since its last `tick`.
 

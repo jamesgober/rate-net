@@ -17,10 +17,17 @@ pub const MIN_COARSE_RESOLUTION: Duration = Duration::from_micros(100);
 /// How often (in reads, per thread) a spawned clock checks whether it has
 /// fallen behind. One real clock read per this many coarse reads costs well
 /// under a nanosecond per reading, amortized.
-const READS_PER_REFRESH: u32 = 64;
+///
+/// The counter is per thread, shared by every `CoarseClock` the thread reads,
+/// and the check refreshes whichever clock the due read was of. The period is
+/// prime so that a thread rotating through several clocks in a fixed order (any
+/// cycle shorter than 61) lands its due reads on each of them in turn; with a
+/// power of two, a thread alternating two clocks would only ever refresh one.
+const READS_PER_REFRESH: u32 = 61;
 
 thread_local! {
-    /// Coarse reads on this thread since its last staleness check.
+    /// Coarse reads on this thread (of any `CoarseClock`) since its last
+    /// staleness check.
     static READS: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -55,10 +62,11 @@ thread_local! {
 ///
 /// - **Spawned** ([`spawn`](Self::spawn)): one tick interval plus however late
 ///   the ticker thread runs. A starved ticker (a machine with every core busy)
-///   cannot stretch this indefinitely: every 64th read on a thread re-reads the
-///   real clock, and if the coarse clock has fallen a whole interval behind it
-///   ticks it then. On any thread that reads the clock steadily, `L` stays
-///   within one interval plus the time of 64 reads.
+///   cannot stretch this indefinitely: every 61st read on a thread re-reads the
+///   real clock, and if the clock read then has fallen a whole interval behind
+///   it ticks it. On any thread that reads the clock steadily, `L` stays within
+///   one interval plus the time of 61 reads. (The count is per thread, across
+///   all coarse clocks it reads; see [`spawn`](Self::spawn).)
 /// - **Manual** ([`new`](Self::new)): exactly the time since the last
 ///   [`tick`](Self::tick). The clock never moves on its own; tick it at least
 ///   as often as the looseness you can accept.
@@ -198,6 +206,13 @@ impl CoarseClock {
     /// of the clock being dropped. Clone one clock into every limiter rather
     /// than spawning one per limiter.
     ///
+    /// Readers also keep a spawned clock fresh when its ticker is starved:
+    /// every 61st coarse read on a thread checks the real clock and ticks the
+    /// clock being read if it is a whole `resolution` behind. That count is
+    /// kept per thread across every spawned clock the thread reads, so a
+    /// thread reading several clocks refreshes each in proportion to how often
+    /// it reads it — one more reason to share a single clock.
+    ///
     /// # Errors
     ///
     /// Returns the OS error if the ticker thread cannot be spawned.
@@ -282,7 +297,7 @@ impl Default for CoarseClock {
 
 impl Clock for CoarseClock {
     /// The time of the last tick: one relaxed load and, for a spawned clock, a
-    /// thread-local counter (every 64th read checks the real clock and ticks
+    /// thread-local counter (every 61st read checks the real clock and ticks
     /// if a whole interval behind).
     #[inline]
     fn now(&self) -> Monotonic {
@@ -420,6 +435,22 @@ mod tests {
         // The real clock moved 20ms, past the 1ms refresh threshold, so some
         // read among the last 128 ticked it at least 20ms forward.
         assert!(clock.inner.clock.now().duration_since(start) >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_a_thread_alternating_two_clocks_refreshes_both() {
+        // With a power-of-two period a strict alternation landed every due
+        // read on the same clock; the prime period reaches both.
+        let a = CoarseClock::self_refreshing(Duration::from_millis(1));
+        let b = CoarseClock::self_refreshing(Duration::from_millis(1));
+        let (a0, b0) = (a.inner.clock.now(), b.inner.clock.now());
+        std::thread::sleep(Duration::from_millis(20));
+        for _ in 0..(super::READS_PER_REFRESH * 4) {
+            let _ = a.now();
+            let _ = b.now();
+        }
+        assert!(a.inner.clock.now().duration_since(a0) >= Duration::from_millis(20));
+        assert!(b.inner.clock.now().duration_since(b0) >= Duration::from_millis(20));
     }
 
     #[test]
