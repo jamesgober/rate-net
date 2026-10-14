@@ -1593,6 +1593,48 @@ mod tests {
         assert_eq!(store.recovery_bytes(), 0);
     }
 
+    #[test]
+    fn test_recovery_records_absorb_merge_and_forget() {
+        use super::{MERGED, Recovery};
+        use crate::algo::Debt;
+
+        let debt = |spent, ms| Debt {
+            spent,
+            until: Duration::from_millis(ms),
+        };
+        let mut table = Recovery::new();
+        assert_eq!(table.peek(7, 0), None);
+        assert!(!table.forget(7));
+
+        // The same key remembered twice keeps the larger debt and later end.
+        assert!(!table.remember(7, debt(2, 100), 0, 8));
+        assert!(!table.remember(7, debt(1, 300), 0, 8));
+        assert_eq!(table.peek(7, 0), Some(debt(2, 300)));
+        // Its record outlives `now` only until the deadline.
+        assert_eq!(table.peek(7, 300), None);
+
+        // Fill a tiny table with distinct live debts until one must merge.
+        let mut merged = false;
+        for hash in 100..200u64 {
+            merged |= table.remember((hash << 32) | hash, debt(5, 1_000), 0, 8);
+        }
+        assert!(merged);
+        assert!(table.records.iter().any(|record| record.tag == MERGED));
+        // A merged record applies to any key that maps to it, and is not
+        // cleared by a key that merely maps there.
+        let probe_hit = (0..10_000u64).find(|&h| table.peek(h, 0).is_some_and(|d| d.spent == 5));
+        assert!(probe_hit.is_some());
+
+        // A key's own record is cleared by `forget` and by `take`.
+        let mut table = Recovery::new();
+        assert!(!table.remember(9, debt(3, 50), 0, 8));
+        assert!(table.forget(9));
+        assert_eq!(table.peek(9, 0), None);
+        assert!(!table.remember(9, debt(3, 50), 0, 8));
+        assert_eq!(table.take(9, 0), Some(debt(3, 50)));
+        assert_eq!(table.peek(9, 0), None);
+    }
+
     proptest::proptest! {
         /// Under any interleaving of inserts, repeats, and idle gaps the index
         /// stays consistent with the slots and the cap holds.

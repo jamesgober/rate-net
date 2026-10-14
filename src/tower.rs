@@ -775,7 +775,7 @@ mod tests {
 
     use http::{HeaderName, Request, Response, StatusCode};
     use tower::util::ServiceFn;
-    use tower::{Layer, ServiceExt, service_fn};
+    use tower::{Layer, Service, ServiceExt, service_fn};
 
     use super::{ForwardedFor, HeaderKey, KeyExtractor, PeerIp, RateLimitLayer, RequestInfo};
     use crate::{Key, RateLimiter};
@@ -856,7 +856,13 @@ mod tests {
             .with_cost(6)
             .with_impossible_status(StatusCode::PAYLOAD_TOO_LARGE);
         let mut service = layer.layer(echo());
-        let response = status(&mut service, from_peer([10, 0, 0, 1])).await;
+        let future = service
+            .ready()
+            .await
+            .unwrap()
+            .call(from_peer([10, 0, 0, 1]));
+        assert!(format!("{future:?}").contains("limited"));
+        let response = future.await.unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(response.headers().get("retry-after").is_none());
     }
@@ -881,6 +887,32 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn test_inner_errors_pass_through_and_services_clone() {
+        let layer = RateLimitLayer::new(RateLimiter::per_minute(5), PeerIp::default());
+        assert_eq!(layer.limiter().quota().limit(), 5);
+        let failing = service_fn(|_: Request<String>| async {
+            Err::<Response<String>, std::io::Error>(std::io::Error::other("down"))
+        });
+        let mut service = layer.layer(failing);
+        let mut clone = service.clone();
+        let error = clone
+            .ready()
+            .await
+            .unwrap()
+            .call(from_peer([10, 0, 0, 1]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "down");
+        let future = service
+            .ready()
+            .await
+            .unwrap()
+            .call(from_peer([10, 0, 0, 1]));
+        assert!(format!("{future:?}").contains("admitted"));
+        assert!(future.await.is_err());
     }
 
     #[test]

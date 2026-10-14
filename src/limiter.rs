@@ -1212,6 +1212,18 @@ mod tests {
         assert!(!admit(limiter));
     }
 
+    #[cfg(feature = "algorithms")]
+    #[test]
+    fn test_with_algorithm_keeps_the_key_options() {
+        let limiter = RateLimiter::builder()
+            .per_second(10)
+            .max_key_len(3)
+            .build()
+            .with_algorithm(Algorithm::FixedWindow);
+        assert!(limiter.check("abcd").is_impossible());
+        assert!(limiter.check("abc").is_allow());
+    }
+
     #[test]
     fn test_debug_does_not_leak_keys() {
         let (_clock, limiter) = manual();
