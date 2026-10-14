@@ -880,21 +880,27 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// per-key state if this is the first time the key is seen.
     #[inline]
     pub(crate) fn check_ref(&self, key: KeyRef<'_>, n: u32) -> Decision {
-        let now = self.now();
         if !self.options.limits_length() {
-            return self.store.check(key, n, now, || self.quota_of(key));
+            return self
+                .store
+                .check(key, n, || self.now(), || self.quota_of(key));
         }
-        self.check_with_policy(key, n, now)
+        self.check_with_policy(key, n)
     }
 
     /// The check path under a key-length policy: refuse an over-long key, or
     /// look a long one up by its digest.
-    fn check_with_policy(&self, key: KeyRef<'_>, n: u32, now: Duration) -> Decision {
+    fn check_with_policy(&self, key: KeyRef<'_>, n: u32) -> Decision {
         match self.admit(key) {
-            Admitted::AsIs(key) => self.store.check(key, n, now, || self.quota_of(key)),
-            Admitted::Digest(digest) => self
+            Admitted::AsIs(key) => self
                 .store
-                .check(KeyRef::digest(&digest), n, now, || self.quota_of(key)),
+                .check(key, n, || self.now(), || self.quota_of(key)),
+            Admitted::Digest(digest) => self.store.check(
+                KeyRef::digest(&digest),
+                n,
+                || self.now(),
+                || self.quota_of(key),
+            ),
             Admitted::TooLong => {
                 #[cfg(feature = "metrics")]
                 {

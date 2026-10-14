@@ -167,14 +167,20 @@ impl<S: KeyState> Slot<S> {
         }
     }
 
-    /// Marks the entry used. Both marks are written only when they change, so a
-    /// hot key's cache line is not dirtied on every check.
+    /// Marks the entry used for CLOCK. Written only when it changes, so a hot
+    /// key's cache line is not dirtied on every check.
     #[inline]
-    fn touch(&self, now_ms: u64, track_idle: bool) {
+    fn touch(&self) {
         if !self.referenced.load(Ordering::Relaxed) {
             self.referenced.store(true, Ordering::Relaxed);
         }
-        if track_idle && self.last_seen_ms.load(Ordering::Relaxed) < now_ms {
+    }
+
+    /// Records a check at `now_ms` for the idle TTL, only when it moves the
+    /// stamp forward.
+    #[inline]
+    fn touch_idle(&self, now_ms: u64) {
+        if self.last_seen_ms.load(Ordering::Relaxed) < now_ms {
             self.last_seen_ms.store(now_ms, Ordering::Relaxed);
         }
     }
@@ -684,22 +690,26 @@ impl<S: KeyState> Store<S> {
         }
     }
 
-    /// Checks `n` units against `key` as of elapsed time `now`, creating the
-    /// key's state with `make_state` if this is the first time the key is seen.
-    /// A key whose `make_state` gives `None` (a quota that admits nothing) is
-    /// denied and never stored.
+    /// Checks `n` units against `key` as of the elapsed time `clock()`,
+    /// creating the key's state with `make_state` if this is the first time the
+    /// key is seen. A key whose `make_state` gives `None` (a quota that admits
+    /// nothing) is denied and never stored.
+    ///
+    /// The clock is read only once the key's state is in hand, immediately
+    /// before its accounting: the shorter the gap between reading the time and
+    /// the compare-and-swap that acts on it, the less often a contended CAS
+    /// fails and retries.
     #[inline]
     pub(crate) fn check(
         &self,
         key: KeyRef<'_>,
         n: u32,
-        now: Duration,
-        make_state: impl FnOnce() -> Option<S>,
+        clock: impl Fn() -> Duration,
+        make_state: impl FnOnce(Duration) -> Option<S>,
     ) -> Decision {
         let hash = self.hasher.hash_one(key);
         let shard = self.shard(hash);
         let track_idle = self.idle_ttl_ms.is_some();
-        let now_ms = if track_idle { millis(now) } else { 0 };
 
         // Fast path: a shared read lock is enough for an existing key. The
         // algorithm does its own accounting, so concurrent checks — of this key
@@ -707,20 +717,28 @@ impl<S: KeyState> Store<S> {
         {
             let map = sync::read(&shard.map);
             if let Some(slot) = map.get(hash, key) {
-                slot.touch(now_ms, track_idle);
+                slot.touch();
+                let now = clock();
+                if track_idle {
+                    slot.touch_idle(millis(now));
+                }
                 return shard.on_decision(slot.state.acquire(n, now));
             }
         }
 
         // Slow path: first-seen key. Take the write lock, re-check (another
         // thread may have inserted it in the gap), make room, insert.
-        let now_ms = millis(now);
         let mut map = sync::write(&shard.map);
+        let now = clock();
+        let now_ms = millis(now);
         if let Some(slot) = map.get(hash, key) {
-            slot.touch(now_ms, track_idle);
+            if track_idle {
+                slot.touch_idle(now_ms);
+            }
+            slot.touch();
             return shard.on_decision(slot.state.acquire(n, now));
         }
-        let Some(state) = make_state() else {
+        let Some(state) = make_state(now) else {
             return shard.on_decision(closed(n));
         };
         self.make_room(shard, &mut map, now, now_ms);
@@ -987,10 +1005,10 @@ impl Keyed {
         &self,
         key: KeyRef<'_>,
         n: u32,
-        now: Duration,
+        clock: impl Fn() -> Duration,
         quota: impl FnOnce() -> Quota,
     ) -> Decision {
-        keyed!(self, store: State => store.check(key, n, now, || State::create(&quota(), now)))
+        keyed!(self, store: State => store.check(key, n, clock, |now| State::create(&quota(), now)))
     }
 
     /// See [`Store::peek`].
@@ -1094,9 +1112,12 @@ mod tests {
     ) -> bool {
         let key = key.into();
         store
-            .check(key.as_key_ref(), n, at(ms), || {
-                BucketCore::create(&quota, at(ms))
-            })
+            .check(
+                key.as_key_ref(),
+                n,
+                || at(ms),
+                |now| BucketCore::create(&quota, now),
+            )
             .is_allow()
     }
 
@@ -1164,7 +1185,12 @@ mod tests {
         let long = "an-api-token-much-longer-than-the-inline-capacity";
         assert!(check(&store, long, 3, 0, Quota::per_second(3)));
         // A borrowed lookup by the same bytes finds the stored key.
-        let decision = store.check(crate::key::KeyRef::raw(long.as_bytes()), 1, at(0), || None);
+        let decision = store.check(
+            crate::key::KeyRef::raw(long.as_bytes()),
+            1,
+            || at(0),
+            |_| None,
+        );
         assert!(decision.is_deny());
         assert_eq!(store.len(), 1);
     }
@@ -1256,9 +1282,12 @@ mod tests {
         let store = make_store(1, Eviction::new(1_000, Duration::from_secs(1)));
         let quota = Quota::per_second(1_000);
         let key = Key::from("k");
-        let _ = store.check(key.as_key_ref(), 1_000, Duration::from_micros(999), || {
-            BucketCore::create(&quota, Duration::from_micros(999))
-        });
+        let _ = store.check(
+            key.as_key_ref(),
+            1_000,
+            || Duration::from_micros(999),
+            |now| BucketCore::create(&quota, now),
+        );
         let _ = check(&store, "other", 1, 1_000, quota);
         assert!(tracked(&store, key.clone()), "reclaimed early");
         // Once truly idle for longer than the TTL, it goes.
