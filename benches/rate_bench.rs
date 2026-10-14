@@ -9,7 +9,12 @@
 //! - `check/many_keys` — distinct keys spread across shards, the realistic
 //!   server workload.
 //! - `check/contended_single_key_4t` — four threads hammering one key, the
-//!   worst case for per-key contention.
+//!   worst case for per-key contention. Reported as **per-check latency** —
+//!   each thread's own time per check, averaged over the threads — not as
+//!   aggregate throughput.
+//! - `check/long_key`, `check/long_key_bytes` — a 36-byte UUID key through
+//!   `check` (which builds an owned key, allocating for anything over 22
+//!   bytes) and through `check_bytes` (which borrows it).
 //! - `check/eviction_sweep` — first-seeing a new key while a small shard is at
 //!   capacity, so every call inserts and evicts.
 //! - `check/insert_at_default_cap` — the same at the realistic scale: the
@@ -22,7 +27,7 @@
 //! Run with `cargo bench --bench rate_bench`.
 
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -74,29 +79,50 @@ fn bench_many_keys(c: &mut Criterion) {
 }
 
 fn bench_contended_single_key(c: &mut Criterion) {
-    const THREADS: u64 = 4;
+    const THREADS: u32 = 4;
     let limiter = Arc::new(permissive());
     let _ = limiter.check("hot"); // warm
 
     let _ = c.bench_function("check/contended_single_key_4t", |b| {
         b.iter_custom(|iters| {
-            let per_thread = iters / THREADS;
-            let start = Instant::now();
+            // Every thread runs `iters` checks, timing only its own loop (after
+            // a barrier, so spawning is not measured). Criterion divides the
+            // returned time by `iters`, so returning the threads' mean loop
+            // time reports the latency of one check under 4-way contention.
+            let barrier = Arc::new(Barrier::new(THREADS as usize));
             let handles: Vec<_> = (0..THREADS)
                 .map(|_| {
                     let limiter = Arc::clone(&limiter);
+                    let barrier = Arc::clone(&barrier);
                     thread::spawn(move || {
-                        for _ in 0..per_thread {
+                        let _leader = barrier.wait();
+                        let start = Instant::now();
+                        for _ in 0..iters {
                             let _ = limiter.check(black_box("hot"));
                         }
+                        start.elapsed()
                     })
                 })
                 .collect();
-            for handle in handles {
-                let _ = handle.join();
-            }
-            start.elapsed()
+            let total: Duration = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .sum();
+            total / THREADS
         });
+    });
+}
+
+fn bench_long_key(c: &mut Criterion) {
+    let limiter = permissive();
+    let key = "9f6c1d2e-8b7a-4c3d-9e1f-0a2b3c4d5e6f";
+    let _ = limiter.check(key);
+
+    let _ = c.bench_function("check/long_key", |b| {
+        b.iter(|| limiter.check(black_box(key)));
+    });
+    let _ = c.bench_function("check/long_key_bytes", |b| {
+        b.iter(|| limiter.check_bytes(black_box(key)));
     });
 }
 
@@ -165,6 +191,7 @@ criterion_group!(
     bench_single_key_coarse_clock,
     bench_many_keys,
     bench_contended_single_key,
+    bench_long_key,
     bench_eviction_sweep,
     bench_insert_at_default_cap,
     bench_direct,

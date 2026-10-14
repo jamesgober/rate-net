@@ -236,6 +236,11 @@ required-features = ["std"]
 name    = "comparison"
 harness = false
 
+[[bench]]
+name              = "flood"
+harness           = false
+required-features = ["std"]
+
 
 
 # RELEASE PROFILE
