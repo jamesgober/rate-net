@@ -879,7 +879,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// policy, and hand the borrowed key to the store, which seeds fresh
     /// per-key state if this is the first time the key is seen.
     #[inline]
-    fn check_ref(&self, key: KeyRef<'_>, n: u32) -> Decision {
+    pub(crate) fn check_ref(&self, key: KeyRef<'_>, n: u32) -> Decision {
         let now = self.now();
         if !self.options.limits_length() {
             return self.store.check(key, n, now, || self.quota_of(key));
