@@ -30,9 +30,17 @@ const LIMIT: u32 = 100;
 const RUN: Duration = Duration::from_millis(300);
 /// Thread counts exercised for each algorithm.
 const THREADS: [usize; 3] = [2, 4, 8];
+/// The fewest checks each worker makes, however long that takes. With at
+/// least `LIMIT` checks in total, every algorithm must admit at least `LIMIT`
+/// (each starts with a full allowance, and nothing but an admission spends
+/// it), so the run is never vacuous even when a loaded host starves the
+/// workers for the whole of [`RUN`].
+const MIN_CHECKS: u64 = LIMIT as u64;
 
-/// Hammers one key from `threads` threads for [`RUN`], returning the units
-/// admitted and the time elapsed since just before the limiter was built.
+/// Hammers one key from `threads` threads for at least [`RUN`] and at least
+/// [`MIN_CHECKS`] checks per thread, returning the units admitted and the time
+/// elapsed since just before the limiter was built. The ceilings are computed
+/// from that measured elapsed time, so a longer run never loosens them.
 fn hammer(algorithm: Algorithm, threads: usize) -> (u64, Duration) {
     let start = Instant::now();
     let limiter = Arc::new(
@@ -48,11 +56,12 @@ fn hammer(algorithm: Algorithm, threads: usize) -> (u64, Duration) {
             let limiter = Arc::clone(&limiter);
             let admitted = Arc::clone(&admitted);
             thread::spawn(move || {
-                let mut local = 0u64;
-                while start.elapsed() < RUN {
+                let (mut local, mut checks) = (0u64, 0u64);
+                while checks < MIN_CHECKS || start.elapsed() < RUN {
                     if limiter.check("hot").is_allow() {
                         local += 1;
                     }
+                    checks += 1;
                 }
                 let _total = admitted.fetch_add(local, Ordering::Relaxed);
             })
@@ -86,7 +95,8 @@ fn assert_bounded(algorithm: Algorithm, ceiling: impl Fn(Duration) -> u64) {
             "{algorithm:?} with {threads} threads admitted {admitted} in {elapsed:?}; \
              the quota allows at most {bound}"
         );
-        // The run did real work: the key was admitted well past one burst.
+        // The run did real work: at least a full allowance was admitted. Every
+        // worker made at least MIN_CHECKS checks, so this holds on any host.
         assert!(
             admitted >= u64::from(LIMIT),
             "{algorithm:?} with {threads} threads admitted only {admitted}"
