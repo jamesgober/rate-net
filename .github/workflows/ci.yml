@@ -84,7 +84,8 @@ jobs:
       # Miri makes weak compare-and-swap fail spuriously, which native x86 runs
       # never do; it is what exercises the CAS retry paths.
       - name: Miri
-        run: cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
+        run: |
+          cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
         env:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"
