@@ -209,7 +209,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
     doctest,
     feature = "algorithms",
     feature = "async",
-    feature = "metrics"
+    feature = "metrics",
+    feature = "tower"
 ))]
 #[doc = include_str!("../README.md")]
 mod readme_doctests {}
@@ -218,7 +219,8 @@ mod readme_doctests {}
     doctest,
     feature = "algorithms",
     feature = "async",
-    feature = "metrics"
+    feature = "metrics",
+    feature = "tower"
 ))]
 #[doc = include_str!("../docs/API.md")]
 mod api_doctests {}
