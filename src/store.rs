@@ -454,10 +454,12 @@ impl<S: KeyState> ShardMap<S> {
     }
 
     /// Evicts the slot at `pos`, first recording its debt if it has not
-    /// recovered, so eviction never resets a limit.
+    /// recovered, so eviction never resets a limit. `recovered` says the caller
+    /// has already seen that it has (so there is no debt to compute).
     fn evict_at(
         &mut self,
         pos: usize,
+        recovered: bool,
         now: Duration,
         now_ms: u64,
         records: usize,
@@ -466,6 +468,9 @@ impl<S: KeyState> ShardMap<S> {
         let Some(slot) = self.remove_at(pos) else {
             return;
         };
+        if recovered {
+            return;
+        }
         if let Some(debt) = slot.state.debt(now) {
             out.remembered += 1;
             if self.recovery.remember(slot.hash, debt, now_ms, records) {
@@ -498,7 +503,7 @@ impl<S: KeyState> ShardMap<S> {
                 .is_some_and(|slot| slot.is_expired(now_ms, Some(ttl_ms)));
             if expired {
                 // The swap moved an unexamined slot here; look at it next.
-                self.evict_at(self.sweep, now, now_ms, records, out);
+                self.evict_at(self.sweep, false, now, now_ms, records, out);
                 out.expired += 1;
             } else {
                 self.sweep += 1;
@@ -542,7 +547,7 @@ impl<S: KeyState> ShardMap<S> {
         }
         let under_hand = if self.hand >= len { 0 } else { self.hand };
         let pos = recovered.or(unreferenced).unwrap_or(under_hand);
-        self.evict_at(pos, now, now_ms, records, out);
+        self.evict_at(pos, recovered.is_some(), now, now_ms, records, out);
         out.evicted += 1;
         // The swap moved the newest slot into `pos`; step past it so a key
         // that just arrived gets a full revolution before the hand returns.

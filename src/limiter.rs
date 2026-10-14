@@ -981,9 +981,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
             .unwrap_or(self.quota)
     }
 
-    /// Monotonic elapsed time since this limiter's epoch, for the window
-    /// algorithms and eviction timestamps. Saturating, so a multi-million-year
-    /// uptime cannot wrap it.
+    /// Monotonic elapsed time since this limiter's epoch, the time every
+    /// algorithm and the eviction stamps run on. Saturating, so a
+    /// multi-million-year uptime cannot wrap it.
+    #[inline]
     fn now(&self) -> Duration {
         self.clock.now().saturating_duration_since(self.epoch)
     }

@@ -134,6 +134,12 @@ impl KeyState for BucketCore {
         self.reset_at(now);
     }
 
+    /// Recovered means every token is back: one read of the balance, without
+    /// computing the refill time `peek` also reports.
+    fn is_full(&self, now: Duration) -> bool {
+        self.available_at(now) >= self.capacity()
+    }
+
     fn owed(&self, debt: Debt, now: Duration) -> u32 {
         let config = self.config();
         owed_units(debt, now, config.refill_amount(), config.refill_period())
