@@ -161,7 +161,7 @@ jobs:
       # checks, too slow under miri; they run natively in every test job).
       - name: Miri
         run: |
-          cargo miri test --locked --lib --all-features -- algo:: gcra:: metrics:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear store::tests::test_recovery store::tests::test_an_overloaded_recovery_table store::tests::test_newcomers_are_charged
+          cargo miri test --locked --lib --all-features -- algo:: gcra:: metrics:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear store::tests::test_recovery store::tests::test_an_overloaded_recovery_table store::tests::test_newcomers_are_charged store::tests::test_a_spent_count store::tests::test_an_idle_expired
         env:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"
