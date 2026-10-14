@@ -3,7 +3,6 @@
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 
 /// Keys up to this many bytes are stored inline, with no heap allocation. It
 /// covers the common identities — an IPv6 address (16 bytes), an IPv6 prefix
@@ -40,9 +39,8 @@ enum Repr {
         len: u8,
         buf: [u8; INLINE_CAP],
     },
-    /// Bytes too long to inline, on the heap. Shared, so cloning a long key
-    /// (passing `&key` to a check, retrying in a wait loop) never allocates.
-    Heap { kind: Kind, bytes: Arc<[u8]> },
+    /// Bytes too long to inline, on the heap.
+    Heap { kind: Kind, bytes: Box<[u8]> },
 }
 
 /// An opaque identity a rate limit is tracked against.
@@ -118,7 +116,7 @@ impl Key {
         } else {
             Self(Repr::Heap {
                 kind,
-                bytes: Arc::from(bytes),
+                bytes: Box::from(bytes),
             })
         }
     }
@@ -129,6 +127,19 @@ impl Key {
     #[cfg(feature = "tower")]
     pub(crate) fn anonymous() -> Self {
         Self::with_kind(Kind::Digest, &[])
+    }
+
+    /// Builds a raw key from owned bytes, reusing the allocation when they are
+    /// too long to inline.
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        if bytes.len() <= INLINE_CAP {
+            Self::with_kind(Kind::Raw, &bytes)
+        } else {
+            Self(Repr::Heap {
+                kind: Kind::Raw,
+                bytes: bytes.into_boxed_slice(),
+            })
+        }
     }
 
     /// The borrowed view the store looks keys up by.
@@ -445,7 +456,7 @@ impl From<&str> for Key {
 
 impl From<String> for Key {
     fn from(value: String) -> Self {
-        Self::with_kind(Kind::Raw, value.as_bytes())
+        Self::from_vec(value.into_bytes())
     }
 }
 
@@ -463,7 +474,7 @@ impl From<&[u8]> for Key {
 
 impl From<Vec<u8>> for Key {
     fn from(value: Vec<u8>) -> Self {
-        Self::with_kind(Kind::Raw, &value)
+        Self::from_vec(value)
     }
 }
 
@@ -754,13 +765,6 @@ mod tests {
         assert_eq!(hash(&KeyRef::raw(long.as_bytes())), hash(&Key::from(long)));
         let digest = [1u8; 16];
         assert_ne!(KeyRef::digest(&digest).to_key(), Key::from(digest));
-    }
-
-    #[test]
-    fn test_cloning_a_long_key_shares_its_bytes() {
-        let long = Key::from("a-key-long-enough-to-live-on-the-heap");
-        let copy = long.clone();
-        assert_eq!(long.as_bytes().as_ptr(), copy.as_bytes().as_ptr());
     }
 
     #[test]
