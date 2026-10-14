@@ -63,14 +63,15 @@ path = "src/lib.rs"
 # LINTS
 # #################################
 # `loom` and `comparison` are build-time cfgs toggled via `RUSTFLAGS="--cfg ..."`
-# (the concurrency model check and the `governor` comparison bench); `docsrs` is
-# set by docs.rs. Registering them keeps `unexpected_cfgs` quiet under
-# `-D warnings`.
+# (the concurrency model check and the `governor` comparison bench); `docsrs`
+# is set by docs.rs and `fuzzing` by cargo-fuzz. Registering them keeps
+# `unexpected_cfgs` quiet under `-D warnings`.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(loom)',
     'cfg(comparison)',
     'cfg(docsrs)',
+    'cfg(fuzzing)',
 ] }
 
 
