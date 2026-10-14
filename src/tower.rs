@@ -69,8 +69,9 @@ use http::{Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri};
 use tower_layer::Layer;
 use tower_service::Service;
 
-use crate::key::Key;
+use crate::key::{Digester, Key, KeyRef};
 use crate::limiter::RateLimiter;
+use crate::quota::Quota;
 use crate::snapshot::Snapshot;
 
 /// The parts of a request a [`KeyExtractor`] may look at, borrowed — the
@@ -269,9 +270,18 @@ impl KeyExtractor for PeerIp {
 /// to their left is whatever the client sent — trivially forged. With
 /// `trusted_proxies` proxies in front of the service, the client is the entry
 /// that many places from the right: that is the address taken. A header with
-/// fewer entries (a request that bypassed a proxy, or a misconfiguration) or an
-/// unparseable entry yields no key, and the request is charged to the shared
-/// anonymous key — never to an address the client chose.
+/// fewer entries or an unparseable one yields no key (see
+/// [`Anonymous`]).
+///
+/// **The header is only as trustworthy as the path to the service.** A client
+/// that can reach the service *directly*, bypassing the proxies, writes the
+/// whole header itself and can choose its key. So either make the service
+/// unreachable except through the proxies, or name them with
+/// [`only_from`](Self::only_from): the header is then used only when the
+/// connection's peer address (from the request extensions, as for
+/// [`PeerIp`]) is one of those networks, and any other request is keyed by
+/// its peer address — so a direct client is limited as itself, whatever it
+/// writes in the header.
 ///
 /// With `trusted_proxies == 0` the header is ignored and the peer address is
 /// used, as [`PeerIp`].
@@ -291,11 +301,28 @@ impl KeyExtractor for PeerIp {
 /// let key = ForwardedFor::trusting(1).extract(&RequestInfo::of(&request));
 /// let client: IpAddr = "203.0.113.7".parse().unwrap();
 /// assert_eq!(key, Some(Key::ip_prefix(client, 32, 64)));
+///
+/// // Verified: only a peer inside 10.0.0.0/8 may speak for the client.
+/// let verified = ForwardedFor::trusting(1).only_from("10.0.0.0".parse().unwrap(), 8);
+/// let mut direct = http::Request::get("/")
+///     .header("x-forwarded-for", "198.51.100.1")
+///     .body(())
+///     .unwrap();
+/// let attacker: IpAddr = "192.0.2.66".parse().unwrap();
+/// direct.extensions_mut().insert(attacker);
+/// // A direct client is keyed by its own address, not the one it wrote.
+/// assert_eq!(
+///     verified.extract(&RequestInfo::of(&direct)),
+///     Some(Key::ip_prefix(attacker, 32, 64))
+/// );
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardedFor {
     trusted_proxies: usize,
     prefixes: Prefixes,
+    /// Networks the connection's peer must belong to for the header to be
+    /// believed; empty means "every peer is a proxy".
+    proxies: Vec<(IpAddr, u8)>,
 }
 
 impl ForwardedFor {
@@ -305,7 +332,28 @@ impl ForwardedFor {
         Self {
             trusted_proxies,
             prefixes: Prefixes::DEFAULT,
+            proxies: Vec::new(),
         }
+    }
+
+    /// Believes the header only from a connection whose peer address is in
+    /// the network `addr / prefix_len` (repeat for several networks); any
+    /// other request is keyed by its peer address. See the type docs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::tower::ForwardedFor;
+    ///
+    /// let extractor = ForwardedFor::trusting(1)
+    ///     .only_from("10.0.0.0".parse().unwrap(), 8)
+    ///     .only_from("fd00::".parse().unwrap(), 8);
+    /// # let _ = extractor;
+    /// ```
+    #[must_use]
+    pub fn only_from(mut self, addr: IpAddr, prefix_len: u8) -> Self {
+        self.proxies.push((addr, prefix_len));
+        self
     }
 
     /// Keys IPv4 clients by their first `v4` bits and IPv6 clients by their
@@ -317,10 +365,48 @@ impl ForwardedFor {
     }
 }
 
+/// Whether `addr` is in the network `net / len` (IPv4-mapped addresses
+/// compare as IPv4).
+fn in_network(addr: IpAddr, net: IpAddr, len: u8) -> bool {
+    match (canonical(addr), canonical(net)) {
+        (IpAddr::V4(a), IpAddr::V4(n)) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(len.min(32)))
+                .unwrap_or(0);
+            u32::from(a) & mask == u32::from(n) & mask
+        }
+        (IpAddr::V6(a), IpAddr::V6(n)) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(len.min(128)))
+                .unwrap_or(0);
+            u128::from(a) & mask == u128::from(n) & mask
+        }
+        _ => false,
+    }
+}
+
+/// `addr` with an IPv4-mapped IPv6 address unwrapped.
+fn canonical(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
+        IpAddr::V4(_) => addr,
+    }
+}
+
 impl KeyExtractor for ForwardedFor {
     fn extract(&self, request: &RequestInfo<'_>) -> Option<Key> {
         if self.trusted_proxies == 0 {
             return peer_addr(request.extensions).map(|addr| self.prefixes.key(addr));
+        }
+        if !self.proxies.is_empty() {
+            let peer = peer_addr(request.extensions)?;
+            let from_proxy = self
+                .proxies
+                .iter()
+                .any(|&(net, len)| in_network(peer, net, len));
+            if !from_proxy {
+                return Some(self.prefixes.key(peer));
+            }
         }
         // Every entry across every `X-Forwarded-For` line, in order.
         let mut hops = request
@@ -336,18 +422,35 @@ impl KeyExtractor for ForwardedFor {
 }
 
 /// An address from an `X-Forwarded-For` entry: a bare IPv4 or IPv6 address,
-/// or one with a port (`a.b.c.d:port`, `[v6]:port`).
+/// one with a port (`a.b.c.d:port`, `[v6]:port`), a bracketed IPv6 address
+/// (`[v6]`), or an IPv6 address with a zone (`fe80::1%eth0`, the zone
+/// dropped).
 fn parse_addr(text: &str) -> Option<IpAddr> {
-    text.parse::<IpAddr>()
-        .ok()
-        .or_else(|| text.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+    if let Ok(addr) = text.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    if let Ok(addr) = text.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+    let unbracketed = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(text);
+    let without_zone = unbracketed.split('%').next().unwrap_or(unbracketed);
+    without_zone.parse::<IpAddr>().ok()
 }
 
 /// Keys a request by the value of one header — an API key, a tenant id, a
-/// session token. The raw value bytes are the key, so use it with
-/// [`Builder::digest_keys_longer_than`](crate::Builder::digest_keys_longer_than)
-/// or [`Builder::max_key_len`](crate::Builder::max_key_len) when the header
-/// comes from untrusted clients. A request without the header has no key.
+/// session token. A request without the header has no key.
+///
+/// Header values are chosen by the client and can be kilobytes long, so a
+/// value longer than 64 bytes (configurable with
+/// [`with_digest_over`](Self::with_digest_over)) is keyed by a 16-byte keyed
+/// digest of it instead of its bytes: the bytes a key holds are bounded
+/// whatever clients send. Shorter values are the key as they are. The digest
+/// is two independently, randomly seeded 64-bit hashes (fresh per
+/// extractor): a client cannot aim a value at another's key, but it is not a
+/// cryptographic hash.
 ///
 /// # Examples
 ///
@@ -363,26 +466,76 @@ fn parse_addr(text: &str) -> Option<IpAddr> {
 ///     .extract(&RequestInfo::of(&request));
 /// assert_eq!(key, Some(Key::from("k-123")));
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HeaderKey {
     name: HeaderName,
+    digest_over: usize,
+    digester: Digester,
 }
 
 impl HeaderKey {
-    /// Keys requests by the first value of the header `name`.
+    /// Keys requests by the first value of the header `name`, digesting
+    /// values longer than 64 bytes.
     #[must_use]
-    pub const fn new(name: HeaderName) -> Self {
-        Self { name }
+    pub fn new(name: HeaderName) -> Self {
+        Self {
+            name,
+            digest_over: 64,
+            digester: Digester::new(),
+        }
+    }
+
+    /// Digests values longer than `len` bytes instead of 64.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::tower::{HeaderKey, KeyExtractor, RequestInfo};
+    ///
+    /// let request = http::Request::get("/")
+    ///     .header("x-api-key", "a".repeat(40))
+    ///     .body(())
+    ///     .unwrap();
+    /// let short = HeaderKey::new(http::HeaderName::from_static("x-api-key")).with_digest_over(16);
+    /// let key = short.extract(&RequestInfo::of(&request)).unwrap();
+    /// assert_eq!(key.len(), 16); // digested
+    /// ```
+    #[must_use]
+    pub const fn with_digest_over(mut self, len: usize) -> Self {
+        self.digest_over = len;
+        self
     }
 }
 
 impl KeyExtractor for HeaderKey {
     fn extract(&self, request: &RequestInfo<'_>) -> Option<Key> {
-        request
-            .headers
-            .get(&self.name)
-            .map(|value| Key::from(value.as_bytes()))
+        let value = request.headers.get(&self.name)?.as_bytes();
+        Some(if value.len() > self.digest_over {
+            self.digester.digest_key(KeyRef::raw(value))
+        } else {
+            Key::from(value)
+        })
     }
+}
+
+/// What the layer does with a request whose extractor finds no identity —
+/// no peer address, no header, an unparseable `X-Forwarded-For`.
+///
+/// `#[non_exhaustive]`: more policies may be added.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anonymous {
+    /// Charge every such request to one shared anonymous key, which no
+    /// extracted key can equal (the default). Unidentifiable traffic is then
+    /// limited as a group — and, because the group shares one allowance,
+    /// clients that cannot be identified can exhaust it for each other.
+    Shared,
+    /// Charge such requests to this key instead, so it can be given its own
+    /// quota with [`Builder::quota_for`](crate::Builder::quota_for).
+    Key(Key),
+    /// Answer such requests with this status without charging anything or
+    /// calling the inner service.
+    Reject(StatusCode),
 }
 
 /// A [`Layer`] that rate-limits every request through a shared
@@ -401,6 +554,7 @@ struct Config<K> {
     policy: Option<String>,
     headers_on_success: bool,
     impossible_status: StatusCode,
+    anonymous: Anonymous,
 }
 
 impl<K: KeyExtractor> RateLimitLayer<K, SystemClock> {
@@ -446,11 +600,14 @@ impl<K: KeyExtractor, C: Clock + Clone> RateLimitLayer<K, C> {
                 policy: None,
                 headers_on_success: false,
                 impossible_status: StatusCode::TOO_MANY_REQUESTS,
+                anonymous: Anonymous::Shared,
             }),
         }
     }
 
-    /// Charges `cost` units per request instead of one.
+    /// Charges `cost` units per request instead of one. A cost of `0` is
+    /// treated as `1`: a zero-cost check always succeeds, so the layer would
+    /// not limit anything.
     ///
     /// # Examples
     ///
@@ -463,7 +620,26 @@ impl<K: KeyExtractor, C: Clock + Clone> RateLimitLayer<K, C> {
     /// ```
     #[must_use]
     pub fn with_cost(self, cost: u32) -> Self {
-        self.map_config(|config| config.cost = cost)
+        self.map_config(|config| config.cost = cost.max(1))
+    }
+
+    /// What to do with requests the extractor cannot identify; see
+    /// [`Anonymous`]. Defaults to [`Anonymous::Shared`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use http::StatusCode;
+    /// use rate_net::RateLimiter;
+    /// use rate_net::tower::{Anonymous, PeerIp, RateLimitLayer};
+    ///
+    /// let layer = RateLimitLayer::new(RateLimiter::per_second(10), PeerIp::default())
+    ///     .with_anonymous(Anonymous::Reject(StatusCode::BAD_REQUEST));
+    /// # let _ = layer;
+    /// ```
+    #[must_use]
+    pub fn with_anonymous(self, anonymous: Anonymous) -> Self {
+        self.map_config(|config| config.anonymous = anonymous)
     }
 
     /// Names the rate-limit policy, so responses also carry the structured
@@ -550,6 +726,7 @@ impl<K: Clone> Config<K> {
             policy: config.policy.clone(),
             headers_on_success: config.headers_on_success,
             impossible_status: config.impossible_status,
+            anonymous: config.anonymous.clone(),
         }
     }
 }
@@ -628,16 +805,25 @@ where
 
     fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
         let config = &*self.config;
-        let key = config
-            .extractor
-            .extract(&RequestInfo::of(&request))
-            .unwrap_or_else(Key::anonymous);
+        let key = match config.extractor.extract(&RequestInfo::of(&request)) {
+            Some(key) => key,
+            None => match &config.anonymous {
+                Anonymous::Shared => Key::anonymous(),
+                Anonymous::Key(key) => key.clone(),
+                Anonymous::Reject(status) => {
+                    let mut response = Response::new(ResBody::default());
+                    *response.status_mut() = *status;
+                    return ResponseFuture::limited(response);
+                }
+            },
+        };
         let decision = self.limiter.check_ref(key.as_key_ref(), config.cost);
         if decision.is_allow() {
             let headers = config.headers_on_success.then(|| {
                 let mut headers = HeaderMap::new();
                 let snapshot = self.limiter.peek_ref(key.as_key_ref());
-                write_headers(&mut headers, snapshot, &self.limiter, config);
+                let quota = self.limiter.quota_of_ref(key.as_key_ref());
+                write_headers(&mut headers, snapshot, quota, config);
                 headers
             });
             return ResponseFuture::inner(self.inner.call(request), headers);
@@ -652,18 +838,15 @@ where
             let _previous = response.headers_mut().insert(RETRY_AFTER, secs.into());
         }
         let snapshot = self.limiter.peek_ref(key.as_key_ref());
-        write_headers(response.headers_mut(), snapshot, &self.limiter, config);
+        let quota = self.limiter.quota_of_ref(key.as_key_ref());
+        write_headers(response.headers_mut(), snapshot, quota, config);
         ResponseFuture::limited(response)
     }
 }
 
-/// Writes the rate-limit headers for `snapshot` into `headers`.
-fn write_headers<K, C: Clock + Clone>(
-    headers: &mut HeaderMap,
-    snapshot: Snapshot,
-    limiter: &RateLimiter<C>,
-    config: &Config<K>,
-) {
+/// Writes the rate-limit headers for `snapshot` — a key under `quota` (its
+/// own, per-key override included) — into `headers`.
+fn write_headers<K>(headers: &mut HeaderMap, snapshot: Snapshot, quota: Quota, config: &Config<K>) {
     let [(_, limit), (_, remaining), (_, reset)] = snapshot.headers();
     for (name, value) in [
         ("ratelimit-limit", limit),
@@ -676,8 +859,8 @@ fn write_headers<K, C: Clock + Clone>(
         if let Ok(value) = HeaderValue::from_str(&snapshot.ratelimit(policy).to_string()) {
             let _previous = headers.insert(HeaderName::from_static("ratelimit"), value);
         }
-        let quota = limiter.quota().ratelimit_policy(policy).to_string();
-        if let Ok(value) = HeaderValue::from_str(&quota) {
+        let policy = quota.ratelimit_policy(policy).to_string();
+        if let Ok(value) = HeaderValue::from_str(&policy) {
             let _previous = headers.insert(HeaderName::from_static("ratelimit-policy"), value);
         }
     }
@@ -777,8 +960,10 @@ mod tests {
     use tower::util::ServiceFn;
     use tower::{Layer, Service, ServiceExt, service_fn};
 
+    use std::sync::Arc;
+
     use super::{ForwardedFor, HeaderKey, KeyExtractor, PeerIp, RateLimitLayer, RequestInfo};
-    use crate::{Key, RateLimiter};
+    use crate::{Key, Quota, RateLimiter};
 
     fn from_peer(ip: [u8; 4]) -> Request<String> {
         let mut request = Request::new(String::new());
@@ -977,6 +1162,174 @@ mod tests {
         );
         let by_path = |info: &RequestInfo<'_>| Some(Key::from(info.uri().path()));
         assert_eq!(by_path.extract(&info), Some(Key::from("/t/acme/x")));
+    }
+
+    #[test]
+    fn test_forwarded_for_verified_peers_stop_direct_forgery() {
+        // RN2-005: with `only_from`, a client reaching the service directly is
+        // keyed by its own address whatever it writes in the header.
+        let verified = ForwardedFor::trusting(1).only_from("10.0.0.0".parse().unwrap(), 8);
+        let mut keys = std::collections::HashSet::new();
+        for i in 0..1_000u32 {
+            let mut request = Request::get("/")
+                .header("x-forwarded-for", format!("172.16.{}.{}", i >> 8, i & 255))
+                .body(())
+                .unwrap();
+            let _previous = request
+                .extensions_mut()
+                .insert(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 66)));
+            let _new = keys.insert(verified.extract(&RequestInfo::of(&request)));
+        }
+        assert_eq!(keys.len(), 1, "a direct client chose its key");
+        // Through a proxy in the network, the proxy's report is used.
+        let mut proxied = Request::get("/")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(())
+            .unwrap();
+        let _previous = proxied
+            .extensions_mut()
+            .insert(SocketAddr::from(([10, 1, 2, 3], 443)));
+        assert_eq!(
+            verified.extract(&RequestInfo::of(&proxied)),
+            Some(Key::ip_prefix("203.0.113.7".parse().unwrap(), 32, 64))
+        );
+        // A mapped IPv6 peer matches its IPv4 network; no peer, no key.
+        let mut mapped = Request::get("/")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(())
+            .unwrap();
+        let _previous = mapped
+            .extensions_mut()
+            .insert(IpAddr::V6(Ipv4Addr::new(10, 9, 9, 9).to_ipv6_mapped()));
+        assert!(verified.extract(&RequestInfo::of(&mapped)).is_some());
+        let bare = Request::get("/")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(())
+            .unwrap();
+        assert_eq!(verified.extract(&RequestInfo::of(&bare)), None);
+        let v6 = ForwardedFor::trusting(1).only_from("fd00::".parse().unwrap(), 8);
+        let mut from_v6 = Request::get("/")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(())
+            .unwrap();
+        let _previous = from_v6
+            .extensions_mut()
+            .insert("fd12::1".parse::<IpAddr>().unwrap());
+        assert!(v6.extract(&RequestInfo::of(&from_v6)).is_some());
+        assert!(!super::in_network(
+            "1.2.3.4".parse().unwrap(),
+            "fd00::".parse().unwrap(),
+            8
+        ));
+    }
+
+    #[test]
+    fn test_forwarded_for_parses_bracketed_and_zoned_ipv6() {
+        for (entry, expect) in [
+            ("[2001:db8::1]", Some("2001:db8::1")),
+            ("fe80::1%eth0", Some("fe80::1")),
+            ("[fe80::1%25eth0]", Some("fe80::1")),
+            ("unknown", None),
+        ] {
+            assert_eq!(
+                super::parse_addr(entry),
+                expect.map(|text| text.parse::<IpAddr>().unwrap()),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_header_key_digests_long_values() {
+        // RN2-006: kilobyte header values do not become kilobyte keys.
+        let header = HeaderKey::new(HeaderName::from_static("x-api-key"));
+        let long = "A".repeat(8 * 1024);
+        let request = Request::get("/")
+            .header("x-api-key", &long)
+            .body(())
+            .unwrap();
+        let key = header.extract(&RequestInfo::of(&request)).unwrap();
+        assert_eq!(key.len(), 16);
+        assert_eq!(
+            header.extract(&RequestInfo::of(&request)),
+            Some(key.clone())
+        );
+        assert_ne!(key, Key::from(long.as_str()));
+        // Different long values, different keys; 64 bytes is still verbatim.
+        let other = Request::get("/")
+            .header("x-api-key", "B".repeat(8 * 1024))
+            .body(())
+            .unwrap();
+        assert_ne!(header.extract(&RequestInfo::of(&other)), Some(key));
+        let at_limit = "c".repeat(64);
+        let exact = Request::get("/")
+            .header("x-api-key", &at_limit)
+            .body(())
+            .unwrap();
+        assert_eq!(
+            header.extract(&RequestInfo::of(&exact)),
+            Some(Key::from(at_limit.as_str()))
+        );
+        assert!(format!("{header:?}").contains("HeaderKey"));
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_policies_and_zero_cost() {
+        use super::Anonymous;
+
+        // Reject: no charge, the configured status.
+        let layer = RateLimitLayer::new(RateLimiter::per_minute(1), PeerIp::default())
+            .with_anonymous(Anonymous::Reject(StatusCode::BAD_REQUEST));
+        let mut service = layer.layer(echo());
+        let response = status(&mut service, Request::new(String::new())).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("retry-after").is_none());
+        // Key: charged to a chosen key, which can have its own quota.
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .per_minute(1)
+                .quota_for(|key| (key.as_bytes() == b"anon").then(|| Quota::per_minute(3)))
+                .build(),
+        );
+        let layer = RateLimitLayer::shared(Arc::clone(&limiter), PeerIp::default())
+            .with_anonymous(Anonymous::Key(Key::from("anon")));
+        let mut service = layer.layer(echo());
+        for _ in 0..3 {
+            let response = status(&mut service, Request::new(String::new())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = status(&mut service, Request::new(String::new())).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // RN2-008: a zero cost still limits (it counts as one).
+        let layer = RateLimitLayer::new(RateLimiter::per_minute(1), PeerIp::default()).with_cost(0);
+        let mut service = layer.layer(echo());
+        let first = status(&mut service, from_peer([10, 0, 0, 1])).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = status(&mut service, from_peer([10, 0, 0, 1])).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_policy_header_reports_the_keys_own_override() {
+        // RN2-009: a key under a per-key quota is described by that quota.
+        let frozen = Arc::new(clock_lib::ManualClock::new());
+        let vip = Key::ip_prefix("10.0.0.9".parse().unwrap(), 32, 64);
+        let limiter = Arc::new(
+            RateLimiter::builder()
+                .per_minute(10)
+                .quota_for(move |key| (key == &vip).then(|| Quota::per_minute(100)))
+                .clock(frozen)
+                .build(),
+        );
+        let layer = RateLimitLayer::shared(limiter, PeerIp::default())
+            .with_policy("tier")
+            .with_headers_on_success(true);
+        let mut service = layer.layer(echo());
+        let vip = status(&mut service, from_peer([10, 0, 0, 9])).await;
+        assert_eq!(vip.headers()["ratelimit-limit"], "100");
+        assert_eq!(vip.headers()["ratelimit-policy"], r#""tier";q=100;w=60"#);
+        let free = status(&mut service, from_peer([10, 0, 0, 8])).await;
+        assert_eq!(free.headers()["ratelimit-policy"], r#""tier";q=10;w=60"#);
     }
 
     #[test]
