@@ -73,6 +73,14 @@ pub struct Metrics {
     /// the cap is too small for the number of keys being limited at once, or
     /// the limiter is under a flood. See [`Eviction`](crate::Eviction).
     pub debts_overflowed: u64,
+    /// Debts of still-limited evicted keys that were dropped because the exact
+    /// recovery table was full, under [`Overflow::Forget`](crate::Overflow)
+    /// (the default): such a key may come back with a fresh allowance. Not
+    /// counted within `keys_remembered`. A steady rate means more keys are
+    /// being limited at once than about twice the cap — raise the cap, or
+    /// choose [`Overflow::FailClosed`](crate::Overflow) if no key may ever be
+    /// reset.
+    pub debts_forgotten: u64,
     /// New keys refused because their shard was saturated: full, and every
     /// examined key still limited with nowhere to record its debt. The store
     /// failing closed; any non-zero rate means the cap is far too small for
@@ -96,6 +104,7 @@ pub(crate) struct Counters {
     remembered: AtomicU64,
     restored: AtomicU64,
     overflowed: AtomicU64,
+    forgotten: AtomicU64,
     refused: AtomicU64,
     rejected: AtomicU64,
 }
@@ -112,6 +121,7 @@ impl Counters {
             remembered: AtomicU64::new(0),
             restored: AtomicU64::new(0),
             overflowed: AtomicU64::new(0),
+            forgotten: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
@@ -165,6 +175,11 @@ impl Counters {
     }
 
     #[inline]
+    pub(crate) fn forgotten(&self) {
+        let _previous = self.forgotten.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub(crate) fn refused(&self) {
         let _previous = self.refused.fetch_add(1, Ordering::Relaxed);
     }
@@ -185,6 +200,7 @@ impl Counters {
         into.keys_remembered += self.remembered.load(Ordering::Relaxed);
         into.keys_restored += self.restored.load(Ordering::Relaxed);
         into.debts_overflowed += self.overflowed.load(Ordering::Relaxed);
+        into.debts_forgotten += self.forgotten.load(Ordering::Relaxed);
         into.keys_refused += self.refused.load(Ordering::Relaxed);
         into.keys_rejected += self.rejected.load(Ordering::Relaxed);
     }
@@ -208,6 +224,7 @@ mod tests {
         counters.remembered();
         counters.restored();
         counters.overflowed();
+        counters.forgotten();
         counters.refused();
         counters.rejected();
         let mut metrics = Metrics::default();
@@ -225,6 +242,7 @@ mod tests {
                 keys_remembered: 2,
                 keys_restored: 2,
                 debts_overflowed: 2,
+                debts_forgotten: 2,
                 keys_refused: 2,
                 keys_rejected: 2,
             }

@@ -7,7 +7,7 @@
 //! takes one shard read lock plus the algorithm's atomic accounting, so
 //! unrelated keys rarely contend, and memory is bounded by O(1) eviction, so a
 //! flood of unique keys hits a cap instead of growing without limit — and
-//! evicting a key never resets its limit.
+//! evicting a still-limited key keeps its debt instead of resetting it.
 //!
 //! rate-net does not reimplement token-bucket accounting. It consumes
 //! [`better-bucket`](https://crates.io/crates/better-bucket) (1.1 or newer) for
@@ -70,9 +70,12 @@
 //!   index, and capped shards are kept at 16,384 keys or fewer so it stays
 //!   short. A token-bucket key costs about 138 bytes at the default cap; key
 //!   bytes beyond 22 can be bounded with a maximum length or a digest.
-//! - **Eviction never resets a limit.** A key evicted before its allowance
+//! - **Eviction does not reset a limit.** A key evicted before its allowance
 //!   recovered has its debt recorded, and resumes no more permissive than it
-//!   left; under extreme pressure the store fails closed, never open. See
+//!   left — unconditionally while the still-limited evicted keys fit about
+//!   twice the cap. Past that, [`Overflow`] chooses: drop the debts that do
+//!   not fit (`Forget`, the default) or keep them all and fail closed for
+//!   some other keys (`FailClosed`, for identity-keyed limiters). See
 //!   [`Eviction`].
 //! - **Zero-allocation steady state.** A check on an existing key allocates
 //!   nothing: always through [`check_bytes`](RateLimiter::check_bytes), which
@@ -174,7 +177,7 @@ pub use crate::decision::Decision;
 pub use crate::direct::DirectLimiter;
 pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
-pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction, Overflow};
 #[cfg(target_has_atomic = "64")]
 pub use crate::gcra::Gcra;
 #[cfg(feature = "std")]

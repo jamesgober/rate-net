@@ -7,7 +7,11 @@
 //! per username, say) by flooding the limiter with throwaway keys.
 //!
 //! Every test here fails against `1.1.0` and passes now. They drive the public
-//! API only, with a frozen `ManualClock`, so nothing refills by itself.
+//! API only, with a frozen `ManualClock`, so nothing refills by itself. Floods
+//! far past the cap run under `Overflow::FailClosed`, which never resets a
+//! limit however large the flood; `Overflow::Forget` (the default) keeps the
+//! same guarantee while the evicted, still-limited keys fit the exact table
+//! (about twice the cap), which the `forget_` tests check.
 
 #![cfg(feature = "std")]
 
@@ -15,15 +19,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clock_lib::ManualClock;
-use rate_net::{Algorithm, Eviction, Quota, RateLimiter};
+use rate_net::{Algorithm, Eviction, Overflow, Quota, RateLimiter};
 
 fn limiter(algorithm: Algorithm, cap: usize) -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
+    limiter_with(
+        algorithm,
+        Eviction::capacity(cap).with_overflow(Overflow::FailClosed),
+    )
+}
+
+fn limiter_with(
+    algorithm: Algorithm,
+    eviction: Eviction,
+) -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
     let clock = Arc::new(ManualClock::new());
     let limiter = RateLimiter::builder()
         .algorithm(algorithm)
         .quota(5, Duration::from_secs(60))
         .shards(1)
-        .eviction(Eviction::capacity(cap))
+        .eviction(eviction)
         .clock(Arc::clone(&clock))
         .build();
     (clock, limiter)
@@ -133,6 +147,82 @@ fn test_idle_expiry_with_a_short_ttl_never_resets_a_limit() {
         let _ = limiter.check(key);
     }
     assert!(limiter.check("slow:victim").is_deny());
+}
+
+#[test]
+fn test_idle_expiry_of_a_key_that_spent_again_never_resets_its_limit() {
+    // RN3-001: the key is checked, then drained later; the eviction must judge
+    // it by its state now, not by when it was first stored. A 10/s default
+    // with a one-second idle TTL, and a 10/minute override for `pro`: one unit
+    // at 0 s (whole again at 6 s), nine more at 0.5 s (whole again at about
+    // 60 s), ten idle seconds, then enough inserts for the sweep to take it.
+    for algorithm in algorithms() {
+        for overflow in [Overflow::Forget, Overflow::FailClosed] {
+            let clock = Arc::new(ManualClock::new());
+            let limiter = RateLimiter::builder()
+                .algorithm(algorithm)
+                .per_second(10)
+                .quota_for(|key| (key.as_bytes() == b"pro").then(|| Quota::per_minute(10)))
+                .shards(1)
+                .eviction(Eviction::new(1_000, Duration::from_secs(1)).with_overflow(overflow))
+                .clock(Arc::clone(&clock))
+                .build();
+            assert!(limiter.check("pro").is_allow());
+            clock.advance(Duration::from_millis(500));
+            assert!(limiter.check_n("pro", 9).is_allow(), "{algorithm:?}");
+            clock.advance(Duration::from_secs(10));
+            for key in 0..64u64 {
+                let _ = limiter.check(key);
+            }
+            assert_eq!(
+                limiter.tracked_keys(),
+                64,
+                "{algorithm:?}: the sweep took it"
+            );
+            assert!(
+                limiter.check_n("pro", 10).is_deny(),
+                "{algorithm:?} / {overflow:?}: an idle-expired key came back with a fresh allowance"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_forget_never_resets_a_key_while_the_exact_table_holds_the_flood() {
+    // The default policy keeps every debt while the evicted, still-limited
+    // keys fit the exact table: a flood of 1.5x the cap resets nobody.
+    for algorithm in algorithms() {
+        let (_clock, limiter) = limiter_with(algorithm, Eviction::capacity(1_000));
+        assert!(limiter.check_n("victim", 5).is_allow());
+        for key in 0..1_500u64 {
+            let _ = limiter.check(key);
+        }
+        assert!(limiter.check_n("victim", 3).is_deny(), "{algorithm:?}");
+    }
+}
+
+#[test]
+fn test_forget_never_denies_a_newcomer_however_large_the_flood() {
+    // Past the bound the default drops debts instead of charging or refusing
+    // others: after a flood of 20x the cap, every never-seen key is admitted.
+    for algorithm in algorithms() {
+        let (_clock, limiter) = limiter_with(algorithm, Eviction::capacity(64));
+        for key in 0..1_280u64 {
+            let _ = limiter.check_n(key, 5);
+        }
+        for i in 0..200u64 {
+            assert!(
+                limiter.check_n(format!("newcomer-{i}"), 5).is_allow(),
+                "{algorithm:?}: newcomer {i} denied"
+            );
+        }
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = limiter.metrics();
+            assert!(metrics.debts_forgotten > 0, "{algorithm:?}");
+            assert_eq!((metrics.debts_overflowed, metrics.keys_refused), (0, 0));
+        }
+    }
 }
 
 /// A builder with a 5/s default quota and a 5/hour override for `slow:` keys,

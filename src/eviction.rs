@@ -7,8 +7,10 @@ use core::time::Duration;
 /// Roughly a million keys. Generous for legitimate traffic, but a hard ceiling
 /// so a flood of unique keys can never grow the store without limit. At this
 /// cap a default token-bucket limiter holds about 138 MiB of per-key state
-/// (measured: `tests/memory.rs`), plus up to 64 MiB of recovery records under
-/// eviction pressure, plus the bytes of any key longer than 22 bytes. Pick a
+/// (measured: `tests/memory.rs`), plus the recovery tables under eviction
+/// pressure — 32 MiB with the default [`Overflow::Forget`], 64 MiB with
+/// [`Overflow::FailClosed`] (about 170 or 202 MiB in all) — plus the bytes of
+/// any key longer than 22 bytes. Pick a
 /// value that matches your real key cardinality with [`Eviction::capacity`].
 pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 
@@ -38,7 +40,7 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// the shards (rounded up, at least one key per shard), so the live-key count
 /// stays at or below the cap plus one key per shard.
 ///
-/// # Eviction never resets a limit
+/// # Eviction does not reset a limit
 ///
 /// Evicting a key that is still being limited — one that has spent part of its
 /// allowance and not yet recovered it — must not hand it a fresh allowance when
@@ -55,37 +57,53 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 ///
 /// The debts live in a per-shard recovery table, allocated the first time a
 /// shard evicts an unrecovered key (`retain_recent` releases it once every
-/// debt has expired):
+/// debt has expired): an **exact** cuckoo-hashed table of 16-byte records, two
+/// per key of capacity, in which a key reads back only its own record. While
+/// a shard's still-limited evicted keys fit — about twice its share of the
+/// cap at once; what counts is the rate at which still-limited keys are
+/// evicted times their recovery time, not the size of the population — the
+/// guarantee is unconditional and costs nothing in liveness: no evicted key
+/// is reset, no key that never owed anything is charged, and nothing is
+/// refused. Idle-TTL expiry records debts the same way (a key with a
+/// per-key quota that recovers more slowly than the TTL is judged by its
+/// current state when it expires).
 ///
-/// - an **exact** cuckoo-hashed table of 16-byte records, two per key of
-///   capacity. A key reads back only its own record. While a shard's
-///   unrecovered evicted keys fit — about twice its share of the cap, live at
-///   once — eviction costs nothing in liveness: no key that never owed
-///   anything is charged, and nothing is refused;
-/// - beyond that, an **overflow sketch** of four 8-byte cells per key of
-///   capacity. A debt the exact table cannot place is written to two cells; a
-///   key being stored is charged the smaller of its two cells while both are
-///   live. That never undercharges a key whose own debt overflowed, but it can
-///   charge a key that never owed anything — it then starts partly or wholly
-///   drained (fail closed);
-/// - a key charged from the sketch is never written back into it when it is
-///   evicted again, so sketch charges cannot spread or ratchet. If its debt
-///   finds no place in the exact table either, the key is not evicted, and a
-///   full shard with nothing else to evict **refuses** the newcomer with a
-///   retry time instead of exceeding the cap or forgetting a debt.
+/// Past that bound the [`Overflow`] policy decides
+/// ([`with_overflow`](Self::with_overflow)):
+///
+/// - [`Overflow::Forget`] (the default) drops the debts that do not fit: those
+///   keys may come back with a fresh allowance, as every evicted key did in
+///   1.1, and no other key is ever affected. Under a sustained flood that
+///   evicts far more still-limited keys than the table holds, a targeted key
+///   can be reset repeatedly (`Metrics::debts_forgotten` counts the drops);
+/// - [`Overflow::FailClosed`] keeps every debt, spilling those the exact table
+///   cannot place into a shared **overflow sketch** of four 8-byte cells per
+///   key of capacity. A key being stored is charged the smaller of its two
+///   cells while both are live — never less than its own spilled debt — so a
+///   key that never owed anything can start partly or wholly drained. A key
+///   charged from the sketch never writes that charge back, so it cannot
+///   spread or ratchet, and a full shard that can neither evict nor record
+///   **refuses** the newcomer with a retry time. The sketch keeps 24 bits of a
+///   spent count; a larger count is charged as everything.
 ///
 /// Measured (`docs/BENCHMARKS.md`; 128 shards, cap 100,000 for the floods and
-/// 10,000 for the populations): newcomers after a flood of
+/// 10,000 for the populations): with `FailClosed`, newcomers after a flood of
 /// unique keys that each drain their quota are never denied up to a flood of
-/// 3x the cap (2x unrecovered evictions), about 3 % at 4x and 39 % at 6x; a
-/// population of well-behaved users three times the cap sees no false
-/// denials, ten times the cap 4 %. 1.1.0 denied none of them, because it
-/// forgot every debt — and so let any key's limit be reset by a flood. The
-/// table costs 64 bytes per key of capacity (64 MiB at the default cap; up
-/// to twice that when a shard's share of the cap is just past a power of two);
-/// `Metrics::debts_overflowed` and `Metrics::keys_refused` (feature
-/// `metrics`) count spills and refusals: any sustained rate means the cap is
-/// too small for the traffic.
+/// 3x the cap, about 3 % at 4x, 38 % at 6x, 86 % at 9x; a well-behaved
+/// population of 10x the cap sees about 4 % false denials at 5,000 visits a
+/// second and **72 % at 20,000** — a unique-key flood can lock legitimate
+/// newcomers out. With `Forget` none of these keys is ever denied, but in a
+/// real-clock race of four drained victims against unique-key flood threads
+/// (cap 32) the victims were reset over and over. **Use `FailClosed` for
+/// limiters keyed by identities an attacker can target** (usernames, API
+/// keys, account ids); `Forget` suits load shedding for anonymous traffic.
+///
+/// The exact table costs 32 bytes per key of capacity, and `FailClosed`'s
+/// sketch another 32 (32 or 64 MiB at the default cap; up to twice that when
+/// a shard's share of the cap is just past a power of two).
+/// `Metrics::debts_forgotten`, `debts_overflowed`, and `keys_refused`
+/// (feature `metrics`) count drops, spills, and refusals: any sustained rate
+/// means the cap is too small for the traffic.
 ///
 /// `remove`, `reset`, and `clear` forget a key's own record along with its
 /// state; they are explicit resets. A sketch charge is shared and cannot be
@@ -119,6 +137,7 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 pub struct Eviction {
     max_keys: Option<usize>,
     idle_ttl: Option<Duration>,
+    overflow: Overflow,
 }
 
 impl Eviction {
@@ -141,6 +160,7 @@ impl Eviction {
         Self {
             max_keys: Some(max_keys),
             idle_ttl: None,
+            overflow: Overflow::Forget,
         }
     }
 
@@ -166,6 +186,7 @@ impl Eviction {
         Self {
             max_keys: Some(DEFAULT_MAX_KEYS),
             idle_ttl: Some(ttl),
+            overflow: Overflow::Forget,
         }
     }
 
@@ -186,6 +207,7 @@ impl Eviction {
         Self {
             max_keys: Some(max_keys),
             idle_ttl: Some(ttl),
+            overflow: Overflow::Forget,
         }
     }
 
@@ -209,6 +231,7 @@ impl Eviction {
         Self {
             max_keys: None,
             idle_ttl: None,
+            overflow: Overflow::Forget,
         }
     }
 
@@ -293,6 +316,89 @@ impl Eviction {
     pub const fn idle_ttl(&self) -> Option<Duration> {
         self.idle_ttl
     }
+
+    /// Chooses what happens when still-limited keys are evicted faster than
+    /// the store can keep their debts exactly (see [`Overflow`]). The default
+    /// is [`Overflow::Forget`].
+    ///
+    /// Choose [`Overflow::FailClosed`] for a limiter keyed by identities an
+    /// attacker can target — usernames, API keys, account ids — where no
+    /// flood may ever reset a key's limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Eviction, Overflow};
+    ///
+    /// let policy = Eviction::capacity(100_000).with_overflow(Overflow::FailClosed);
+    /// assert_eq!(policy.overflow(), Overflow::FailClosed);
+    /// assert_eq!(Eviction::capacity(100_000).overflow(), Overflow::Forget);
+    /// ```
+    #[must_use]
+    pub const fn with_overflow(mut self, overflow: Overflow) -> Self {
+        self.overflow = overflow;
+        self
+    }
+
+    /// The overflow policy (see [`with_overflow`](Self::with_overflow)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Eviction, Overflow};
+    ///
+    /// assert_eq!(Eviction::default().overflow(), Overflow::Forget);
+    /// ```
+    #[must_use]
+    pub const fn overflow(&self) -> Overflow {
+        self.overflow
+    }
+}
+
+/// What the store does with the debts of still-limited keys it evicts faster
+/// than it can keep them exactly — [`Eviction::with_overflow`].
+///
+/// Each shard keeps the debt of every key it evicts before the key has fully
+/// recovered, so a key that returns resumes no more permissive than it left.
+/// Debts are kept **exactly** — each key reads back only its own — for about
+/// twice the shard's share of the cap at once (the count that matters is the
+/// still-limited keys evicted within one recovery period: the eviction rate
+/// times the recovery time, not the size of the population). Within that
+/// bound both policies behave identically: no evicted key is reset, and no
+/// other key is affected. They differ only past it:
+///
+/// | | `Forget` (default) | `FailClosed` |
+/// |---|---|---|
+/// | A debt that does not fit | is dropped | is kept in a shared sketch |
+/// | Evicted, still-limited keys past the bound | may come back with a fresh allowance (1.1 behaviour) | never come back looser than they left |
+/// | Keys that never owed anything | never charged, never refused | may start partly or wholly drained, or be refused with a retry time |
+///
+/// Measured (`docs/BENCHMARKS.md`, cap 100,000 for floods, 10,000 for
+/// populations, 128 shards): with `FailClosed`, newcomers after a flood of
+/// unique keys that each drain their quota are never denied up to a flood of
+/// 3x the cap, about 3 % at 4x, 39 % at 6x; a well-behaved population of 10x
+/// the cap sees about 4 % false denials at 5,000 visits a second but **72 %
+/// at 20,000** — a unique-key flood can lock legitimate newcomers out. With
+/// `Forget` none of them is ever denied, but a flood that evicts more than
+/// about twice the cap's worth of still-limited keys within one recovery
+/// period can reset some of them.
+///
+/// **Choose `FailClosed` for limiters keyed by identities an attacker can
+/// target** (usernames, API keys, account ids — login attempts, password
+/// resets, paid quotas), where a reset is the attack. `Forget` suits limiters
+/// that shed load from anonymous traffic (per-IP limits in front of a
+/// service), where availability for newcomers matters more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Overflow {
+    /// Drop debts the exact table cannot hold (1.1 behaviour past the bound;
+    /// never denies a key that owed nothing). The default.
+    #[default]
+    Forget,
+    /// Keep every debt, spilling those the exact table cannot hold into a
+    /// shared sketch that may charge or refuse keys that owed nothing; an
+    /// evicted key never comes back looser than it left.
+    FailClosed,
 }
 
 impl Default for Eviction {
@@ -305,7 +411,7 @@ impl Default for Eviction {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MAX_KEYS, Eviction};
+    use super::{DEFAULT_MAX_KEYS, Eviction, Overflow};
     use core::time::Duration;
 
     #[test]
@@ -313,6 +419,27 @@ mod tests {
         let policy = Eviction::default();
         assert_eq!(policy.max_keys(), Some(DEFAULT_MAX_KEYS));
         assert_eq!(policy.idle_ttl(), None);
+        assert_eq!(policy.overflow(), Overflow::Forget);
+    }
+
+    #[test]
+    fn test_overflow_policy_composes() {
+        for policy in [
+            Eviction::capacity(10),
+            Eviction::idle(Duration::from_secs(1)),
+            Eviction::new(10, Duration::from_secs(1)),
+            Eviction::unbounded(),
+        ] {
+            assert_eq!(policy.overflow(), Overflow::Forget);
+            let closed = policy.with_overflow(Overflow::FailClosed);
+            assert_eq!(closed.overflow(), Overflow::FailClosed);
+            assert_eq!(closed.max_keys(), policy.max_keys());
+            assert_eq!(
+                closed.with_idle(Duration::from_secs(2)).overflow(),
+                Overflow::FailClosed
+            );
+        }
+        assert_eq!(Overflow::default(), Overflow::Forget);
     }
 
     #[test]

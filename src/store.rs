@@ -56,6 +56,10 @@
 //!   before anything spills; after a walk fails, the next [`WALK_BACKOFF`]
 //!   debts spill without one, so a sustained flood stays cheap. A key reads
 //!   back only its own record.
+//! - **Past the table: [`Overflow`].** Under [`Overflow::Forget`] (the
+//!   default) a debt the table cannot place is dropped — its key may return
+//!   with a fresh allowance — and nothing below applies: the sketch is never
+//!   written. Under [`Overflow::FailClosed`]:
 //! - **Overflow sketch.** A debt the table cannot place goes into two cells of
 //!   a shared sketch ([`CELLS_PER_KEY`] cells per key), each keeping the larger
 //!   deadline and spend. A key being stored is charged the *smaller* of its two
@@ -70,11 +74,18 @@
 //!   evicted, and if a full shard has nothing else to evict the newcomer is
 //!   refused with a retry time (fail closed, `Metrics::keys_refused`).
 //!
-//! So the guarantee is exact — no false denials, no saturation — while the
-//! unrecovered evicted keys of a shard fit its exact table (about twice the
-//! cap); past that, keys that never owed anything can be charged, at a rate
-//! `docs/BENCHMARKS.md` measures. An evicted key is never given back more
-//! than it had.
+//! So the guarantee is exact — no reset, no false denials, no saturation —
+//! while the unrecovered evicted keys of a shard fit its exact table (about
+//! twice the cap). Past that, `Forget` resets the keys whose debts it drops,
+//! and `FailClosed` never gives an evicted key back more than it had but can
+//! charge keys that never owed anything, at rates `docs/BENCHMARKS.md`
+//! measures.
+//!
+//! The eviction sweep judges a candidate by a cached "recovers at" hint
+//! ([`Slot::recovers_at_ms`]) only while the slot's reference bit is clear:
+//! a set bit means a check may have spent since, and the state is read again
+//! — including for idle-expired slots, which are taken whatever their bit
+//! says.
 //!
 //! Removal is a swap-remove from the slot vector plus two table updates, so
 //! evicting is O(1). The one shard-wide pass that remains is amortized growth:
@@ -95,7 +106,7 @@ use crate::algo::{Debt, KeyState, closed};
 use crate::algo::{FixedWindow, SlidingCounter, SlidingLog};
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
-use crate::eviction::Eviction;
+use crate::eviction::{Eviction, Overflow};
 #[cfg(feature = "algorithms")]
 use crate::gcra::Gcra;
 use crate::key::{Key, KeyRef};
@@ -250,8 +261,14 @@ impl<S: KeyState> Slot<S> {
 
     /// When the key's allowance is whole again: the hint if it is still valid,
     /// otherwise read from the state (and remembered).
+    ///
+    /// The hint is valid only while the reference bit is clear: every check
+    /// sets the bit before it touches the state, so a set bit means the key
+    /// may have spent since the hint was computed. The CLOCK hand clears the
+    /// bit (and the hint) on its way past, but an idle-expired slot is taken
+    /// whatever its bit says — so a set bit always forces a fresh read here.
     fn recovers_at(&mut self, now: Duration) -> u64 {
-        if self.recovers_at_ms == UNKNOWN {
+        if self.recovers_at_ms == UNKNOWN || self.referenced.load(Ordering::Relaxed) {
             self.recovers_at_ms = recovers_at(&self.state, now);
         }
         self.recovers_at_ms
@@ -336,13 +353,22 @@ fn pack(until_ms: u64, spent: u32) -> u64 {
     (until_ms.min(UNTIL_MAX) << SPENT_BITS) | u64::from(spent).min(SPENT_MAX)
 }
 
-/// The deadline and spent count of a sketch cell.
+/// The deadline and spent count of a sketch cell. A spent count that filled
+/// the field ([`SPENT_MAX`] or more units) reads back as `u32::MAX` — all of
+/// the key's allowance, clamped to its limit when restored — so a limit
+/// larger than the field is never under-charged.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "the spent field is masked to 24 bits"
 )]
 const fn unpack(cell: u64) -> (u64, u32) {
-    (cell >> SPENT_BITS, (cell & SPENT_MAX) as u32)
+    let spent = cell & SPENT_MAX;
+    let spent = if spent == SPENT_MAX {
+        u32::MAX
+    } else {
+        spent as u32
+    };
+    (cell >> SPENT_BITS, spent)
 }
 
 /// Where a key's records and cells live in a recovery table, and its tag.
@@ -405,16 +431,20 @@ impl Probe {
     }
 }
 
-/// The sizes of a shard's recovery table once allocated.
+/// The sizes of a shard's recovery table once allocated, and what happens to
+/// a debt the exact table cannot hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TableSize {
     buckets: usize,
     cells: usize,
+    /// [`Overflow::Forget`]: such a debt is dropped, and the sketch is never
+    /// written (so it is kept at its minimum size).
+    forget: bool,
 }
 
 impl TableSize {
     /// Records for [`EXACT_PER_KEY`] evicted debts per key of capacity, and
-    /// [`CELLS_PER_KEY`] overflow cells per key.
+    /// [`CELLS_PER_KEY`] overflow cells per key ([`Overflow::FailClosed`]).
     fn for_cap(per_shard_cap: usize) -> Self {
         Self {
             buckets: per_shard_cap
@@ -426,6 +456,20 @@ impl TableSize {
                 .saturating_mul(CELLS_PER_KEY)
                 .clamp(MIN_CELLS, MAX_CELLS)
                 .next_power_of_two(),
+            forget: false,
+        }
+    }
+
+    /// The table for `overflow`: under [`Overflow::Forget`] the sketch is
+    /// never written, so it keeps only its minimum size.
+    fn with_overflow(self, overflow: Overflow) -> Self {
+        match overflow {
+            Overflow::FailClosed => self,
+            _ => Self {
+                cells: MIN_CELLS,
+                forget: true,
+                ..self
+            },
         }
     }
 }
@@ -446,6 +490,9 @@ enum Recorded {
     Exact,
     /// In the shared overflow sketch (the exact table had no room).
     Overflowed,
+    /// Under [`Overflow::Forget`], the exact table had no room and a debt —
+    /// this one, or one it displaced — was dropped.
+    Forgotten,
 }
 
 /// Debts of keys evicted before they recovered: an exact table, and an
@@ -608,8 +655,7 @@ impl Recovery {
         let budget = if self.backoff > 0 {
             self.backoff -= 1;
             if !inherited {
-                self.overflow(new, probe.buckets[0], now_ms);
-                return Some(Recorded::Overflowed);
+                return Some(self.spill(new, probe.buckets[0], now_ms, size));
             }
             1
         } else {
@@ -626,8 +672,7 @@ impl Recovery {
             if inherited {
                 return None;
             }
-            self.overflow(new, probe.buckets[0], now_ms);
-            return Some(Recorded::Overflowed);
+            return Some(self.spill(new, probe.buckets[0], now_ms, size));
         };
         let mut homeless = new;
         for kick in 1..=budget {
@@ -649,8 +694,19 @@ impl Recovery {
         // runs at least once), and only a debt that is not inherited is ever
         // moved.
         self.backoff = WALK_BACKOFF;
-        self.overflow(homeless, b, now_ms);
-        Some(Recorded::Overflowed)
+        Some(self.spill(homeless, b, now_ms, size))
+    }
+
+    /// Disposes of a debt the exact table could not hold, found homeless at
+    /// `bucket`: into the overflow sketch, or — under [`Overflow::Forget`] —
+    /// nowhere.
+    fn spill(&mut self, record: Record, bucket: usize, now_ms: u64, size: TableSize) -> Recorded {
+        if size.forget {
+            Recorded::Forgotten
+        } else {
+            self.overflow(record, bucket, now_ms);
+            Recorded::Overflowed
+        }
     }
 
     /// Puts `record` at `(b, r)`, returning the record it replaces.
@@ -762,6 +818,7 @@ struct Reclaimed {
     expired: usize,
     remembered: usize,
     overflowed: usize,
+    forgotten: usize,
 }
 
 impl<S: KeyState> ShardMap<S> {
@@ -850,7 +907,8 @@ impl<S: KeyState> ShardMap<S> {
     }
 
     /// Evicts the slot at `pos`, first recording its debt if it still owes, so
-    /// eviction never resets a limit.
+    /// eviction does not reset a limit (unless, under [`Overflow::Forget`], the
+    /// full exact table drops a debt).
     fn evict_at(
         &mut self,
         pos: usize,
@@ -874,6 +932,7 @@ impl<S: KeyState> ShardMap<S> {
                             out.overflowed += 1;
                         }
                         Some(Recorded::Exact) => out.remembered += 1,
+                        Some(Recorded::Forgotten) => out.forgotten += 1,
                         None => return,
                     }
                 }
@@ -1075,6 +1134,9 @@ impl<S: KeyState> Shard<S> {
             for _ in 0..reclaimed.overflowed {
                 self.counters.overflowed();
             }
+            for _ in 0..reclaimed.forgotten {
+                self.counters.forgotten();
+            }
         }
     }
 
@@ -1147,7 +1209,7 @@ impl<S: KeyState> Store<S> {
         let idle_ttl_ms = eviction
             .idle_ttl()
             .map(|ttl| ceil_millis(ttl.max(min_idle)).saturating_add(1));
-        let table = TableSize::for_cap(per_shard_cap);
+        let table = TableSize::for_cap(per_shard_cap).with_overflow(eviction.overflow());
 
         let shards = (0..shard_count)
             .map(|_| Shard::new())
@@ -1206,7 +1268,12 @@ impl<S: KeyState> Store<S> {
         // lock — then lock, re-check (another thread may have inserted it in
         // the gap; the fresh state is then simply dropped), make room, insert.
         let now = clock();
-        let fresh = make_state(now);
+        // A quota that admits nothing is never stored: deny it here, before
+        // the write lock, so a blocked key hammering the limiter never
+        // serialises its shard.
+        let Some(mut state) = make_state(now) else {
+            return shard.on_decision(closed(n));
+        };
         let mut map = sync::write(&shard.map);
         let now_ms = millis(now);
         if let Some(slot) = map.get(hash, key) {
@@ -1216,9 +1283,6 @@ impl<S: KeyState> Store<S> {
             slot.touch();
             return shard.on_decision(slot.state.acquire(n, now));
         }
-        let Some(mut state) = fresh else {
-            return shard.on_decision(closed(n));
-        };
         if let Err(recovers_at_ms) = self.make_room(shard, &mut map, now, now_ms) {
             // Saturated: every examined key is still limited and its debt
             // cannot be recorded. Refuse the newcomer (fail closed) rather than
@@ -1582,12 +1646,22 @@ mod tests {
 
     use super::{CLOCK_SCAN, Known, Store, TTL_SWEEP, TableSize};
     use crate::algo::KeyState;
-    use crate::eviction::Eviction;
+    use crate::eviction::{Eviction, Overflow};
     use crate::key::Key;
     use crate::quota::Quota;
 
+    /// A store under [`Overflow::FailClosed`], whose sketch most of these
+    /// tests exercise; [`Overflow::Forget`] tests ask for it explicitly.
     fn make_store(shards: usize, eviction: Eviction) -> Store<BucketCore> {
-        Store::new(shards, eviction, Duration::ZERO)
+        Store::new(
+            shards,
+            eviction.with_overflow(Overflow::FailClosed),
+            Duration::ZERO,
+        )
+    }
+
+    fn make_forgetting_store(shards: usize, max_keys: usize) -> Store<BucketCore> {
+        Store::new(shards, Eviction::capacity(max_keys), Duration::ZERO)
     }
 
     fn at(ms: u64) -> Duration {
@@ -1880,6 +1954,139 @@ mod tests {
     }
 
     #[test]
+    fn test_an_idle_expired_key_is_judged_by_its_current_state() {
+        // RN3-001: the recovery hint computed when the key was stored is stale
+        // once the key spends again. A key whose own quota recovers far slower
+        // than the idle TTL (a per-key override) must be recorded, not
+        // forgotten, when the idle sweep takes it.
+        let store: Store<BucketCore> = Store::new(
+            1,
+            Eviction::new(1_000, Duration::from_secs(1)),
+            Duration::ZERO,
+        );
+        let pro = Quota::per_minute(10);
+        assert!(check(&store, "pro", 1, 0, pro)); // hint: whole again at 6 s
+        assert!(check(&store, "pro", 9, 500, pro)); // drained: whole at 60.5 s
+        // Ten idle seconds later, enough inserts for the sweep to take it.
+        for k in 0..64u64 {
+            let _ = check(&store, k, 1, 10_000, pro);
+        }
+        assert!(!tracked(&store, "pro"), "the idle sweep took the key");
+        // It comes back with only what refilled since (about one unit), not
+        // a fresh allowance.
+        assert!(!check(&store, "pro", 3, 10_001, pro));
+        assert!(check(&store, "pro", 1, 10_001, pro));
+    }
+
+    #[test]
+    fn test_a_spent_count_past_the_sketch_field_charges_everything() {
+        // RN3-002: the sketch keeps 24 bits of spent units; a count that
+        // fills them reads back as all of the key's allowance.
+        use super::{Recorded, Recovery, SPENT_MAX, TableSize, pack, unpack};
+        use crate::algo::Debt;
+
+        let below = u32::try_from(SPENT_MAX - 1).unwrap();
+        assert_eq!(unpack(pack(7, below)), (7, below));
+        for spent in [SPENT_MAX, SPENT_MAX + 1, 100_000_000, u64::from(u32::MAX)] {
+            let spent = u32::try_from(spent).unwrap();
+            assert_eq!(unpack(pack(7, spent)), (7, u32::MAX), "{spent}");
+        }
+        assert_eq!(unpack(0), (0, 0));
+
+        // Through the table: nine keys that each spent 100 M units fill the
+        // eight exact records of a two-bucket table and spill one into the
+        // sketch; every key reads back at least what it spent.
+        let size = TableSize {
+            buckets: 2,
+            cells: 8,
+            forget: false,
+        };
+        let debt = Debt {
+            spent: 100_000_000,
+            until: Duration::from_secs(60),
+        };
+        let mut table = Recovery::new();
+        let hashes: Vec<u64> = (1..=9u64)
+            .map(|k| k.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .collect();
+        let spilled = hashes
+            .iter()
+            .filter(|&&hash| table.record(hash, debt, 0, size, false) == Some(Recorded::Overflowed))
+            .count();
+        assert_eq!(spilled, 1);
+        for &hash in &hashes {
+            let charge = table.peek(hash, 0).unwrap();
+            assert!(charge.debt.spent >= debt.spent, "{charge:?}");
+        }
+        // A window key restored from such a charge has nothing left.
+        #[cfg(feature = "algorithms")]
+        {
+            use crate::algo::FixedWindow;
+            let quota = Quota::from_parts(100_000_000, Duration::from_secs(60), 100_000_000);
+            let mut state = FixedWindow::create(&quota, Duration::ZERO).unwrap();
+            state.restore(
+                Debt {
+                    spent: u32::MAX,
+                    until: Duration::from_secs(60),
+                },
+                Duration::ZERO,
+            );
+            assert_eq!(state.peek(Duration::ZERO).remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn test_a_key_that_admits_nothing_never_takes_the_write_lock() {
+        // RN3-003: hold the shard's read lock; a closed key must still be
+        // answered (a write lock would wait for the guard forever).
+        let store = make_store(1, Eviction::capacity(8));
+        let closed = Quota::from_parts(0, Duration::from_secs(1), 0);
+        let guard = super::sync::read(&store.shards[0].map);
+        let (done, answered) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let _handle = scope.spawn(|| {
+                let denied = !check(&store, "blocked", 1, 0, closed);
+                let _sent = done.send(denied);
+            });
+            let denied = answered.recv_timeout(Duration::from_secs(10));
+            drop(guard);
+            assert_eq!(denied, Ok(true), "a closed key waited for the write lock");
+        });
+        assert!(!tracked(&store, "blocked"));
+    }
+
+    #[test]
+    fn test_forget_drops_debts_past_the_exact_table_and_never_charges_others() {
+        // Overflow::Forget: debts that fit are kept exactly (an evicted key
+        // never comes back looser), debts that do not are dropped, the sketch
+        // is never written, and no key that owed nothing is charged or
+        // refused.
+        let store = make_forgetting_store(1, 16);
+        assert!(store.table.forget);
+        assert_eq!(store.table.cells, super::MIN_CELLS);
+        // Within the bound: a drained key evicted by a small flood comes back
+        // drained.
+        assert!(check(&store, "victim", 1, 0, slow(1)));
+        for k in 0..20u64 {
+            assert!(check(&store, k, 1, 0, slow(1)));
+        }
+        assert!(!tracked(&store, "victim"));
+        assert!(!check(&store, "victim", 1, 0, slow(1)));
+        // Far past it: every newcomer still has its whole allowance, and the
+        // sketch stayed empty.
+        for k in 100..10_000u64 {
+            assert!(
+                check(&store, k, 1, 0, slow(1)),
+                "key {k} refused or charged"
+            );
+        }
+        assert_eq!(store.overflow_cells(0), 0);
+        for k in 0..100u64 {
+            assert!(check(&store, format!("new-{k}"), 1, 0, slow(1)));
+        }
+    }
+
+    #[test]
     fn test_recovery_table_is_lazy_and_bounded() {
         let store = make_store(1, Eviction::capacity(100));
         assert_eq!(store.recovery_bytes(), 0);
@@ -1895,7 +2102,8 @@ mod tests {
             store.table,
             TableSize {
                 buckets: 64,
-                cells: 512
+                cells: 512,
+                forget: false,
             }
         );
         assert_eq!(store.recovery_bytes(), 64 * 64 + 512 * 8);
@@ -1903,14 +2111,16 @@ mod tests {
             TableSize::for_cap(1),
             TableSize {
                 buckets: 2,
-                cells: 8
+                cells: 8,
+                forget: false,
             }
         );
         assert_eq!(
             TableSize::for_cap(usize::MAX),
             TableSize {
                 buckets: 8_192,
-                cells: 65_536
+                cells: 65_536,
+                forget: false,
             }
         );
     }
@@ -2192,6 +2402,7 @@ mod tests {
         let size = TableSize {
             buckets: 2,
             cells: 8,
+            forget: false,
         };
         let mut table = Recovery::new();
         assert_eq!(table.peek(7, 0), None);
@@ -2293,7 +2504,7 @@ mod tests {
             use super::{Recovery, TableSize};
             use crate::algo::Debt;
 
-            let size = TableSize { buckets: 1 << buckets_log, cells: 8 };
+            let size = TableSize { buckets: 1 << buckets_log, cells: 8, forget: false };
             let mut table = Recovery::new();
             // The debts recorded for each key since it last returned:
             // (spent, until_ms). Each must be covered while it is live.
@@ -2387,6 +2598,49 @@ mod tests {
                         // units <= 4 + 5 * (b - a) / 1000, scaled by 1000.
                         proptest::prop_assert!(
                             units * 1_000 <= 4_000 + 5 * (b - a),
+                            "key {} admitted {} units in [{}ms, {}ms]", key, units, a, b
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The same with an idle TTL and keys under a slower quota than the
+        /// default the TTL was raised for (RN3-001): idle expiry never resets
+        /// a key either, whichever overflow policy, while the exact table
+        /// holds the debts (eight keys: at most seven evicted, against at
+        /// least eight exact records).
+        #[test]
+        fn prop_idle_expiry_never_resets_a_slow_key(
+            cap in 1usize..12,
+            fail_closed in proptest::bool::ANY,
+            ops in proptest::collection::vec((0u64..8, 0u64..3_000, 1u32..4), 1..400),
+        ) {
+            let fast = Quota::per_second(5).with_burst(4);
+            let slow = Quota::rate(5, Duration::from_secs(10)).unwrap();
+            let eviction = Eviction::new(cap, Duration::from_millis(1))
+                .with_overflow(if fail_closed { Overflow::FailClosed } else { Overflow::Forget });
+            // The TTL is raised to the default quota's recovery, 0.8 s.
+            let store: Store<BucketCore> = Store::new(1, eviction, Duration::from_millis(800));
+            let mut admitted: std::collections::HashMap<u64, Vec<(u64, u64)>> =
+                std::collections::HashMap::new();
+            let mut now = 0u64;
+            for (key, advance, n) in ops {
+                now += advance;
+                let quota = if key >= 4 { slow } else { fast };
+                if check(&store, key, n, now, quota) {
+                    admitted.entry(key).or_default().push((now, u64::from(n)));
+                }
+            }
+            for (key, events) in &admitted {
+                // burst + limit * elapsed / period, scaled by the period.
+                let (burst, limit, period) = if *key >= 4 { (5, 5, 10_000) } else { (4, 5, 1_000) };
+                for (i, &(a, _)) in events.iter().enumerate() {
+                    let mut units = 0u64;
+                    for &(b, n) in &events[i..] {
+                        units += n;
+                        proptest::prop_assert!(
+                            units * period <= burst * period + limit * (b - a),
                             "key {} admitted {} units in [{}ms, {}ms]", key, units, a, b
                         );
                     }

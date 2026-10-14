@@ -6,10 +6,12 @@
 //! back looser). These check the other side, with the scenarios of the
 //! 1.2.0 re-audit's attack harness scaled down to run in well under a second.
 //! The store keeps evicted debts exactly for up to about twice its cap (a
-//! cuckoo-hashed table) and only beyond that falls back to a shared sketch
-//! that can charge an unrelated key, so each scenario is run inside that
-//! bound, where it must be (all but) free of false denials. `docs/BENCHMARKS.md`
-//! has the numbers past the bound and at full scale.
+//! cuckoo-hashed table). Past that, `Overflow::FailClosed` falls back to a
+//! shared sketch that can charge an unrelated key, so its scenarios run inside
+//! the bound, where it must be (all but) free of false denials;
+//! `Overflow::Forget` (the default) drops such debts and must never deny a
+//! newcomer at all. `docs/BENCHMARKS.md` has the numbers past the bound and
+//! at full scale.
 
 #![cfg(feature = "std")]
 #![allow(
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clock_lib::ManualClock;
-use rate_net::{Eviction, Quota, RateLimiter};
+use rate_net::{Eviction, Overflow, Quota, RateLimiter};
 
 /// A small deterministic PRNG (xorshift), so every run is the same.
 struct Rng(u64);
@@ -44,7 +46,7 @@ fn limiter(quota: Quota, cap: usize) -> (Arc<ManualClock>, RateLimiter<Arc<Manua
         .quota(quota.limit(), quota.period())
         .burst(quota.burst())
         .shards(16)
-        .eviction(Eviction::capacity(cap))
+        .eviction(Eviction::capacity(cap).with_overflow(Overflow::FailClosed))
         .clock(Arc::clone(&clock))
         .build();
     (clock, limiter)
@@ -173,4 +175,24 @@ fn test_a_returning_key_resumes_without_rounding_losses() {
         }
         clock.advance(Duration::from_secs(6));
     }
+}
+
+#[test]
+fn test_forget_admits_every_newcomer_after_any_drain_flood() {
+    // The default policy never charges a key that owed nothing: after a drain
+    // flood of ten times the cap, every newcomer has its whole allowance.
+    let clock = Arc::new(ManualClock::new());
+    let limiter = RateLimiter::builder()
+        .per_minute(10)
+        .shards(16)
+        .eviction(Eviction::capacity(4_000))
+        .clock(Arc::clone(&clock))
+        .build();
+    for key in 0..44_000u64 {
+        let _ = limiter.check_n_bytes(key.to_be_bytes(), 10);
+    }
+    let denied = (0..2_000u64)
+        .filter(|i| limiter.check_n(format!("newcomer-{i}"), 10).is_deny())
+        .count();
+    assert_eq!(denied, 0);
 }
