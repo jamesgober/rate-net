@@ -43,20 +43,36 @@
 //! it returns — a way to reset any key's limit by flooding the store with
 //! others. So whenever an evicted key still owes part of its allowance, the
 //! shard records what it owed: how many units were spent and when they would
-//! all have been back (a 16-byte [`Record`], keyed by a 32-bit tag of the key's
-//! hash, in a table of half the shard's capacity allocated on first use). When
-//! a key is inserted the table is consulted, and a key that returns before its
-//! debt is repaid resumes no more permissive than it left (see
-//! [`KeyState::restore`]); its record is then cleared.
+//! all have been back. When a key is inserted the table is consulted, and a key
+//! that returns before its debt is repaid resumes no more permissive than it
+//! left (see [`KeyState::restore`]); its own record is then cleared. Records
+//! expire at their deadline, and a shard's table is allocated on first use.
 //!
-//! Each key has two candidate records. If both are held by other keys' live
-//! debts, the new debt is *merged* into one of them — the record keeps the
-//! larger debt and the later deadline and loses its tag, so it then applies to
-//! every new key that hashes to it until it expires. A merge therefore never
-//! forgets a debt; it can only make an unrelated new key start drained (fail
-//! closed). Merges happen only when more unrecovered keys are evicted within
-//! one recovery period than the table holds — a flood far beyond the cap — and
-//! are counted in `Metrics::records_merged`.
+//! - **Exact records.** Each debt is a 16-byte [`Record`] tagged with 32 bits
+//!   of its key's hash, in a cuckoo-hashed table of 64-byte buckets holding
+//!   [`EXACT_PER_KEY`] records per key of shard capacity. A key has two
+//!   candidate buckets; when both are full, records are moved to their other
+//!   bucket (at most [`MAX_KICKS`] moves), which fills the table past 90 %
+//!   before anything spills. A key reads back only its own record.
+//! - **Overflow sketch.** A debt the table cannot place goes into two cells of
+//!   a shared sketch ([`CELLS_PER_KEY`] cells per key), each keeping the larger
+//!   deadline and spend. A key being stored is charged the *smaller* of its two
+//!   cells, and only while both are live: never less than its own overflowed
+//!   debt, but an unrelated key whose two cells were both written by others is
+//!   charged too (it starts partly or wholly drained — fail closed).
+//! - **No spreading.** A key charged from the sketch carries debt that may be
+//!   others'. When such a key is evicted its debt goes only into the exact
+//!   table, marked so that it is never moved back into the sketch: a sketch
+//!   charge cannot be written back, spread to further keys, and ratchet up.
+//!   If the key's buckets hold nothing but such marked debts, the key is not
+//!   evicted, and if a full shard has nothing else to evict the newcomer is
+//!   refused with a retry time (fail closed, `Metrics::keys_refused`).
+//!
+//! So the guarantee is exact — no false denials, no saturation — while the
+//! unrecovered evicted keys of a shard fit its exact table (about twice the
+//! cap); past that, keys that never owed anything can be charged, at a rate
+//! `docs/BENCHMARKS.md` measures. An evicted key is never given back more
+//! than it had.
 //!
 //! Removal is a swap-remove from the slot vector plus two table updates, so
 //! evicting is O(1). The one shard-wide pass that remains is amortized growth:
@@ -130,17 +146,34 @@ const BUCKET_RECORDS: usize = 4;
 
 /// Exact records per key of shard capacity. Debts are 16 bytes against a key's
 /// ~128, so the table holds twice as many evicted debts as the shard holds
-/// keys; measured, that keeps a store whose limited population is three times
-/// its cap under 1 % false denials (`tests/eviction_liveness.rs`).
+/// keys (`tests/eviction_liveness.rs` measures what that buys).
 const EXACT_PER_KEY: usize = 2;
+
+/// The most records one insertion into the exact table may relocate (cuckoo
+/// moves) before the last displaced debt goes to the overflow sketch. With two
+/// four-record buckets per key this fills the table past 90 % before anything
+/// overflows.
+const MAX_KICKS: usize = 16;
+
+/// The bit of [`Record::until_ms`] that marks a debt charged (in part) from
+/// the shared overflow sketch: see [`Recovery::record`].
+const INHERITED: u64 = 1 << 63;
 
 /// The fewest and most buckets a shard's exact table holds (4 records each).
 const MIN_BUCKETS: usize = 2;
 const MAX_BUCKETS: usize = 1 << 13;
 
+/// Overflow-sketch cells per key of shard capacity. A newcomer is charged from
+/// the sketch only when both of its cells are live, so the sparser the sketch
+/// the fewer keys that never owed anything start short; at four 8-byte cells
+/// per key, a sketch holding a cap's worth of live overflowed debts charges
+/// about one newcomer in six, and one holding a quarter of that about one in
+/// seventy (`(1 - e^(-2n/m))^2` for `n` debts in `m` cells).
+const CELLS_PER_KEY: usize = 4;
+
 /// The fewest and most cells a shard's overflow sketch holds.
 const MIN_CELLS: usize = 8;
-const MAX_CELLS: usize = 1 << 14;
+const MAX_CELLS: usize = 1 << 16;
 
 /// Bits of a sketch cell holding the spent units; the rest hold the deadline.
 const SPENT_BITS: u32 = 24;
@@ -255,19 +288,30 @@ struct Record {
     /// Units the key had spent and not yet recovered.
     spent: u32,
     /// When they would all have been back, in whole milliseconds since the
-    /// limiter epoch (rounded up). A record is live while this is in the future.
+    /// limiter epoch (rounded up), with the [`INHERITED`] bit on top. A record
+    /// is live while the deadline is in the future.
     until_ms: u64,
 }
 
 impl Record {
+    const fn until(&self) -> u64 {
+        self.until_ms & !INHERITED
+    }
+
     const fn is_live(&self, now_ms: u64) -> bool {
-        self.tag != 0 && self.until_ms > now_ms
+        self.tag != 0 && self.until() > now_ms
+    }
+
+    /// Whether the debt was charged (in part) from the overflow sketch, so it
+    /// must never be moved back into it.
+    const fn is_inherited(&self) -> bool {
+        self.until_ms & INHERITED != 0
     }
 
     const fn debt(&self) -> Debt {
         Debt {
             spent: self.spent,
-            until: Duration::from_millis(self.until_ms),
+            until: Duration::from_millis(self.until()),
         }
     }
 }
@@ -300,27 +344,39 @@ struct Probe {
     tag: u32,
 }
 
+/// `len - 1` bits of `word` from bit `shift` up (`len` a power of two).
+fn pick(word: u64, shift: u32, len: usize) -> usize {
+    let mask = u64::try_from(len - 1).unwrap_or(u64::MAX);
+    usize::try_from((word >> shift) & mask).unwrap_or(0)
+}
+
+/// A record's other candidate bucket, from its bucket and tag alone, so a
+/// record can be moved there without its key's hash (partial-key cuckoo
+/// hashing). An involution — `alt(alt(b)) == b` — and never `b` itself.
+fn alt_bucket(bucket: usize, tag: u32, buckets: usize) -> usize {
+    let offset = pick(u64::from(tag).wrapping_mul(MIX2), 32, buckets).max(1);
+    bucket ^ offset
+}
+
+/// A key's two overflow cells, from its tag and the lower of its two buckets —
+/// both recoverable from a record — so a record displaced from the exact
+/// table lands in the same cells its key reads.
+fn cells_of(tag: u32, low_bucket: usize, cells: usize) -> [usize; 2] {
+    let low = u64::try_from(low_bucket).unwrap_or(u64::MAX);
+    let word = ((low << 32) | u64::from(tag)).wrapping_mul(MIX);
+    let word = (word ^ (word >> 31)).wrapping_mul(MIX2);
+    let first = pick(word, 40, cells);
+    let mut second = pick(word, 16, cells);
+    if second == first {
+        second = (first + 1) & (cells - 1);
+    }
+    [first, second]
+}
+
 impl Probe {
     /// The probe for `hash` in a table of `buckets` buckets and `cells` cells
-    /// (both powers of two).
+    /// (both powers of two, `buckets >= 2`).
     fn new(hash: u64, buckets: usize, cells: usize) -> Self {
-        let a = hash.wrapping_mul(MIX);
-        let b = hash.rotate_left(32).wrapping_mul(MIX2);
-        // The top bits of each product depend on every bit of the hash.
-        let pick = |word: u64, shift: u32, len: usize| {
-            let mask = u64::try_from(len - 1).unwrap_or(u64::MAX);
-            usize::try_from((word >> shift) & mask).unwrap_or(0)
-        };
-        let first = pick(a, 40, buckets);
-        let mut second = pick(a, 20, buckets);
-        if second == first {
-            second = (first + 1) & (buckets - 1);
-        }
-        let c1 = pick(b, 40, cells);
-        let mut c2 = pick(b, 20, cells);
-        if c2 == c1 {
-            c2 = (c1 + 1) & (cells - 1);
-        }
         #[allow(
             clippy::cast_possible_truncation,
             reason = "the tag is deliberately the hash's low 32 bits"
@@ -329,9 +385,12 @@ impl Probe {
             0 => 1,
             tag => tag,
         };
+        // The top bits of the product depend on every bit of the hash.
+        let first = pick(hash.wrapping_mul(MIX), 40, buckets);
+        let second = alt_bucket(first, tag, buckets);
         Self {
             buckets: [first, second],
-            cells: [c1, c2],
+            cells: cells_of(tag, first.min(second), cells),
             tag,
         }
     }
@@ -346,7 +405,7 @@ struct TableSize {
 
 impl TableSize {
     /// Records for [`EXACT_PER_KEY`] evicted debts per key of capacity, and
-    /// one overflow cell per key.
+    /// [`CELLS_PER_KEY`] overflow cells per key.
     fn for_cap(per_shard_cap: usize) -> Self {
         Self {
             buckets: per_shard_cap
@@ -355,6 +414,7 @@ impl TableSize {
                 .clamp(MIN_BUCKETS, MAX_BUCKETS)
                 .next_power_of_two(),
             cells: per_shard_cap
+                .saturating_mul(CELLS_PER_KEY)
                 .clamp(MIN_CELLS, MAX_CELLS)
                 .next_power_of_two(),
         }
@@ -384,6 +444,8 @@ enum Recorded {
 struct Recovery {
     buckets: Box<[Bucket]>,
     cells: Box<[u64]>,
+    /// Rotates which record of a full bucket a cuckoo walk moves first.
+    turn: usize,
 }
 
 impl Recovery {
@@ -391,6 +453,7 @@ impl Recovery {
         Self {
             buckets: Box::new([]),
             cells: Box::new([]),
+            turn: 0,
         }
     }
 
@@ -410,39 +473,98 @@ impl Recovery {
         })
     }
 
-    /// Whether the exact table can take a debt for `hash` (its own record, or a
-    /// free or expired one in either candidate bucket).
+    /// Whether the exact table can take an inherited debt for `hash`: its own
+    /// record, or a record in either candidate bucket that is free, expired,
+    /// or holds a debt that may be moved on (one that is not inherited).
     fn has_exact_room(&self, hash: u64, now_ms: u64) -> bool {
         let Some(probe) = self.probe(hash) else {
             return true; // allocated on first record, empty
         };
         self.own(&probe, now_ms).is_some()
             || probe.buckets.iter().any(|&b| {
-                self.buckets
-                    .get(b)
-                    .is_some_and(|bucket| bucket.0.iter().any(|r| !r.is_live(now_ms)))
+                self.buckets.get(b).is_some_and(|bucket| {
+                    bucket
+                        .0
+                        .iter()
+                        .any(|r| !r.is_live(now_ms) || !r.is_inherited())
+                })
             })
     }
 
+    /// A free or expired record of bucket `b`.
+    fn free_in(&self, b: usize, now_ms: u64) -> Option<usize> {
+        self.buckets
+            .get(b)?
+            .0
+            .iter()
+            .position(|record| !record.is_live(now_ms))
+    }
+
+    /// A record of bucket `b` that may be moved to its other bucket: live and
+    /// not inherited. Starts at a rotating offset so repeated walks through a
+    /// bucket do not always move the same record.
+    fn movable_in(&mut self, b: usize, now_ms: u64) -> Option<usize> {
+        let start = self.turn;
+        self.turn = self.turn.wrapping_add(1);
+        let bucket = self.buckets.get(b)?;
+        (0..BUCKET_RECORDS)
+            .map(|i| (start + i) % BUCKET_RECORDS)
+            .find(|&r| {
+                bucket
+                    .0
+                    .get(r)
+                    .is_some_and(|record| record.is_live(now_ms) && !record.is_inherited())
+            })
+    }
+
+    /// Writes `record`, found homeless at bucket `bucket`, into its key's
+    /// overflow cells (each keeps the larger deadline and spend).
+    fn overflow(&mut self, record: Record, bucket: usize, now_ms: u64) {
+        let low = bucket.min(alt_bucket(bucket, record.tag, self.buckets.len()));
+        let until_ms = record.until();
+        for c in cells_of(record.tag, low, self.cells.len()) {
+            if let Some(cell) = self.cells.get_mut(c) {
+                let (old_until, old_spent) = unpack(*cell);
+                *cell = if old_until > now_ms {
+                    pack(old_until.max(until_ms), old_spent.max(record.spent))
+                } else {
+                    pack(until_ms, record.spent)
+                };
+            }
+        }
+    }
+
     /// Records that the key with `hash` owes `debt`, allocating the table on
-    /// first use: in the exact table if it has room, otherwise — when
-    /// `overflow` is allowed — in both of the key's overflow cells (each keeps
-    /// the larger deadline and spend). Returns `None` when neither is
-    /// possible.
+    /// first use.
+    ///
+    /// The debt goes into the exact table: a free or expired record of either
+    /// of the key's buckets, or else — cuckoo hashing — the place of another
+    /// record, which moves to its own other bucket, displacing another in
+    /// turn, for at most [`MAX_KICKS`] moves. If the walk ends with a debt
+    /// still homeless, that debt goes into its key's overflow cells: nothing is
+    /// ever dropped.
+    ///
+    /// An `inherited` debt — one a key was charged (in part) from the overflow
+    /// sketch — is never written to the sketch, by this call or by a later
+    /// walk: the sketch is shared, and writing back a debt read from it would
+    /// let it spread and ratchet across keys that never owed it. Returns
+    /// `None`, recording nothing, when an inherited debt finds no place (see
+    /// [`has_exact_room`](Self::has_exact_room)).
     fn record(
         &mut self,
         hash: u64,
         debt: Debt,
         now_ms: u64,
         size: TableSize,
-        overflow: bool,
+        inherited: bool,
     ) -> Option<Recorded> {
         if self.buckets.is_empty() {
             self.buckets = vec![Bucket::default(); size.buckets].into_boxed_slice();
             self.cells = vec![0u64; size.cells].into_boxed_slice();
         }
         let probe = Probe::new(hash, self.buckets.len(), self.cells.len());
-        let until_ms = ceil_millis(debt.until);
+        let flag = if inherited { INHERITED } else { 0 };
+        let until_ms = ceil_millis(debt.until).min(!INHERITED);
         if let Some((b, r)) = self.own(&probe, now_ms) {
             if let Some(record) = self
                 .buckets
@@ -450,36 +572,63 @@ impl Recovery {
                 .and_then(|bucket| bucket.0.get_mut(r))
             {
                 record.spent = record.spent.max(debt.spent);
-                record.until_ms = record.until_ms.max(until_ms);
+                let kept = record.until_ms & INHERITED;
+                record.until_ms = record.until().max(until_ms) | kept | flag;
             }
             return Some(Recorded::Exact);
         }
-        for &b in &probe.buckets {
-            if let Some(bucket) = self.buckets.get_mut(b) {
-                if let Some(record) = bucket.0.iter_mut().find(|r| !r.is_live(now_ms)) {
-                    *record = Record {
-                        tag: probe.tag,
-                        spent: debt.spent,
-                        until_ms,
-                    };
-                    return Some(Recorded::Exact);
-                }
+        let new = Record {
+            tag: probe.tag,
+            spent: debt.spent,
+            until_ms: until_ms | flag,
+        };
+        for b in probe.buckets {
+            if let Some(r) = self.free_in(b, now_ms) {
+                let _empty = self.put(b, r, new);
+                return Some(Recorded::Exact);
             }
         }
-        if !overflow {
-            return None;
-        }
-        for &c in &probe.cells {
-            if let Some(cell) = self.cells.get_mut(c) {
-                let (old_until, old_spent) = unpack(*cell);
-                *cell = if old_until > now_ms {
-                    pack(old_until.max(until_ms), old_spent.max(debt.spent))
-                } else {
-                    pack(until_ms, debt.spent)
-                };
+        // Both buckets are full of live debts: walk, starting from a bucket
+        // with a record that may move (an inherited debt must displace one).
+        let mut start = None;
+        for b in probe.buckets {
+            if let Some(r) = self.movable_in(b, now_ms) {
+                start = Some((b, r));
+                break;
             }
         }
+        let Some((mut b, mut r)) = start else {
+            if inherited {
+                return None;
+            }
+            self.overflow(new, probe.buckets[0], now_ms);
+            return Some(Recorded::Overflowed);
+        };
+        let mut homeless = new;
+        for _ in 0..MAX_KICKS {
+            homeless = self.put(b, r, homeless);
+            b = alt_bucket(b, homeless.tag, self.buckets.len());
+            if let Some(free) = self.free_in(b, now_ms) {
+                let _empty = self.put(b, free, homeless);
+                return Some(Recorded::Exact);
+            }
+            match self.movable_in(b, now_ms) {
+                Some(next) => r = next,
+                None => break,
+            }
+        }
+        // Only a debt that was moved can be left homeless here, and only a
+        // debt that is not inherited is ever moved.
+        self.overflow(homeless, b, now_ms);
         Some(Recorded::Overflowed)
+    }
+
+    /// Puts `record` at `(b, r)`, returning the record it replaces.
+    fn put(&mut self, b: usize, r: usize, record: Record) -> Record {
+        self.buckets
+            .get_mut(b)
+            .and_then(|bucket| bucket.0.get_mut(r))
+            .map_or(Record::default(), |slot| core::mem::replace(slot, record))
     }
 
     /// The debt that applies to a key with `hash` at `now_ms`: its own exact
@@ -689,7 +838,7 @@ impl<S: KeyState> ShardMap<S> {
                 if let Some(debt) = slot.state.debt(now) {
                     // `evictable` checked that a seeded key fits the exact
                     // table, so recording cannot fail.
-                    match recovery.record(slot.hash, debt, now_ms, size, !slot.seeded) {
+                    match recovery.record(slot.hash, debt, now_ms, size, slot.seeded) {
                         Some(Recorded::Overflowed) => {
                             out.remembered += 1;
                             out.overflowed += 1;
@@ -1708,15 +1857,15 @@ mod tests {
             let _ = check(&store, k, 1, 0, slow(5));
         }
         // Two records per key of capacity (50 buckets of 4, rounded up to 64)
-        // and one overflow cell per key (128): 5 KiB, whatever the flood.
+        // and four overflow cells per key (512): 8 KiB, whatever the flood.
         assert_eq!(
             store.table,
             TableSize {
                 buckets: 64,
-                cells: 128
+                cells: 512
             }
         );
-        assert_eq!(store.recovery_bytes(), 64 * 64 + 128 * 8);
+        assert_eq!(store.recovery_bytes(), 64 * 64 + 512 * 8);
         assert_eq!(
             TableSize::for_cap(1),
             TableSize {
@@ -1728,7 +1877,7 @@ mod tests {
             TableSize::for_cap(usize::MAX),
             TableSize {
                 buckets: 8_192,
-                cells: 16_384
+                cells: 65_536
             }
         );
     }
@@ -2018,11 +2167,11 @@ mod tests {
 
         // The same key remembered twice keeps the larger debt and later end.
         assert_eq!(
-            table.record(7, debt(2, 100), 0, size, true),
+            table.record(7, debt(2, 100), 0, size, false),
             Some(Recorded::Exact)
         );
         assert_eq!(
-            table.record(7, debt(1, 300), 0, size, true),
+            table.record(7, debt(1, 300), 0, size, false),
             Some(Recorded::Exact)
         );
         assert_eq!(table.peek(7, 0), Some(own(2, 300)));
@@ -2030,39 +2179,70 @@ mod tests {
         assert_eq!(table.peek(7, 300), None);
         assert!(table.is_spent(300));
 
-        // Fill the 8 exact records; the next debt overflows into the sketch,
-        // or is refused when overflow is not allowed.
+        // Two buckets: every key's pair is the whole table, so cuckoo moves
+        // fill all 8 records; the ninth debt overflows into the sketch.
+        let hashes = (100..200u64).map(|hash| hash.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut table = Recovery::new();
-        let mut overflowed = None;
-        for hash in 100..200u64 {
-            let hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            match table.record(hash, debt(5, 1_000), 0, size, true) {
-                Some(Recorded::Overflowed) => {
-                    overflowed = Some(hash);
-                    break;
-                }
-                Some(Recorded::Exact) => {}
-                None => panic!("overflow is allowed"),
-            }
+        for (i, hash) in hashes.clone().take(9).enumerate() {
+            let expect = if i < 8 {
+                Recorded::Exact
+            } else {
+                Recorded::Overflowed
+            };
+            assert_eq!(
+                table.record(hash, debt(5, 1_000), 0, size, false),
+                Some(expect)
+            );
         }
-        let overflowed = overflowed.unwrap(); // eight records fill up
-        assert_eq!(
-            table.record(overflowed ^ 1, debt(5, 1_000), 0, size, false),
-            None
-        );
-        assert!(!table.has_exact_room(overflowed ^ 1, 0));
-        // The overflowed key reads back at least its own debt, as shared.
-        let charge = table.peek(overflowed, 0).unwrap(); // both cells are live
-        assert!(charge.shared && charge.debt.spent >= 5);
+        // Every key reads back at least its own debt: the one whose record
+        // was left homeless (whichever the walk displaced) from the sketch.
+        let mut shared = 0;
+        for hash in hashes.clone().take(9) {
+            let charge = table.peek(hash, 0).unwrap();
+            assert!(charge.debt.spent >= 5);
+            shared += usize::from(charge.shared);
+        }
+        assert!(shared >= 1);
         assert!(!table.is_spent(0));
         assert!(table.is_spent(1_000));
 
+        // An inherited debt displaces a movable one (which overflows), and is
+        // itself never moved: once all 8 records are inherited, the next
+        // inherited debt is refused and a plain one overflows.
+        let mut table = Recovery::new();
+        let mut inherited = hashes.clone().skip(10);
+        for _ in 0..8 {
+            let hash = inherited.next().unwrap();
+            assert!(table.has_exact_room(hash, 0));
+            assert_eq!(
+                table.record(hash, debt(7, 2_000), 0, size, true),
+                Some(Recorded::Exact)
+            );
+        }
+        let refused = inherited.next().unwrap();
+        assert!(!table.has_exact_room(refused, 0));
+        assert_eq!(table.record(refused, debt(7, 2_000), 0, size, true), None);
+        assert_eq!(
+            table.record(1, debt(1, 500), 0, size, false),
+            Some(Recorded::Overflowed)
+        );
+        for hash in hashes.skip(10).take(8) {
+            let charge = table.peek(hash, 0).unwrap();
+            assert_eq!(charge.debt, debt(7, 2_000));
+        }
+        // An inherited debt never reaches the sketch: only the plain one did.
+        assert_eq!(
+            table.cells.iter().filter(|&&cell| cell != 0).count(),
+            2,
+            "only the plain debt's two cells"
+        );
+
         // A key's own record is cleared by `forget` and by `take`.
         let mut table = Recovery::new();
-        let _ = table.record(9, debt(3, 50), 0, size, true);
+        let _ = table.record(9, debt(3, 50), 0, size, false);
         assert!(table.forget(9, 0));
         assert_eq!(table.peek(9, 0), None);
-        let _ = table.record(9, debt(3, 50), 0, size, true);
+        let _ = table.record(9, debt(3, 50), 0, size, false);
         assert_eq!(table.take(9, 0), Some(own(3, 50)));
         assert_eq!(table.peek(9, 0), None);
         assert!(super::pack(u64::MAX, u32::MAX) > 0);
@@ -2070,6 +2250,58 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// Whatever the order of debts recorded, taken, and moved by cuckoo
+        /// walks, every key reads back at least the debt it still owes.
+        #[test]
+        fn prop_recovery_never_loses_a_debt(
+            buckets_log in 1u32..4,
+            ops in proptest::collection::vec((0u64..48, 1u32..20, 1u64..400, 0u64..3, proptest::bool::ANY), 1..400),
+        ) {
+            use super::{Recovery, TableSize};
+            use crate::algo::Debt;
+
+            let size = TableSize { buckets: 1 << buckets_log, cells: 8 };
+            let mut table = Recovery::new();
+            // The debts recorded for each key since it last returned:
+            // (spent, until_ms). Each must be covered while it is live.
+            let mut owed: std::collections::HashMap<u64, Vec<(u32, u64)>> = std::collections::HashMap::new();
+            let mut now = 0u64;
+            for (key, spent, ttl, op, inherited) in ops {
+                let hash = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (key << 7);
+                match op {
+                    0 => {
+                        now += ttl / 8;
+                    }
+                    1 => {
+                        // The key returns: its charge covers what it owed.
+                        let charge = table.take(hash, now);
+                        for &(s, u) in owed.get(&hash).into_iter().flatten() {
+                            if u > now {
+                                let charge = charge.unwrap();
+                                proptest::prop_assert!(charge.debt.spent >= s);
+                                proptest::prop_assert!(charge.debt.until >= Duration::from_millis(u));
+                            }
+                        }
+                        let _ = owed.remove(&hash);
+                    }
+                    _ => {
+                        let debt = Debt { spent, until: Duration::from_millis(now + ttl) };
+                        if table.record(hash, debt, now, size, inherited).is_some() {
+                            owed.entry(hash).or_default().push((spent, now + ttl));
+                        }
+                    }
+                }
+                for (&hash, &(s, u)) in owed.iter().flat_map(|(hash, debts)| debts.iter().map(move |debt| (hash, debt))) {
+                    if u > now {
+                        let charge = table.peek(hash, now);
+                        proptest::prop_assert!(charge.is_some(), "a debt was lost");
+                        let charge = charge.unwrap();
+                        proptest::prop_assert!(charge.debt.spent >= s && charge.debt.until >= Duration::from_millis(u));
+                    }
+                }
+            }
+        }
+
         /// Under any interleaving of inserts, repeats, and idle gaps the index
         /// stays consistent with the slots and the cap holds.
         #[test]
