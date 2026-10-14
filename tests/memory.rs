@@ -64,7 +64,7 @@ static ALLOCATOR: Tracking = Tracking;
 /// The documented ceiling: live heap per tracked key, worst case across the
 /// growth steps of the shard vectors (which double, so a store that has just
 /// grown carries up to 2x slack).
-const BUDGET_BYTES_PER_KEY: isize = 512;
+const BUDGET_BYTES_PER_KEY: isize = 256;
 
 /// Live heap per key for `keys` unique keys.
 fn bytes_per_key(keys: u64) -> isize {
