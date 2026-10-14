@@ -23,6 +23,8 @@
 //! - `check/direct` — a [`DirectLimiter`]: no key, no map, no shard lock.
 //! - `check/direct_coarse_clock` — the same on a [`CoarseClock`].
 //! - `peek/existing_key` — reading an allowance for `RateLimit-*` headers.
+//! - `check/blocked_key` — a key whose `quota_for` override admits nothing (a
+//!   blocked tenant): denied without ever taking the shard write lock.
 //!
 //! Run with `cargo bench --bench rate_bench`.
 
@@ -32,7 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rate_net::{CoarseClock, DEFAULT_MAX_KEYS, DirectLimiter, Eviction, RateLimiter};
+use rate_net::{CoarseClock, DEFAULT_MAX_KEYS, DirectLimiter, Eviction, Quota, RateLimiter};
 
 /// A limiter with effectively no rate ceiling, so the benchmark measures the
 /// check machinery rather than the deny branch.
@@ -185,6 +187,17 @@ fn bench_peek(c: &mut Criterion) {
     });
 }
 
+fn bench_blocked_key(c: &mut Criterion) {
+    let limiter = RateLimiter::builder()
+        .per_second(u32::MAX)
+        .quota_for(|key| (key.as_bytes() == b"blocked").then(|| Quota::per_second(0)))
+        .build();
+
+    let _ = c.bench_function("check/blocked_key", |b| {
+        b.iter(|| limiter.check(black_box("blocked")));
+    });
+}
+
 criterion_group!(
     benches,
     bench_single_key,
@@ -196,6 +209,7 @@ criterion_group!(
     bench_insert_at_default_cap,
     bench_direct,
     bench_direct_coarse_clock,
-    bench_peek
+    bench_peek,
+    bench_blocked_key
 );
 criterion_main!(benches);

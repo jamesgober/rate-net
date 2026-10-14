@@ -7,11 +7,13 @@
 //! checks' latency distribution (p50, p99, p99.9, max) with and without the
 //! flood, so the question "does a flood stall real users?" has a number.
 //!
-//! Three scenarios: no flood; a flood of keys that recover at once (each
+//! Four scenarios: no flood; a flood of keys that recover at once (each
 //! eviction is lossless); and a flood of keys that each drain a slow quota, so
 //! every eviction must record the key's debt in the recovery table — which the
-//! flood overloads, so records merge. The legitimate keys run on a quota they
-//! never exhaust (a per-key override), so every timed check is admitted.
+//! flood overloads — under the default `Overflow::Forget` (the overflow is
+//! dropped) and under `Overflow::FailClosed` (it spills into the shared
+//! sketch). The legitimate keys run on a quota they never exhaust (a per-key
+//! override), so every timed check is admitted.
 //!
 //! In `1.0.0` each flood insert scanned its whole shard under the shard's write
 //! lock, and a legitimate check landing in that shard waited for the scan.
@@ -31,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rate_net::{DEFAULT_MAX_KEYS, Quota, RateLimiter};
+use rate_net::{DEFAULT_MAX_KEYS, Eviction, Overflow, Quota, RateLimiter};
 
 /// Threads inserting unique keys during the flood scenario.
 const FLOOD_THREADS: u64 = 3;
@@ -60,7 +62,12 @@ fn main() {
             "{:<22} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}",
             "scenario", "p50", "p99", "p99.9", "max", "legit checks", "flood inserts"
         );
-        for flood in [Flood::None, Flood::Recovering, Flood::Draining] {
+        for flood in [
+            Flood::None,
+            Flood::Recovering,
+            Flood::Draining,
+            Flood::DrainingFailClosed,
+        ] {
             let report = run(flood, duration);
             println!(
                 "{:<22} {:>10} {:>10} {:>10} {:>10} {:>12} {:>14}",
@@ -85,8 +92,10 @@ enum Flood {
     /// is evicted.
     Recovering,
     /// Unique keys that each spend a 1-per-minute quota: every eviction
-    /// records a debt.
+    /// records a debt (`Overflow::Forget`).
     Draining,
+    /// The same under `Overflow::FailClosed`.
+    DrainingFailClosed,
 }
 
 impl Flood {
@@ -95,6 +104,7 @@ impl Flood {
             Self::None => "no flood",
             Self::Recovering => "flood, recovered keys",
             Self::Draining => "flood, drained keys",
+            Self::DrainingFailClosed => "same, FailClosed",
         }
     }
 }
@@ -112,10 +122,16 @@ fn run(flood: Flood, duration: Duration) -> Report {
     // A rate no legitimate key will exhaust, so every timed check is admitted;
     // in the draining scenario, flood keys (below LEGIT_BASE) get one unit a
     // minute instead.
-    let draining = flood == Flood::Draining;
+    let draining = matches!(flood, Flood::Draining | Flood::DrainingFailClosed);
+    let overflow = if flood == Flood::DrainingFailClosed {
+        Overflow::FailClosed
+    } else {
+        Overflow::Forget
+    };
     let limiter = Arc::new(
         RateLimiter::builder()
             .per_second(u32::MAX)
+            .eviction(Eviction::default().with_overflow(overflow))
             .quota_for(move |key| {
                 let bytes: [u8; 8] = key.as_bytes().try_into().ok()?;
                 (draining && u64::from_be_bytes(bytes) < LEGIT_BASE).then(|| Quota::per_minute(1))

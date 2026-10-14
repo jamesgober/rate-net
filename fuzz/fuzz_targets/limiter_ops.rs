@@ -1,10 +1,15 @@
 //! Drives a small, heavily evicting limiter with an arbitrary sequence of
 //! checks, clock advances, and key-management calls, and checks it against an
 //! oracle: for the token bucket, the units admitted for one key in any time
-//! interval `[a, b]` never exceed `burst + rate * (b - a)` — whatever eviction,
-//! debt recording, merging, resets, and removals happened in between (a reset
-//! or removal starts a key's accounting over). For every algorithm, nothing
-//! panics and the store never exceeds its cap.
+//! interval `[a, b]` never exceed `burst + rate * (b - a)` for that key's own
+//! quota — whatever capacity and idle-TTL eviction, debt recording, cuckoo
+//! moves, overflow, resets, and removals happened in between (a reset or
+//! removal starts a key's accounting over). Keys 200..=254 run under a
+//! `quota_for` override far slower than the default, so their recovery
+//! outlasts the idle TTL (the RN3-001 case). The oracle is enforced under
+//! `Overflow::FailClosed`, and under `Overflow::Forget` while no debt has been
+//! dropped. For every algorithm, nothing panics and the store never exceeds
+//! its cap.
 
 #![no_main]
 
@@ -15,7 +20,7 @@ use std::time::Duration;
 use arbitrary::Arbitrary;
 use clock_lib::ManualClock;
 use libfuzzer_sys::fuzz_target;
-use rate_net::{Algorithm, Eviction, Quota, RateLimiter};
+use rate_net::{Algorithm, Eviction, Overflow, Quota, RateLimiter};
 
 #[derive(Arbitrary, Debug)]
 enum Op {
@@ -32,12 +37,25 @@ struct Input {
     algorithm: u8,
     cap: u8,
     idle_ms: Option<u16>,
+    fail_closed: bool,
     ops: Vec<Op>,
 }
 
-/// 5 per second, burst 4.
+/// The default quota: 5 per second, burst 4.
 const LIMIT: u64 = 5;
 const BURST: u64 = 4;
+const PERIOD_MS: u64 = 1_000;
+
+/// The override for keys 200..=254: 5 per 10 seconds, burst 5 — a recovery
+/// of 10 s, longer than the idle TTL the default quota allows (0.8 s), and
+/// short enough for a few clock advances to cross it.
+const SLOW_LIMIT: u64 = 5;
+const SLOW_BURST: u64 = 5;
+const SLOW_PERIOD_MS: u64 = 10_000;
+
+fn is_slow(key: u8) -> bool {
+    (200..255).contains(&key)
+}
 
 fuzz_target!(|input: Input| {
     let algorithm = match input.algorithm % 5 {
@@ -52,14 +70,23 @@ fuzz_target!(|input: Input| {
         Some(ms) => Eviction::new(cap, Duration::from_millis(u64::from(ms))),
         None => Eviction::capacity(cap),
     };
+    let overflow = if input.fail_closed {
+        Overflow::FailClosed
+    } else {
+        Overflow::Forget
+    };
     let clock = Arc::new(ManualClock::new());
     let limiter = RateLimiter::builder()
         .algorithm(algorithm)
         .quota(5, Duration::from_secs(1))
         .burst(4)
         .shards(1)
-        .eviction(eviction)
-        .quota_for(|key| (key.as_bytes() == [255]).then(|| Quota::per_second(0)))
+        .eviction(eviction.with_overflow(overflow))
+        .quota_for(|key| match key.as_bytes() {
+            [255] => Some(Quota::per_second(0)),
+            [k] if is_slow(*k) => Quota::rate(5, Duration::from_secs(10)).ok(),
+            _ => None,
+        })
         .clock(Arc::clone(&clock))
         .build();
 
@@ -109,13 +136,22 @@ fuzz_target!(|input: Input| {
     if algorithm != Algorithm::TokenBucket {
         return;
     }
+    if overflow == Overflow::Forget && limiter.metrics().debts_forgotten > 0 {
+        // Past the exact table, Forget drops debts by design.
+        return;
+    }
     for (key, events) in &admitted {
+        let (limit, burst, period) = if is_slow(*key) {
+            (SLOW_LIMIT, SLOW_BURST, SLOW_PERIOD_MS)
+        } else {
+            (LIMIT, BURST, PERIOD_MS)
+        };
         for (i, &(a, _)) in events.iter().enumerate() {
             let mut units = 0;
             for &(b, n) in &events[i..] {
                 units += n;
                 assert!(
-                    units * 1_000 <= BURST * 1_000 + LIMIT * (b - a),
+                    units * period <= burst * period + limit * (b - a),
                     "key {key}: {units} units admitted in [{a}ms, {b}ms]"
                 );
             }
