@@ -40,14 +40,11 @@ use crate::snapshot::Snapshot;
 /// assert_eq!(limiter.peek().remaining(), 49);
 /// ```
 pub struct DirectLimiter<C: Clock + Clone = SystemClock> {
-    state: AlgoState<C>,
+    state: AlgoState,
     algorithm: Algorithm,
     quota: Quota,
     clock: C,
     epoch: Monotonic,
-    /// The token bucket reads its own clock; every other algorithm needs the
-    /// elapsed time passed in.
-    reads_clock: bool,
     /// Allowed / denied counters. Absent without the `metrics` feature.
     #[cfg(feature = "metrics")]
     counters: crate::metrics::Counters,
@@ -112,14 +109,13 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// Assembles a direct limiter. Shared with the builder.
     pub(crate) fn build(algorithm: Algorithm, quota: Quota, clock: C) -> Self {
         let epoch = clock.now();
-        let state = AlgoState::new(algorithm, &quota, clock.clone(), Duration::ZERO);
+        let state = AlgoState::new(algorithm, &quota, Duration::ZERO);
         Self {
             state,
             algorithm,
             quota,
             clock,
             epoch,
-            reads_clock: algorithm != Algorithm::TokenBucket,
             #[cfg(feature = "metrics")]
             counters: crate::metrics::Counters::new(),
         }
@@ -198,12 +194,7 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// ```
     #[inline]
     pub fn check_n(&self, n: u32) -> Decision {
-        let now = if self.reads_clock {
-            self.now()
-        } else {
-            Duration::ZERO
-        };
-        let decision = self.state.acquire(n, now);
+        let decision = self.state.acquire(n, self.now());
         #[cfg(feature = "metrics")]
         self.counters.decision(decision.is_allow());
         decision
@@ -261,7 +252,7 @@ impl<C: Clock + Clone> DirectLimiter<C> {
     /// assert!(limiter.check().is_allow());
     /// ```
     pub fn reset(&self) {
-        self.state.reset();
+        self.state.reset(self.now());
     }
 
     /// The quota this limiter enforces, as configured.

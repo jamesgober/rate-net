@@ -3,6 +3,7 @@
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 /// Keys up to this many bytes are stored inline, with no heap allocation. It
 /// covers the common identities — an IPv6 address (16 bytes), an IPv6 prefix
@@ -25,6 +26,10 @@ enum Kind {
     Ip,
     /// A masked IP prefix plus its length, from the `*_prefix` constructors.
     IpPrefix,
+    /// A keyed 128-bit digest standing in for a key longer than the limiter's
+    /// digest threshold (`Builder::digest_keys_longer_than`). Never produced by
+    /// a public constructor, so no caller-built key can equal one.
+    Digest,
 }
 
 #[derive(Clone)]
@@ -35,8 +40,9 @@ enum Repr {
         len: u8,
         buf: [u8; INLINE_CAP],
     },
-    /// Bytes too long to inline, on the heap.
-    Heap { kind: Kind, bytes: Box<[u8]> },
+    /// Bytes too long to inline, on the heap. Shared, so cloning a long key
+    /// (passing `&key` to a check, retrying in a wait loop) never allocates.
+    Heap { kind: Kind, bytes: Arc<[u8]> },
 }
 
 /// An opaque identity a rate limit is tracked against.
@@ -112,21 +118,17 @@ impl Key {
         } else {
             Self(Repr::Heap {
                 kind,
-                bytes: bytes.into(),
+                bytes: Arc::from(bytes),
             })
         }
     }
 
-    /// Builds a raw key from owned bytes, reusing the allocation when they are
-    /// too long to inline.
-    fn from_vec(bytes: Vec<u8>) -> Self {
-        if bytes.len() <= INLINE_CAP {
-            Self::with_kind(Kind::Raw, &bytes)
-        } else {
-            Self(Repr::Heap {
-                kind: Kind::Raw,
-                bytes: bytes.into_boxed_slice(),
-            })
+    /// The borrowed view the store looks keys up by.
+    #[inline]
+    pub(crate) fn as_key_ref(&self) -> KeyRef<'_> {
+        KeyRef {
+            kind: self.kind(),
+            bytes: self.as_bytes(),
         }
     }
 
@@ -283,6 +285,36 @@ impl Key {
         }
     }
 
+    /// The number of bytes in the key (without its kind tag).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Key;
+    ///
+    /// assert_eq!(Key::from("abc").len(), 3);
+    /// assert_eq!(Key::id(7).len(), 8);
+    /// ```
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    /// Whether the key has no bytes (the empty string or slice).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Key;
+    ///
+    /// assert!(Key::from("").is_empty());
+    /// assert!(!Key::from("a").is_empty());
+    /// ```
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.as_bytes().is_empty()
+    }
+
     /// The key's kind tag.
     const fn kind(&self) -> Kind {
         match &self.0 {
@@ -317,7 +349,7 @@ fn canonical(addr: IpAddr) -> IpAddr {
 
 impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
-        self.kind() == other.kind() && self.as_bytes() == other.as_bytes()
+        self.as_key_ref() == other.as_key_ref()
     }
 }
 
@@ -325,8 +357,58 @@ impl Eq for Key {}
 
 impl Hash for Key {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.kind().hash(state);
-        self.as_bytes().hash(state);
+        self.as_key_ref().hash(state);
+    }
+}
+
+/// A borrowed key: its kind and its bytes, without owning them.
+///
+/// The store finds an existing key by this view, so a check never has to build
+/// (and, for a long key, allocate) an owned [`Key`]; one is built only when the
+/// key is first stored. It hashes and compares exactly like the `Key` it
+/// stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyRef<'a> {
+    kind: Kind,
+    bytes: &'a [u8],
+}
+
+impl<'a> KeyRef<'a> {
+    /// A raw (untagged) key over `bytes` — the view of `Key::from(bytes)`.
+    #[inline]
+    pub(crate) const fn raw(bytes: &'a [u8]) -> Self {
+        Self {
+            kind: Kind::Raw,
+            bytes,
+        }
+    }
+
+    /// The view of a digest key over its 16 digest bytes.
+    #[inline]
+    pub(crate) const fn digest(digest: &'a [u8; 16]) -> Self {
+        Self {
+            kind: Kind::Digest,
+            bytes: digest,
+        }
+    }
+
+    /// The key's bytes.
+    #[inline]
+    pub(crate) const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// The owned key this view stands for.
+    pub(crate) fn to_key(self) -> Key {
+        Key::with_kind(self.kind, self.bytes)
+    }
+}
+
+impl Hash for KeyRef<'_> {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.bytes.hash(state);
     }
 }
 
@@ -355,7 +437,7 @@ impl From<&str> for Key {
 
 impl From<String> for Key {
     fn from(value: String) -> Self {
-        Self::from_vec(value.into_bytes())
+        Self::with_kind(Kind::Raw, value.as_bytes())
     }
 }
 
@@ -373,7 +455,23 @@ impl From<&[u8]> for Key {
 
 impl From<Vec<u8>> for Key {
     fn from(value: Vec<u8>) -> Self {
-        Self::from_vec(value)
+        Self::with_kind(Kind::Raw, &value)
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for Key {
+    /// A raw key of the array's bytes — a digest, a UUID's 16 bytes, a fixed
+    /// identifier — equal to `Key::from(&array[..])`.
+    fn from(value: [u8; N]) -> Self {
+        Self::with_kind(Kind::Raw, &value)
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for Key {
+    /// A raw key of the array's bytes, so a byte-string literal (`b"..."`)
+    /// works directly.
+    fn from(value: &[u8; N]) -> Self {
+        Self::with_kind(Kind::Raw, value)
     }
 }
 
@@ -423,7 +521,7 @@ impl From<SocketAddr> for Key {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::{INLINE_CAP, Key, Repr};
+    use super::{INLINE_CAP, Key, KeyRef, Repr};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn is_inline(key: &Key) -> bool {
@@ -603,6 +701,52 @@ mod tests {
         let at_cap = vec![b'x'; INLINE_CAP];
         assert!(is_inline(&Key::from(at_cap.as_slice())));
         assert!(is_inline(&Key::from(at_cap)));
+    }
+
+    #[test]
+    fn test_arrays_are_raw_byte_keys() {
+        let bytes = [7u8; 16];
+        assert_eq!(Key::from(bytes), Key::from(&bytes[..]));
+        assert_eq!(Key::from(&bytes), Key::from(&bytes[..]));
+        assert_eq!(Key::from(b"abc"), Key::from("abc"));
+        assert_eq!(Key::from(b"abc").len(), 3);
+        assert!(Key::from(b"").is_empty());
+    }
+
+    #[test]
+    fn test_key_ref_hashes_and_compares_like_its_key() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        fn hash<T: Hash>(value: &T) -> u64 {
+            let mut h = DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        }
+
+        let long = "a-key-long-enough-to-live-on-the-heap";
+        for key in [
+            Key::from("short"),
+            Key::from(long),
+            Key::id(9),
+            Key::ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let view = key.as_key_ref();
+            assert_eq!(hash(&key), hash(&view));
+            assert_eq!(view.to_key(), key);
+            assert_eq!(view.bytes(), key.as_bytes());
+        }
+        assert_eq!(KeyRef::raw(long.as_bytes()).to_key(), Key::from(long));
+        assert_eq!(hash(&KeyRef::raw(long.as_bytes())), hash(&Key::from(long)));
+        let digest = [1u8; 16];
+        assert_ne!(KeyRef::digest(&digest).to_key(), Key::from(digest));
+    }
+
+    #[test]
+    fn test_cloning_a_long_key_shares_its_bytes() {
+        let long = Key::from("a-key-long-enough-to-live-on-the-heap");
+        let copy = long.clone();
+        assert_eq!(long.as_bytes().as_ptr(), copy.as_bytes().as_ptr());
     }
 
     #[test]

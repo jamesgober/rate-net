@@ -57,6 +57,26 @@ pub struct Metrics {
     pub keys_expired: u64,
     /// Keys removed explicitly: `remove`, `clear`, and `retain_recent`.
     pub keys_removed: u64,
+    /// Evicted keys that had not yet recovered their full allowance, whose
+    /// outstanding debt was recorded so that a returning key resumes no more
+    /// permissive than it left (see [`Eviction`](crate::Eviction)). Counted
+    /// within `keys_evicted` / `keys_expired`. A steady rate means the cap is
+    /// evicting keys that are still being limited — raise it.
+    pub keys_remembered: u64,
+    /// New keys that resumed from a recorded debt instead of a fresh
+    /// allowance: evicted keys coming back while still limited.
+    pub keys_restored: u64,
+    /// Debt records that had to be merged with an unrelated key's because the
+    /// recovery table was full. A merged record restricts every new key that
+    /// hashes to it until it expires — the store failing closed under extreme
+    /// eviction pressure. Zero is normal; any sustained rate means the cap is
+    /// far too small for the traffic, or the limiter is under a unique-key
+    /// flood.
+    pub records_merged: u64,
+    /// Checks refused because the key exceeded the limiter's maximum key
+    /// length (`Builder::max_key_len`). Counted within `denied`; such keys are
+    /// never stored.
+    pub keys_rejected: u64,
 }
 
 /// The live counters behind [`Metrics`], one set per shard (or per direct
@@ -68,6 +88,10 @@ pub(crate) struct Counters {
     evicted: AtomicU64,
     expired: AtomicU64,
     removed: AtomicU64,
+    remembered: AtomicU64,
+    restored: AtomicU64,
+    merged: AtomicU64,
+    rejected: AtomicU64,
 }
 
 impl Counters {
@@ -79,6 +103,10 @@ impl Counters {
             evicted: AtomicU64::new(0),
             expired: AtomicU64::new(0),
             removed: AtomicU64::new(0),
+            remembered: AtomicU64::new(0),
+            restored: AtomicU64::new(0),
+            merged: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
         }
     }
 
@@ -114,6 +142,26 @@ impl Counters {
         }
     }
 
+    #[inline]
+    pub(crate) fn remembered(&self) {
+        let _previous = self.remembered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn restored(&self) {
+        let _previous = self.restored.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn merged(&self) {
+        let _previous = self.merged.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn rejected(&self) {
+        let _previous = self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Adds this set's values into `into`.
     pub(crate) fn add_to(&self, into: &mut Metrics) {
         into.allowed += self.allowed.load(Ordering::Relaxed);
@@ -122,6 +170,10 @@ impl Counters {
         into.keys_evicted += self.evicted.load(Ordering::Relaxed);
         into.keys_expired += self.expired.load(Ordering::Relaxed);
         into.keys_removed += self.removed.load(Ordering::Relaxed);
+        into.keys_remembered += self.remembered.load(Ordering::Relaxed);
+        into.keys_restored += self.restored.load(Ordering::Relaxed);
+        into.records_merged += self.merged.load(Ordering::Relaxed);
+        into.keys_rejected += self.rejected.load(Ordering::Relaxed);
     }
 }
 
@@ -140,6 +192,10 @@ mod tests {
         counters.expired(0);
         counters.expired(3);
         counters.removed(4);
+        counters.remembered();
+        counters.restored();
+        counters.merged();
+        counters.rejected();
         let mut metrics = Metrics::default();
         counters.add_to(&mut metrics);
         counters.add_to(&mut metrics);
@@ -152,6 +208,10 @@ mod tests {
                 keys_evicted: 4,
                 keys_expired: 6,
                 keys_removed: 8,
+                keys_remembered: 2,
+                keys_restored: 2,
+                records_merged: 2,
+                keys_rejected: 2,
             }
         );
     }
