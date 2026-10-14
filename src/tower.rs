@@ -286,6 +286,13 @@ impl KeyExtractor for PeerIp {
 /// With `trusted_proxies == 0` the header is ignored and the peer address is
 /// used, as [`PeerIp`].
 ///
+/// Addresses are compared as [`Key::ip`] compares them: an IPv6 address with
+/// an embedded IPv4 one — mapped (`::ffff:a.b.c.d`) or compatible
+/// (`::a.b.c.d`) — is that IPv4 address, for peers and for `only_from`
+/// networks alike (an embedded network keeps its last `prefix_len - 96`
+/// bits, so `::ffff:10.0.0.0/104` is `10.0.0.0/8`). A prefix length of `0`
+/// matches every peer, of either family.
+///
 /// # Examples
 ///
 /// ```
@@ -352,7 +359,7 @@ impl ForwardedFor {
     /// ```
     #[must_use]
     pub fn only_from(mut self, addr: IpAddr, prefix_len: u8) -> Self {
-        self.proxies.push((addr, prefix_len));
+        self.proxies.push(network(addr, prefix_len));
         self
     }
 
@@ -368,7 +375,10 @@ impl ForwardedFor {
 /// Whether `addr` is in the network `net / len` (IPv4-mapped addresses
 /// compare as IPv4).
 fn in_network(addr: IpAddr, net: IpAddr, len: u8) -> bool {
-    match (canonical(addr), canonical(net)) {
+    if len == 0 {
+        return true;
+    }
+    match (canonical(addr), net) {
         (IpAddr::V4(a), IpAddr::V4(n)) => {
             let mask = u32::MAX
                 .checked_shl(32 - u32::from(len.min(32)))
@@ -385,11 +395,23 @@ fn in_network(addr: IpAddr, net: IpAddr, len: u8) -> bool {
     }
 }
 
-/// `addr` with an IPv4-mapped IPv6 address unwrapped.
+/// `addr` with an embedded IPv4 address (mapped or compatible) unwrapped, as
+/// [`Key::ip`] does.
 fn canonical(addr: IpAddr) -> IpAddr {
-    match addr {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
-        IpAddr::V4(_) => addr,
+    crate::key::canonical_ip(addr)
+}
+
+/// The network `addr / prefix_len` in canonical form: an IPv6 network whose
+/// prefix covers an embedded IPv4 address (`prefix_len >= 96`) becomes that
+/// IPv4 network with the remaining bits; lengths past the family's width are
+/// clamped.
+fn network(addr: IpAddr, prefix_len: u8) -> (IpAddr, u8) {
+    match (addr, canonical(addr)) {
+        (IpAddr::V6(_), IpAddr::V4(v4)) if prefix_len >= 96 => {
+            (IpAddr::V4(v4), (prefix_len - 96).min(32))
+        }
+        (IpAddr::V4(v4), _) => (IpAddr::V4(v4), prefix_len.min(32)),
+        (v6, _) => (v6, prefix_len.min(128)),
     }
 }
 
@@ -449,8 +471,11 @@ fn parse_addr(text: &str) -> Option<IpAddr> {
 /// digest of it instead of its bytes: the bytes a key holds are bounded
 /// whatever clients send. Shorter values are the key as they are. The digest
 /// is two independently, randomly seeded 64-bit hashes (fresh per
-/// extractor): a client cannot aim a value at another's key, but it is not a
-/// cryptographic hash.
+/// extractor, and shared by its clones): a client cannot aim a value at
+/// another's key, but it is not a cryptographic hash. Two separately created
+/// `HeaderKey`s digest the same long value differently, so layers that share
+/// one limiter should share one extractor (clone it) to key a long value
+/// alike.
 ///
 /// # Examples
 ///
@@ -1221,6 +1246,36 @@ mod tests {
             "fd00::".parse().unwrap(),
             8
         ));
+    }
+
+    #[test]
+    fn test_only_from_compares_embedded_ipv4_as_ipv4() {
+        // RN3-006: IPv4-compatible peers, IPv4-mapped networks with an IPv6
+        // prefix length, and /0 networks.
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let net = |text: &str, len: u8| super::network(ip(text), len);
+        let inside = |peer: &str, (n, len): (IpAddr, u8)| super::in_network(ip(peer), n, len);
+        assert_eq!(net("::ffff:10.0.0.0", 104), (ip("10.0.0.0"), 8));
+        assert_eq!(net("::10.0.0.0", 104), (ip("10.0.0.0"), 8));
+        assert_eq!(net("10.0.0.0", 40), (ip("10.0.0.0"), 32));
+        assert!(inside("10.200.0.1", net("::ffff:10.0.0.0", 104)));
+        assert!(inside("::10.9.9.9", net("10.0.0.0", 8)));
+        assert!(inside("::ffff:10.9.9.9", net("10.0.0.0", 8)));
+        assert!(!inside("11.0.0.1", net("::ffff:10.0.0.0", 104)));
+        assert!(inside("192.0.2.1", net("::", 0)));
+        assert!(inside("2001:db8::1", net("0.0.0.0", 0)));
+        assert!(!inside("192.0.2.1", net("fd00::", 8)));
+        // Through the extractor: a compatible-form proxy peer is trusted.
+        let verified = ForwardedFor::trusting(1).only_from(ip("::ffff:10.0.0.0"), 104);
+        let mut request = Request::get("/")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(())
+            .unwrap();
+        let _previous = request.extensions_mut().insert(ip("::10.1.2.3"));
+        assert_eq!(
+            verified.extract(&RequestInfo::of(&request)),
+            Some(Key::ip_prefix(ip("203.0.113.7"), 32, 64))
+        );
     }
 
     #[test]

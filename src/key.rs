@@ -360,6 +360,11 @@ fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
 /// `addr` with any embedded IPv4 address unwrapped, so one client never has
 /// two identities.
 fn canonical(addr: IpAddr) -> IpAddr {
+    canonical_ip(addr)
+}
+
+/// [`canonical`] for the `tower` extractors.
+pub(crate) fn canonical_ip(addr: IpAddr) -> IpAddr {
     match addr {
         IpAddr::V6(v6) => embedded_ipv4(v6).map_or(addr, IpAddr::V4),
         IpAddr::V4(_) => addr,
