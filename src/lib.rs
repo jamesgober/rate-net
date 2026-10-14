@@ -6,7 +6,8 @@
 //! concurrency. Per-key state lives in a sharded store: an existing-key check
 //! takes one shard read lock plus the algorithm's atomic accounting, so
 //! unrelated keys rarely contend, and memory is bounded by O(1) eviction, so a
-//! flood of unique keys hits a cap instead of growing without limit.
+//! flood of unique keys hits a cap instead of growing without limit — and
+//! evicting a key never resets its limit.
 //!
 //! rate-net does not reimplement token-bucket accounting. It consumes
 //! [`better-bucket`](https://crates.io/crates/better-bucket) (1.1 or newer) for
@@ -18,15 +19,16 @@
 //!
 //! ## Status
 //!
-//! **Stable (`1.1.0`).** The public API is frozen until `2.0`; `1.1` only adds
-//! to it. The five algorithms sit behind the one [`Limiter`] trait (and the
+//! **Stable (`1.2.0`).** The public API is frozen until `2.0`; each `1.x` only
+//! adds to it. The five algorithms sit behind the one [`Limiter`] trait (and the
 //! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
 //! window algorithms under the `algorithms` feature — with the validating
-//! [`Builder`], [`peek`](RateLimiter::peek) snapshots and HTTP
-//! [`headers`](mod@headers) helpers, key management, the un-keyed
-//! [`DirectLimiter`], the `no_std` [`Gcra`] core, the fast [`CoarseClock`], and
-//! optional `AsyncLimiter` (`async`) and `Metrics` (`metrics`) layers. The
-//! steady-state check is allocation-free, and every public type is
+//! [`Builder`] (per-key quotas, key-length limits, long-key digests),
+//! [`peek`](RateLimiter::peek) snapshots and HTTP [`headers`](mod@headers)
+//! helpers, key management, the un-keyed [`DirectLimiter`], the `no_std`
+//! [`Gcra`] core, the fast [`CoarseClock`], and optional `AsyncLimiter`
+//! (`async`), `Metrics` (`metrics`), and `tower` middleware (`tower`) layers.
+//! The steady-state check is allocation-free, and every public type is
 //! `Send + Sync + 'static`, asserted at compile time.
 //!
 //! ```
@@ -65,9 +67,17 @@
 //!   slots for the capacity cap, and 8 slots of incremental idle sweep. The
 //!   only shard-wide pass left is the amortized growth or rehash of a shard's
 //!   index, and capped shards are kept at 16,384 keys or fewer so it stays
-//!   short.
-//! - **Zero-allocation steady state.** A `check` on an existing key allocates
-//!   nothing; allocation happens only the first time a key is seen.
+//!   short. A token-bucket key costs about 138 bytes at the default cap; key
+//!   bytes beyond 22 can be bounded with a maximum length or a digest.
+//! - **Eviction never resets a limit.** A key evicted before its allowance
+//!   recovered has its debt recorded, and resumes no more permissive than it
+//!   left; under extreme pressure the store fails closed, never open. See
+//!   [`Eviction`].
+//! - **Zero-allocation steady state.** A check on an existing key allocates
+//!   nothing: always through [`check_bytes`](RateLimiter::check_bytes), which
+//!   borrows the key, and through [`check`](RateLimiter::check) for keys of up
+//!   to 22 bytes (longer ones are copied into an owned [`Key`] first).
+//!   Allocation otherwise happens only the first time a key is seen.
 //! - **Fail closed.** The infallible constructors turn a degenerate
 //!   configuration into a limiter that denies everything; the validating
 //!   [`Builder::try_build`] reports it instead.
@@ -83,7 +93,7 @@
 //! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
 //! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
 //! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`]; compiled out when off. |
-//! | `tower`      | no  | [`tower`](mod@tower) middleware: `RateLimitLayer` with key extractors and `429` responses. Adds `http`, `tower-layer`, `tower-service`, `pin-project-lite`. |
+//! | `tower`      | no  | `rate_net::tower` middleware: `RateLimitLayer` with key extractors and `429` responses. Adds `http`, `tower-layer`, `tower-service`, `pin-project-lite`. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.

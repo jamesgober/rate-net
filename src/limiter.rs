@@ -207,7 +207,8 @@ impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
 /// atomic compare-and-swap for the token bucket, leaky bucket, and fixed
 /// window; a short per-key mutex for the sliding windows), and memory is
 /// bounded by O(1) [eviction](Self::with_eviction) so a flood of unique keys
-/// hits a cap instead of growing without limit. The
+/// hits a cap instead of growing without limit — without ever resetting an
+/// evicted key's limit. The
 /// limiter is `Send + Sync` and is meant to be shared — behind an
 /// [`Arc`](std::sync::Arc), or as a `static` — across all the threads serving
 /// requests.
@@ -501,7 +502,9 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// Returns [`Decision::Allow`] if the key is within its limit (the unit is
     /// counted), or [`Decision::Deny`] with the wait until it would be admitted.
     /// The key can be anything that converts into a [`Key`] — a string, an IP
-    /// address, a user id.
+    /// address, a user id. A key longer than 22 bytes is copied into a new
+    /// allocation on every call; [`check_bytes`](Self::check_bytes) borrows it
+    /// instead.
     ///
     /// # Examples
     ///
@@ -730,8 +733,11 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// refill completely. The key stays tracked.
     ///
     /// For administrative unblocks ("this customer was throttled by mistake")
-    /// and tests. Returns `true` if the key had state, `false` if it was not
-    /// tracked (an untracked key already has its full allowance).
+    /// and tests. Any debt recorded for the key when it was evicted (see
+    /// [`Eviction`]) is forgotten too. Returns `true` if the key had state or a
+    /// recorded debt, `false` if neither (it already had its full allowance).
+    /// A key the limiter refuses outright ([`Builder::max_key_len`](crate::Builder::max_key_len))
+    /// has neither.
     ///
     /// # Examples
     ///
@@ -755,10 +761,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
         }
     }
 
-    /// Forgets `key` entirely, releasing its state. Its next check starts from
-    /// a fresh allowance.
+    /// Forgets `key` entirely, releasing its state and any debt recorded for it
+    /// when it was evicted. Its next check starts from a fresh allowance.
     ///
-    /// Returns `true` if the key had state.
+    /// Returns `true` if the key had state or a recorded debt.
     ///
     /// # Examples
     ///
@@ -782,8 +788,8 @@ impl<C: Clock + Clone> RateLimiter<C> {
         }
     }
 
-    /// Forgets every key and releases the store's memory. Every key's next
-    /// check starts from a fresh allowance.
+    /// Forgets every key and every recorded debt, and releases the store's
+    /// memory. Every key's next check starts from a fresh allowance.
     ///
     /// # Examples
     ///

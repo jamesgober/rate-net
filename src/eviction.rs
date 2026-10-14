@@ -5,7 +5,10 @@ use core::time::Duration;
 /// The default key-capacity cap, applied unless overridden.
 ///
 /// Roughly a million keys. Generous for legitimate traffic, but a hard ceiling
-/// so a flood of unique keys can never grow the store without limit. Pick a
+/// so a flood of unique keys can never grow the store without limit. At this
+/// cap a default token-bucket limiter holds about 138 MiB of per-key state
+/// (measured: `tests/memory.rs`), plus up to 8 MiB of recovery records under
+/// eviction pressure, plus the bytes of any key longer than 22 bytes. Pick a
 /// value that matches your real key cardinality with [`Eviction::capacity`].
 pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 
@@ -17,16 +20,16 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// compose:
 ///
 /// - **Capacity** — a hard ceiling on the number of live keys. When inserting a
-///   new key would exceed it, one key is evicted by CLOCK (second chance): the
-///   first key not checked since the sweeping hand last passed it, so a key
-///   seen once goes before a key in active use. This is what caps a unique-key
-///   flood.
+///   new key would exceed it, one key is evicted by CLOCK (second chance),
+///   preferring a key whose allowance has **recovered** (is whole again —
+///   forgetting it loses nothing), and otherwise the first key not checked
+///   since the sweeping hand last passed it, so a key seen once goes before a
+///   key in active use. This is what caps a unique-key flood.
 /// - **Idle TTL** — keys not seen for longer than the TTL are reclaimed, so
 ///   long-idle state is not held forever. The effective TTL is never shorter
 ///   than the quota's *recovery time* (the time an idle key needs to regain its
-///   full allowance): reclaiming a key sooner would hand it a fresh quota early.
-///   `Builder::try_build` rejects a shorter TTL; the other constructors raise
-///   it.
+///   full allowance), so an expired key has normally recovered. `try_build`
+///   rejects a shorter TTL; the other constructors raise it.
 ///
 /// Eviction is **lazy and bounded**: it happens only while inserting a new key,
 /// touches only the one shard being written, and does a fixed amount of work —
@@ -35,9 +38,45 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// the shards (rounded up, at least one key per shard), so the live-key count
 /// stays at or below the cap plus one key per shard.
 ///
-/// An evicted key that returns starts with a fresh allowance. Size the cap
-/// above your real key cardinality so only flood keys are ever evicted; each
-/// tracked key costs roughly 200–300 bytes of heap.
+/// # Eviction never resets a limit
+///
+/// Evicting a key that is still being limited — one that has spent part of its
+/// allowance and not yet recovered it — must not hand it a fresh allowance when
+/// it returns, or anyone could reset a target's limit (login attempts for one
+/// username, say) by flooding the limiter with throwaway keys. So when such a
+/// key is evicted, its shard records what it owes: the units spent and when
+/// they would all be back. A key inserted before that time resumes **no more
+/// permissive than it left**:
+///
+/// - token and leaky buckets resume where they were, to within one unit
+///   (rounded against the key);
+/// - window algorithms resume with the spent units charged at the return, so
+///   they may be held back for up to one window longer than the original.
+///
+/// The records live in a per-shard table of half the shard's capacity (16
+/// bytes each, at most 8,192 per shard, allocated the first time a shard evicts
+/// an unrecovered key; `retain_recent` releases a table once its records have
+/// all expired). Each key has two candidate records. When more unrecovered keys
+/// are evicted within one recovery period than the table can hold — a flood far
+/// beyond the cap — a new record is **merged** into an existing one, which
+/// then keeps the larger debt and the later deadline and applies to *every*
+/// key that maps to it until it expires. Merging never forgets a debt; it can
+/// only make an unrelated newcomer start partly or wholly drained. Under
+/// extreme pressure the limiter therefore **fails closed** for some new keys
+/// instead of failing open for evicted ones. `Metrics::records_merged`
+/// (feature `metrics`) counts merges; any sustained rate means the cap is far
+/// too small for the traffic.
+///
+/// `remove`, `reset`, and `clear` forget a key's record along with its state;
+/// they are explicit resets.
+///
+/// Size the cap above your real key cardinality so only flood keys are ever
+/// evicted. A tracked token-bucket key costs about 138 bytes of heap at the
+/// default cap (up to ~210 bytes just after a shard's tables have grown), plus
+/// its bytes beyond 22; see
+/// [`Builder::max_key_len`](crate::Builder::max_key_len) and
+/// [`Builder::digest_keys_longer_than`](crate::Builder::digest_keys_longer_than)
+/// to bound key bytes.
 ///
 /// The [`Default`] is safe: a [`DEFAULT_MAX_KEYS`] capacity cap and no TTL —
 /// memory is bounded out of the box. Opt into unbounded growth explicitly with
