@@ -123,6 +123,14 @@ impl Key {
         }
     }
 
+    /// The key the `tower` middleware charges requests with no extractable
+    /// identity to. A digest-kind key with no bytes: no public constructor and
+    /// no digest (always 16 bytes) can equal it.
+    #[cfg(feature = "tower")]
+    pub(crate) fn anonymous() -> Self {
+        Self::with_kind(Kind::Digest, &[])
+    }
+
     /// The borrowed view the store looks keys up by.
     #[inline]
     pub(crate) fn as_key_ref(&self) -> KeyRef<'_> {

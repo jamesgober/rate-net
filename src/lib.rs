@@ -83,6 +83,7 @@
 //! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
 //! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
 //! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`]; compiled out when off. |
+//! | `tower`      | no  | [`tower`](mod@tower) middleware: `RateLimitLayer` with key extractors and `429` responses. Adds `http`, `tower-layer`, `tower-service`, `pin-project-lite`. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.
@@ -144,6 +145,9 @@ mod snapshot;
 #[cfg(feature = "std")]
 mod store;
 mod sync;
+#[cfg(feature = "tower")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tower")))]
+pub mod tower;
 
 #[cfg(feature = "std")]
 pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};

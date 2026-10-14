@@ -922,7 +922,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
 
     /// The shared peek path: a tracked key's snapshot, an evicted key's
     /// outstanding debt applied to a fresh allowance, or a fresh allowance.
-    fn peek_ref(&self, key: KeyRef<'_>) -> Snapshot {
+    pub(crate) fn peek_ref(&self, key: KeyRef<'_>) -> Snapshot {
         let now = self.now();
         let known = match self.admit(key) {
             Admitted::AsIs(stored) => self.store.peek(stored, now),
