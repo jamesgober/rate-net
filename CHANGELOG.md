@@ -14,6 +14,201 @@
 
 ---
 
+## [1.2.0] — 2026-10-14
+
+**Eviction never resets a limit, and the HTTP surface is complete.** A minor
+release: every change is additive or a fix, and nothing `1.0` or `1.1` offered
+changes (`cargo semver-checks`: no semver update required beyond minor). It
+closes the last eviction loophole from the 2026-10-13 audit — a key evicted at
+capacity used to come back with a fresh allowance — stores per-key state a third
+smaller, checks long keys without allocating, and adds per-key quotas, key-length
+limits, bounded async waits, the current IETF structured headers, and `tower`
+middleware. Finding IDs below are the audit's (`RN-001`…`RN-023`); the
+[1.1.0](#110--2026-10-13) entry used an earlier numbering, cross-referenced at
+the end of this entry.
+
+### Security
+
+- **Capacity eviction reset a still-limited key (RN-005).** In `1.1.0` the CLOCK
+  hand evicted any key not checked during one revolution, recovered or not, and
+  an evicted key that returned started with a full allowance — so flooding the
+  store with throwaway keys reset any target's limit (login attempts for one
+  username, say). The hand now prefers keys whose allowance has fully
+  recovered, and when it must evict one that has not, the shard records the
+  debt (units spent, and when they would all be back) in a lazily allocated
+  recovery table of half the shard's capacity (16 bytes a record). A key that
+  returns before its debt is repaid resumes **no more permissive than it left**:
+  exactly, to within one unit, for the token and leaky buckets; with the spent
+  units charged at the return for the window algorithms. When more unrecovered
+  keys are evicted within one recovery period than the table holds, records
+  merge — keeping the larger debt and the later deadline — and a merged record
+  applies to every new key that maps to it until it expires: under extreme
+  pressure the store fails closed for some newcomers instead of open for evicted
+  keys. An idle-TTL eviction of a key that is still owed (a per-key quota with a
+  longer recovery) records its debt the same way. `remove`, `reset`, and
+  `clear` forget debts. Regression tests (`tests/eviction_bypass.rs`) fail
+  against `1.1.0` for every algorithm; a `loom` model covers a drained key being
+  evicted while it is checked; a property test and a fuzz target check that no
+  amount of eviction lets a key exceed its token-bucket bound.
+- **Key bytes were unbounded (RN-006).** `Builder::max_key_len` refuses
+  over-long keys (denied as impossible, never stored), and
+  `Builder::digest_keys_longer_than` stores long keys as a 16-byte digest of two
+  independently, randomly seeded hashes, so a store's memory is bounded in bytes,
+  not just keys.
+
+### Fixed
+
+- **Long keys allocated on every check (RN-011).** `check_bytes`,
+  `check_n_bytes`, and `peek_bytes` look a key up by a borrowed view; the check
+  of an existing key allocates nothing whatever its length (36-byte UUID:
+  ~52 ns, against ~81 ns through `check`). The allocation audit now covers long
+  keys, every algorithm, and the key-length policies.
+- **Tautological hardening assertions** (`tests/hardening.rs`) replaced with
+  real ones, and every integration test renamed to the REPS
+  `test_<subject>_<condition>_<expected>` convention.
+- **Clock-sensitive examples.** Doc examples that assert a reset time now run on
+  a frozen `ManualClock`, so a stalled host cannot fail them.
+- The benchmark suite's contended figure was aggregate throughput (wall time
+  over all four threads' checks), which read about four times faster than any
+  caller sees; it is now per-check latency, measured per thread after a
+  barrier.
+
+### Added
+
+- `RateLimiter::check_bytes`, `check_n_bytes`, `peek_bytes` — allocation-free
+  checks of raw keys of any length.
+- `Builder::quota_for` — per-key quota overrides (tiered limits) from a
+  resolver called when a key is first stored; an override that admits nothing
+  blocks the key (fail closed, never stored).
+- `Builder::max_key_len`, `Builder::digest_keys_longer_than` — the key-length
+  policies above.
+- `AsyncLimiter::until_ready_within` / `until_ready_n_within` and the same on
+  `DirectLimiter` — awaits bounded by a budget: they sleep only while the next
+  admission fits the remaining budget and otherwise return the denial at once.
+  `with_jitter` / `jitter` on both add uniform random jitter to every sleep.
+  The awaiting methods document that they panic outside a Tokio runtime.
+- `Snapshot::ratelimit` and `Quota::ratelimit_policy` — the current IETF draft's
+  structured `RateLimit` (`"name";r=..;t=..`) and `RateLimit-Policy`
+  (`"name";q=..;w=..`) field values, formatted without allocating;
+  `headers::RATELIMIT`, `headers::RATELIMIT_POLICY`, `headers::RateLimitValue`,
+  `headers::RateLimitPolicyValue`.
+- `tower` feature: `rate_net::tower::RateLimitLayer` for inbound HTTP in front
+  of any `tower::Service` (axum, hyper, tonic), with `KeyExtractor`
+  implementations `PeerIp`, `ForwardedFor` (trusting a fixed number of
+  proxies — never a client-written entry), `HeaderKey`, and closures over
+  `RequestInfo`; denied requests get `429` with `Retry-After` and the rate-limit
+  headers without reaching the inner service. Adds `http`, `tower-layer`,
+  `tower-service`, and `pin-project-lite` (not `tower` itself).
+  `examples/tower_layer.rs`.
+- `Metrics`: `keys_remembered`, `keys_restored`, `records_merged`,
+  `keys_rejected`.
+- `Key::len`, `Key::is_empty`, `From<[u8; N]>`, `From<&[u8; N]>` for `Key`.
+- Tests: `tests/eviction_bypass.rs`, `tests/key_options.rs`, the eviction
+  property test, allocation audits for long keys and every algorithm, a `loom`
+  model of the evict-and-return race, unwind-safety assertions.
+- Fuzzing: `fuzz/` with `limiter_ops` (arbitrary checks, clock advances, resets,
+  removals, and sweeps on a heavily evicting store, against a token-bucket
+  oracle) and `http_keys` (key extraction from hostile headers, and structured
+  field values from arbitrary policy names). Smoke-run in CI.
+- Benchmarks: `check/long_key`, `check/long_key_bytes`, and `benches/flood.rs`
+  (a legitimate key's p50/p99/p99.9 while three threads flood the default
+  limiter at its cap, with recovering and with draining flood keys).
+
+### Changed
+
+- **Typed per-key state.** The store is generic over the algorithm's state, so
+  a key holds exactly that state with no enum tag, and the token bucket keeps
+  `better-bucket`'s clock-free `BucketCore` (the limiter reads the clock once,
+  just before the key's accounting). A token-bucket key is 128 bytes in its
+  shard; heap per key at the default cap fell from ~202 B to ~138 B (~140 MiB
+  at the 1,048,576-key default cap). A quota that admits nothing is never
+  stored.
+- `better-bucket` is used without features (only `BucketCore`), so it no longer
+  pulls `clock-lib` and `error-forge` in a second time.
+- An insert at capacity costs ~50 ns more at the default cap (~0.35 µs) because
+  eviction now reads each candidate's state to prefer recovered keys; a small,
+  cache-resident shard's insert got slightly faster. Many-key checks and `peek`
+  are faster (fewer cache lines per key). See `docs/BENCHMARKS.md`.
+- `#![deny(warnings)]` stays in the crate root as REPS requires, but not on
+  docs.rs (`cfg(docsrs)`), whose nightly rustdoc can add lints after a release
+  and fail the published docs; downstream builds were never affected (Cargo caps
+  dependency lints), and CI enforces `-D warnings` on stable and the MSRV.
+- Clippy pedantic is clean on every target (a CI job enforces it); each allowed
+  lint is narrowly scoped with a reason.
+- CI: `actions/checkout@v7`; an each-feature matrix via `cargo-hack` (clippy,
+  tests, and docs for every feature alone, on stable and the MSRV); pedantic,
+  release-mode stress, coverage, and fuzz-smoke jobs; `semver-checks` on all
+  features; miri over the recovery-table tests.
+- `tests/memory.rs` budget tightened from 512 to 256 B per key.
+
+### Not changed, with reasons
+
+- **No `From` impls for other integer types (RN-011).** A second integer
+  conversion would make an unsuffixed literal (`limiter.check(42)`) ambiguous —
+  verified to stop compiling — so `u32` / `i64` / `u128` keys use `Key::id` or
+  an explicit `u64`.
+- **`error-forge` stays tied to `std` (RN-022).** Making it optional would
+  remove the `ForgeError` impls from `default-features = false, features =
+  ["std"]` builds, a breaking change; it is recorded for `2.0`. It is on 1.0.2
+  (no `thiserror`), and `better-bucket` no longer brings its own copy.
+- **The default capacity stays at 1,048,576 keys (RN-006).** Lowering it would
+  change behaviour for existing users; the bound (~140 MiB) is now documented
+  precisely instead.
+- **No `rust-toolchain.toml` and no committed `Cargo.lock` (RN-023).** The
+  portfolio convention for libraries (shared with `better-bucket`): CI tests
+  stable and the 1.85 MSRV explicitly, which a pinned toolchain file would
+  override, and resolves a fresh lockfile so the audit sees what a consumer
+  builds. The MSRV-aware resolver keeps that resolution on 1.85-compatible
+  versions.
+- **`DynLimiter` has no `Send + Sync` supertrait (RN-017).** Adding one would
+  break 1.1 implementors; `Arc<dyn DynLimiter + Send + Sync>` is the documented
+  form.
+- **Idle keys are reclaimed only by inserts or `retain_recent` (RN-021).**
+  Automatic background reclamation needs a thread, which the runtime-free
+  design avoids; `retain_recent` is the maintenance hook (and now also releases
+  an expired recovery table).
+- **`CHANGELOG` dates for 0.9.0–1.0.0 (RN-023).** The entries are a historical
+  record and are not rewritten; the "soak" wording there describes intent, not a
+  measured period.
+
+### Audit cross-reference (2026-10-13, `RN-0xx`)
+
+| ID | Status |
+|----|--------|
+| RN-001 token-bucket over-admission | Fixed in 1.1.0 (`better-bucket` 1.1); 1.2 drives `BucketCore` directly |
+| RN-002 fixed-window lost update | Fixed in 1.1.0 |
+| RN-003 O(n) eviction scan | Fixed in 1.1.0; 1.2 adds the flood tail-latency benchmark |
+| RN-004 O(n) idle sweep | Fixed in 1.1.0 |
+| RN-005 eviction resets limited keys | Idle TTL fixed in 1.1.0; capacity eviction fixed in **1.2.0** |
+| RN-006 memory bound, unbounded key bytes | **1.2.0**: ~138 B/key, documented; `max_key_len`, `digest_keys_longer_than` |
+| RN-007 sliding-counter retry_after | Fixed in 1.1.0 |
+| RN-008 GCRA fail-open, degenerate configs | Fixed in 1.1.0 (`try_build`) |
+| RN-009 sliding-log memory per unit | Fixed in 1.1.0 (run-length records) |
+| RN-010 token-bucket capacity cap | Fixed in 1.1.0 (`better-bucket` 1.1) |
+| RN-011 long keys allocate | **1.2.0**: `check_bytes` & co., array `From` impls; integer impls declined (above) |
+| RN-012 hot-path write traffic | Fixed in 1.1.0; 1.2 typed slots and a late clock read |
+| RN-013 stale `now` in sliding algorithms | Fixed in 1.1.0 |
+| RN-014 validation gaps, `check_n` doc | Fixed in 1.1.0 (`try_build` covers `with_burst(0)`) |
+| RN-015 `--no-default-features` tests | Fixed in 1.1.0; 1.2 tests every feature alone in CI |
+| RN-016 Retry-After rounding | Fixed in 1.1.0 |
+| RN-017 `Limiter` not dyn-compatible | Fixed in 1.1.0 (`DynLimiter`) |
+| RN-018 cross-type key collisions | Fixed in 1.1.0 (tagged keys, redacted `Debug`) |
+| RN-019 pedantic lints, `deny(warnings)` | **1.2.0**: pedantic clean and enforced; docs.rs exempted |
+| RN-020 broken link, README compile | Fixed in 1.1.0 |
+| RN-021 no reclamation / shrink | Fixed in 1.1.0 (key management); background sweep declined (above) |
+| RN-022 `error-forge` weight | 1.0.2 in 1.1.0; optional feature deferred to 2.0 (above) |
+| RN-023 CI / process | **1.2.0**: checkout v7, feature matrix, coverage, fuzz; toolchain/lock declined (above) |
+
+The `1.1.0` entry's identifiers come from an earlier pass and map as:
+RN-COR-01 = RN-001; RN-SEC-01 = RN-003 and RN-004; RN-COR-03 = RN-002;
+RN-COR-04 = RN-008; RN-COR-05 = RN-008 and RN-010; RN-COR-07 = RN-005 (idle
+TTL); RN-COR-08 = RN-001 and RN-010 (the 49.7-day wrap); RN-SEC-03 = RN-009;
+RN-SEC-04 and RN-SEC-05 = RN-018. RN-COR-02 (a fixed-window `u32` overflow) and
+RN-COR-06 (`until_ready` returning as if admitted) had no counterpart in this
+audit.
+
+---
+
 ## [1.1.0] — 2026-10-13
 
 **Correctness, hardening, and the HTTP surface.** A minor release: every change
@@ -582,7 +777,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jamesgober/rate-net/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jamesgober/rate-net/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/rate-net/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/rate-net/compare/v0.9.0...v0.9.5
