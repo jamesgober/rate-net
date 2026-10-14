@@ -175,6 +175,36 @@ fn loom_eviction_races_a_concurrent_insert() {
     });
 }
 
+/// RN-005: a drained key evicted by a concurrent insert must come back
+/// drained. One thread re-checks the drained key "a" while another inserts "b"
+/// into the full one-key shard, evicting "a" (recording its debt) — in every
+/// interleaving "a" is refused: the record is written under the same write
+/// lock that removes the key, and consulted under the write lock that
+/// re-creates it.
+#[test]
+fn loom_evicted_drained_key_is_never_reset() {
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_minute(1)
+            .shards(1)
+            .eviction(Eviction::capacity(1))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("a").is_allow()); // "a" is drained
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        let handle = thread::spawn(move || other.check("b").is_allow());
+        let again = limiter.check("a").is_allow();
+        let inserted = handle.join().expect("model thread panicked");
+
+        assert!(!again, "eviction reset a drained key");
+        assert!(inserted, "a fresh key has its first unit");
+        assert!(limiter.check("a").is_deny(), "eviction reset a drained key");
+    });
+}
+
 /// RN-COR-03: a thread whose timestamp falls in a window another thread has
 /// already closed must count against the newer window, never write its older
 /// window back and wipe the newer window's count.
