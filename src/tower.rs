@@ -833,7 +833,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_policy_headers_and_headers_on_success() {
-        let layer = RateLimitLayer::new(RateLimiter::per_minute(60), PeerIp::default())
+        // A frozen clock, so the reported numbers are exact on a loaded host.
+        let frozen = std::sync::Arc::new(clock_lib::ManualClock::new());
+        let limiter = std::sync::Arc::new(RateLimiter::per_minute(60).with_clock(frozen));
+        let layer = RateLimitLayer::shared(limiter, PeerIp::default())
             .with_policy("default")
             .with_headers_on_success(true);
         let mut service = layer.clone().layer(echo());

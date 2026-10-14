@@ -631,9 +631,12 @@ is the value of the current draft's structured `RateLimit` field:
 `"policy";r=<remaining>;t=<reset>`.
 
 ```rust
+use clock_lib::ManualClock;
 use rate_net::RateLimiter;
+use std::sync::Arc;
 
-let limiter = RateLimiter::per_second(10);
+// A frozen clock keeps the numbers exact however slow the host.
+let limiter = RateLimiter::per_second(10).with_clock(Arc::new(ManualClock::new()));
 let _ = limiter.check_n("k", 3);
 let snapshot = limiter.peek("k");
 assert!(!snapshot.is_exhausted());
@@ -675,9 +678,11 @@ names and values; the caller writes them into its framework's response type
 (or uses the [`tower` middleware](#tower-middleware)).
 
 ```rust
+use clock_lib::ManualClock;
 use rate_net::{RateLimiter, headers};
+use std::sync::Arc;
 
-let limiter = RateLimiter::per_minute(1);
+let limiter = RateLimiter::per_minute(1).with_clock(Arc::new(ManualClock::new()));
 let _ = limiter.check("client");
 let decision = limiter.check("client");
 let retry = decision.retry_after_secs().map(|secs| (headers::RETRY_AFTER, secs));

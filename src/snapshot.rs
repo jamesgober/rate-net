@@ -154,9 +154,11 @@ impl Snapshot {
     ///
     /// ```
     /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
     /// use rate_net::RateLimiter;
+    /// use std::sync::Arc;
     ///
-    /// let limiter = RateLimiter::per_minute(60);
+    /// let limiter = RateLimiter::per_minute(60).with_clock(Arc::new(ManualClock::new()));
     /// let _ = limiter.check("k"); // one token back in 1 s
     /// assert_eq!(limiter.peek("k").reset_after_secs(), 1);
     /// # }
@@ -194,9 +196,11 @@ impl Snapshot {
     ///
     /// ```
     /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
     /// use rate_net::RateLimiter;
+    /// use std::sync::Arc;
     ///
-    /// let limiter = RateLimiter::per_second(10);
+    /// let limiter = RateLimiter::per_second(10).with_clock(Arc::new(ManualClock::new()));
     /// let _ = limiter.check_n("k", 3);
     /// assert_eq!(
     ///     limiter.peek("k").headers(),
@@ -228,9 +232,12 @@ impl Snapshot {
     ///
     /// ```
     /// # #[cfg(feature = "std")] {
+    /// use clock_lib::ManualClock;
     /// use rate_net::{headers, RateLimiter};
+    /// use std::sync::Arc;
     ///
-    /// let limiter = RateLimiter::per_minute(60);
+    /// let clock = Arc::new(ManualClock::new()); // frozen: exact numbers
+    /// let limiter = RateLimiter::per_minute(60).with_clock(clock);
     /// let _ = limiter.check_n("k", 2);
     /// let snapshot = limiter.peek("k");
     /// assert_eq!(headers::RATELIMIT, "RateLimit");
