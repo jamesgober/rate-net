@@ -80,28 +80,29 @@ pub(crate) trait KeyState: Send + Sync + Sized + 'static {
         self.debt(now).is_none()
     }
 
-    /// The units still owed at `now` on `debt`. The window algorithms owe the
-    /// whole `spent` count until `debt.until`; the buckets override this with
-    /// the time left converted at their refill rate.
-    fn owed(&self, debt: Debt, _now: Duration) -> u32 {
-        debt.spent
+    /// When the key has its whole allowance again: `now` plus the wait, or
+    /// `None` if it already has. The buckets override this with one read of
+    /// their state.
+    fn recovers_at(&self, now: Duration) -> Option<Duration> {
+        self.debt(now).map(|debt| debt.until)
     }
 
-    /// Charges a *fresh* state so it is no more permissive than a key that
-    /// owed `debt` — the state of a key that was evicted before it recovered
-    /// and has now returned.
+    /// Makes a *fresh* state no more permissive than a key that owed `debt` —
+    /// the state of a key that was evicted before it recovered and has now
+    /// returned.
     ///
-    /// The buckets are exact to within one unit: the outstanding debt is the
-    /// time left until `debt.until`, converted at the key's refill rate and
-    /// rounded up. The window algorithms charge the whole `spent` count at
-    /// `now`, which is never looser than the original (whose units were
-    /// admitted earlier and so expire no later) but may hold the allowance
-    /// back for up to one window after `debt.until`.
-    fn restore(&self, debt: Debt, now: Duration) {
+    /// The buckets override this to be exact: their whole state is "when is
+    /// the bucket whole again", so they resume exactly at `debt.until`, with no
+    /// rounding of fractional units (a key evicted and restored over and over
+    /// loses nothing to rounding). The window algorithms charge the whole
+    /// `spent` count at `now`, which is never looser than the original (whose
+    /// units were admitted earlier and so expire no later) but may hold the
+    /// allowance back for up to one window after `debt.until`.
+    fn restore(&mut self, debt: Debt, now: Duration) {
         if debt.until <= now || debt.spent == 0 {
             return;
         }
-        let owed = self.owed(debt, now).min(self.peek(now).limit());
+        let owed = debt.spent.min(self.peek(now).limit());
         if owed > 0 {
             // A fresh state holds its whole capacity, so this always admits.
             let _charged = self.acquire(owed, now);
@@ -140,9 +141,49 @@ impl KeyState for BucketCore {
         self.available_at(now) >= self.capacity()
     }
 
-    fn owed(&self, debt: Debt, now: Duration) -> u32 {
+    /// One read: the wait until the whole capacity is back.
+    fn recovers_at(&self, now: Duration) -> Option<Duration> {
+        match self.time_until_at(self.capacity(), now) {
+            Some(Duration::ZERO) => None,
+            Some(wait) => Some(now.saturating_add(wait)),
+            None => Some(Duration::MAX),
+        }
+    }
+
+    /// Rebuilds the bucket as one that was empty exactly one full refill
+    /// before `debt.until`, so at `now` it holds precisely what the evicted
+    /// bucket would — fractional progress included.
+    fn restore(&mut self, debt: Debt, now: Duration) {
+        if debt.until <= now {
+            return;
+        }
         let config = self.config();
-        owed_units(debt, now, config.refill_amount(), config.refill_period())
+        let (capacity, amount) = (config.capacity(), config.refill_amount());
+        let period = config.refill_period().as_nanos();
+        // Time to refill the whole capacity, rounded down, so the rebuilt
+        // bucket is whole no earlier than `debt.until`.
+        let full = u128::from(capacity) * period / u128::from(amount);
+        let until = debt.until.as_nanos();
+        // The bucket was empty at `until - full`. Before the time line's
+        // origin that instant cannot be expressed, so anchor later with the
+        // whole tokens it had accrued by then: `k` tokens at
+        // `until - full + k * period / amount` (rounded up, never earlier).
+        let short = full.saturating_sub(until);
+        let k = (short * u128::from(amount)).div_ceil(period);
+        let anchor = (until + (k * period).div_ceil(u128::from(amount))).saturating_sub(full);
+        // An anchor past the representable range is a debt that is never
+        // repaid: the latest instant drains the bucket for good (fail closed).
+        let anchor = u64::try_from(anchor).unwrap_or(u64::MAX);
+        let initial = u32::try_from(k).unwrap_or(capacity);
+        let Ok(config) = BucketConfig::new(
+            capacity,
+            amount,
+            config.refill_period(),
+            initial.min(capacity),
+        ) else {
+            return;
+        };
+        *self = Self::new(config, Duration::from_nanos(anchor));
     }
 }
 
@@ -165,9 +206,11 @@ impl KeyState for Gcra {
         Self::reset(self);
     }
 
-    fn owed(&self, debt: Debt, now: Duration) -> u32 {
-        let quota = self.quota();
-        owed_units(debt, now, quota.limit(), quota.period())
+    /// Exact: the theoretical arrival time is raised to `debt.until`.
+    fn restore(&mut self, debt: Debt, now: Duration) {
+        if debt.until > now {
+            self.restore_until(debt.until);
+        }
     }
 }
 
@@ -235,19 +278,6 @@ impl KeyState for SlidingCounter {
 #[cfg_attr(not(feature = "algorithms"), allow(dead_code))]
 fn admits_anything(algorithm: Algorithm, quota: &Quota) -> bool {
     fresh_snapshot(algorithm, quota).limit() > 0
-}
-
-/// Units a bucket refilling `amount` per `period` still owes at `now` on
-/// `debt`: the time left until `debt.until` at that rate, rounded up, and never
-/// more than was spent.
-fn owed_units(debt: Debt, now: Duration, amount: u32, period: Duration) -> u32 {
-    let period = period.as_nanos();
-    if period == 0 {
-        return 0;
-    }
-    let left = debt.until.saturating_sub(now).as_nanos();
-    let units = left.saturating_mul(u128::from(amount)).div_ceil(period);
-    u32::try_from(units).unwrap_or(u32::MAX).min(debt.spent)
 }
 
 /// The decision of a key that admits nothing: zero units always fit, any more
@@ -481,20 +511,20 @@ mod tests {
         assert!(KeyState::acquire(&original, 10, Duration::ZERO).is_allow());
         let debt = original.debt(Duration::ZERO).unwrap();
 
-        let restored = BucketCore::create(&Quota::per_second(10), ms(300)).unwrap();
+        let mut restored = BucketCore::create(&Quota::per_second(10), ms(300)).unwrap();
         restored.restore(debt, ms(300));
         assert_eq!(KeyState::peek(&restored, ms(300)).remaining(), 3);
         assert_eq!(KeyState::peek(&original, ms(300)).remaining(), 3);
         assert_eq!(KeyState::peek(&restored, ms(1_000)), Snapshot::full(10));
         // A debt already repaid restores nothing.
-        let late = BucketCore::create(&Quota::per_second(10), ms(1_000)).unwrap();
+        let mut late = BucketCore::create(&Quota::per_second(10), ms(1_000)).unwrap();
         late.restore(debt, ms(1_000));
         assert_eq!(KeyState::peek(&late, ms(1_000)), Snapshot::full(10));
     }
 
     #[test]
-    fn test_restore_never_charges_more_than_capacity_or_spent() {
-        let state = token(Quota::per_second(5));
+    fn test_restore_of_an_unbounded_debt_drains_the_bucket() {
+        let mut state = token(Quota::per_second(5));
         state.restore(
             Debt {
                 spent: u32::MAX,
@@ -503,15 +533,26 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(KeyState::peek(&state, Duration::ZERO).remaining(), 0);
-        let small = token(Quota::per_second(5));
+        // The buckets restore by time alone: a debt not repaid for a full
+        // refill drains the bucket whatever its spent count says.
+        let mut small = token(Quota::per_second(5));
         small.restore(
             Debt {
                 spent: 1,
-                until: Duration::MAX,
+                until: Duration::from_secs(2),
             },
             Duration::ZERO,
         );
-        assert_eq!(KeyState::peek(&small, Duration::ZERO).remaining(), 4);
+        assert_eq!(KeyState::peek(&small, Duration::ZERO).remaining(), 0);
+        let mut partial = token(Quota::per_second(5));
+        partial.restore(
+            Debt {
+                spent: 1,
+                until: Duration::from_millis(200),
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(KeyState::peek(&partial, Duration::ZERO).remaining(), 4);
     }
 
     /// For one algorithm: a key spends `spend` at 100ms, is evicted, and is
@@ -524,7 +565,7 @@ mod tests {
                 assert!(original.acquire(spend, ms(100)).is_allow());
                 let debt = original.debt(ms(100)).unwrap();
                 let at = ms(100 + gap);
-                let restored = S::create(quota, at).unwrap();
+                let mut restored = S::create(quota, at).unwrap();
                 restored.restore(debt, at);
                 for later in [0u64, 1, 100, 400, 900, 1_000, 2_100] {
                     let t = at + ms(later);

@@ -340,6 +340,26 @@ impl Gcra {
     pub fn reset(&self) {
         self.tat.store(0, Ordering::Release);
     }
+
+    /// Makes the bucket no fuller than one that is whole again exactly at
+    /// `until` (a duration on the caller's time line): the theoretical arrival
+    /// time is raised to the first emission interval that begins at or after
+    /// it. Exact, with no rounding of fractional units, so a key restored
+    /// repeatedly loses nothing.
+    #[cfg(all(feature = "std", feature = "algorithms"))]
+    pub(crate) fn restore_until(&self, until: Duration) {
+        if self.deny_all {
+            return;
+        }
+        let until_ns = nanos(until);
+        let floor = self.intervals_at(until_ns);
+        let interval = if self.nanos_at(floor) >= until_ns {
+            floor
+        } else {
+            floor.saturating_add(1)
+        };
+        let _previous = self.tat.fetch_max(interval, Ordering::AcqRel);
+    }
 }
 
 impl fmt::Debug for Gcra {

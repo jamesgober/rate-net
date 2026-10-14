@@ -33,9 +33,26 @@ fn test_capacity_evictions_are_counted() {
         let _ = limiter.check(user);
     }
     let metrics = limiter.metrics();
-    assert_eq!(metrics.keys_inserted, 100);
-    assert_eq!(metrics.keys_evicted, 90);
+    // Every key is drained (one unit a second) and evicted owing it: its debt
+    // is remembered, exactly or in the overflow; once a 10-key shard is
+    // saturated with keys that cannot be evicted without losing a debt, a
+    // newcomer is refused instead of stored.
+    assert_eq!(metrics.keys_inserted + metrics.keys_refused, 100);
+    assert_eq!(metrics.keys_evicted, metrics.keys_inserted - 10);
+    assert_eq!(metrics.keys_remembered, metrics.keys_evicted);
+    assert!(metrics.debts_overflowed <= metrics.keys_remembered);
     assert_eq!(limiter.tracked_keys(), 10);
+
+    // Keys that spend nothing recover at once and are evicted losslessly.
+    let lossless = RateLimiter::per_second(1)
+        .with_shards(1)
+        .with_eviction(Eviction::capacity(10));
+    for user in 0..100u64 {
+        let _ = lossless.check_n(user, 0);
+    }
+    let metrics = lossless.metrics();
+    assert_eq!((metrics.keys_inserted, metrics.keys_evicted), (100, 90));
+    assert_eq!((metrics.keys_remembered, metrics.keys_refused), (0, 0));
 }
 
 #[test]

@@ -66,13 +66,18 @@ pub struct Metrics {
     /// New keys that resumed from a recorded debt instead of a fresh
     /// allowance: evicted keys coming back while still limited.
     pub keys_restored: u64,
-    /// Debt records that had to be merged with an unrelated key's because the
-    /// recovery table was full. A merged record restricts every new key that
-    /// hashes to it until it expires — the store failing closed under extreme
-    /// eviction pressure. Zero is normal; any sustained rate means the cap is
-    /// far too small for the traffic, or the limiter is under a unique-key
-    /// flood.
-    pub records_merged: u64,
+    /// Debts recorded in the shared overflow because the exact recovery table
+    /// was full (counted within `keys_remembered`). A new key whose two
+    /// overflow cells are both live is charged the smaller of them, so a
+    /// steady rate means some new keys start with less than a full allowance:
+    /// the cap is too small for the number of keys being limited at once, or
+    /// the limiter is under a flood. See [`Eviction`](crate::Eviction).
+    pub debts_overflowed: u64,
+    /// New keys refused because their shard was saturated: full, and every
+    /// examined key still limited with nowhere to record its debt. The store
+    /// failing closed; any non-zero rate means the cap is far too small for
+    /// the traffic, or a flood is in progress.
+    pub keys_refused: u64,
     /// Checks refused because the key exceeded the limiter's maximum key
     /// length (`Builder::max_key_len`). Counted within `denied`; such keys are
     /// never stored.
@@ -90,7 +95,8 @@ pub(crate) struct Counters {
     removed: AtomicU64,
     remembered: AtomicU64,
     restored: AtomicU64,
-    merged: AtomicU64,
+    overflowed: AtomicU64,
+    refused: AtomicU64,
     rejected: AtomicU64,
 }
 
@@ -105,7 +111,8 @@ impl Counters {
             removed: AtomicU64::new(0),
             remembered: AtomicU64::new(0),
             restored: AtomicU64::new(0),
-            merged: AtomicU64::new(0),
+            overflowed: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
         }
     }
@@ -153,8 +160,13 @@ impl Counters {
     }
 
     #[inline]
-    pub(crate) fn merged(&self) {
-        let _previous = self.merged.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn overflowed(&self) {
+        let _previous = self.overflowed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn refused(&self) {
+        let _previous = self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -172,7 +184,8 @@ impl Counters {
         into.keys_removed += self.removed.load(Ordering::Relaxed);
         into.keys_remembered += self.remembered.load(Ordering::Relaxed);
         into.keys_restored += self.restored.load(Ordering::Relaxed);
-        into.records_merged += self.merged.load(Ordering::Relaxed);
+        into.debts_overflowed += self.overflowed.load(Ordering::Relaxed);
+        into.keys_refused += self.refused.load(Ordering::Relaxed);
         into.keys_rejected += self.rejected.load(Ordering::Relaxed);
     }
 }
@@ -194,7 +207,8 @@ mod tests {
         counters.removed(4);
         counters.remembered();
         counters.restored();
-        counters.merged();
+        counters.overflowed();
+        counters.refused();
         counters.rejected();
         let mut metrics = Metrics::default();
         counters.add_to(&mut metrics);
@@ -210,7 +224,8 @@ mod tests {
                 keys_removed: 8,
                 keys_remembered: 2,
                 keys_restored: 2,
-                records_merged: 2,
+                debts_overflowed: 2,
+                keys_refused: 2,
                 keys_rejected: 2,
             }
         );
