@@ -173,9 +173,9 @@ bytes to the heap — use [`check_bytes`](#borrowed-keys) for long keys — exce
 that a sliding-window-log key's run-length log grows amortized (a few
 allocations per thousand checks of a high-limit key, until it reaches its
 working size). The first
-check of a new key takes the shard write lock and may evict one other key
-([Sharding and eviction](#sharding-and-eviction)), which never resets that key's
-limit.
+check of a new key takes the shard write lock and may evict one other key,
+recording its debt if it still owes ([Sharding and eviction](#sharding-and-eviction)).
+A key whose quota admits nothing is denied without taking the write lock.
 
 ```rust
 use rate_net::{Decision, RateLimiter};
@@ -763,6 +763,11 @@ pub const fn with_idle(self, ttl: Duration) -> Eviction
 pub const fn without_capacity(self) -> Eviction
 pub const fn max_keys(&self) -> Option<usize>
 pub const fn idle_ttl(&self) -> Option<Duration>
+pub const fn with_overflow(self, overflow: Overflow) -> Eviction
+pub const fn overflow(&self) -> Overflow
+
+#[non_exhaustive]
+pub enum Overflow { Forget /* default */, FailClosed }  // Copy, Eq, Hash, Debug, Default
 ```
 
 How the store bounds its memory — the defense against a unique-key flood. A
@@ -770,12 +775,18 @@ How the store bounds its memory — the defense against a unique-key flood. A
 key whose allowance has recovered (spread evenly over the shards, at least one
 key per shard, so `capacity(0)` behaves as one per shard); an **idle TTL**
 reclaims keys not seen for that long, raised to the quota's recovery time. Either
-way **eviction never resets a limit**: a key evicted before it recovered has its
-debt recorded and resumes no more permissive than it left (see
-[Sharding and eviction](#sharding-and-eviction) for the exact guarantee and its
-fail-closed overload behaviour). The `Default` is a
-[`DEFAULT_MAX_KEYS`](#constants) cap and no TTL. `unbounded` is only safe when
-the key space is intrinsically small.
+way a key evicted before it recovered has its debt recorded and resumes no more
+permissive than it left — unconditionally while the still-limited evicted keys
+fit about twice the cap. Past that, the **`Overflow`** policy decides:
+`Forget` (the default) drops the debts that do not fit, so those keys may come
+back with a fresh allowance (1.1 behaviour) and no other key is affected;
+`FailClosed` keeps them all, so no evicted key ever comes back looser, at the
+cost of charging or refusing some keys that owed nothing. Use `FailClosed` for
+limiters keyed by identities an attacker can target (usernames, API keys). See
+[Sharding and eviction](#sharding-and-eviction) for the exact guarantee and the
+measured trade-off. The `Default` is a [`DEFAULT_MAX_KEYS`](#constants) cap, no
+TTL, and `Overflow::Forget`. `unbounded` is only safe when the key space is
+intrinsically small.
 
 ```rust
 use rate_net::{Eviction, DEFAULT_MAX_KEYS};
@@ -786,6 +797,11 @@ assert_eq!(policy.max_keys(), Some(100_000));
 assert_eq!(policy.idle_ttl(), Some(Duration::from_secs(300)));
 assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
 assert_eq!(Eviction::unbounded().without_capacity().max_keys(), None);
+
+use rate_net::Overflow;
+let strict = Eviction::capacity(100_000).with_overflow(Overflow::FailClosed);
+assert_eq!(strict.overflow(), Overflow::FailClosed);
+assert_eq!(Eviction::default().overflow(), Overflow::Forget);
 ```
 
 ---
@@ -961,7 +977,8 @@ pub struct Metrics {
     pub keys_removed: u64,   // remove / clear / retain_recent
     pub keys_remembered: u64, // evicted before recovering: debt recorded
     pub keys_restored: u64,   // new keys charged a recorded debt
-    pub debts_overflowed: u64, // debts spilled into the shared overflow sketch
+    pub debts_forgotten: u64, // debts dropped past the exact table (Overflow::Forget)
+    pub debts_overflowed: u64, // debts spilled into the shared sketch (Overflow::FailClosed)
     pub keys_refused: u64,    // newcomers refused: shard saturated with debtors
     pub keys_rejected: u64,   // refused by max_key_len
 }
@@ -973,10 +990,13 @@ counters. `keys_evicted` should normally be zero: a steady rate means the cap is
 below the live key population or the limiter is under a unique-key flood (a
 `keys_inserted` spike is the other signature). `keys_remembered` counts the
 evictions that had to record a debt and `keys_restored` the keys that came back
-to one (including keys charged from the shared overflow sketch). Both
-`debts_overflowed` and `keys_refused` should be zero: a sustained
-`debts_overflowed` means more still-limited keys are being evicted than the
-exact recovery table holds, so keys that never owed anything can start drained;
+to one (including keys charged from the shared overflow sketch).
+`debts_forgotten`, `debts_overflowed`, and `keys_refused` should be zero: a
+sustained `debts_forgotten` (under `Overflow::Forget`) means more still-limited
+keys are being evicted than the exact recovery table holds, so some of them come
+back with a fresh allowance; a sustained `debts_overflowed` (under
+`Overflow::FailClosed`) means the same, and keys that never owed anything can
+start drained;
 `keys_refused` counts newcomers denied with a retry time because a full shard
 held only still-limited keys whose debts could not be kept (both are the store
 failing closed). Either means the cap is too small for the traffic. Without
@@ -1216,7 +1236,7 @@ requested shard count; give it enough shards.
 The cap is enforced per shard (`max_keys / shards`, rounded up), so the
 live count stays within one key per shard of the configured maximum.
 
-**Eviction never resets a limit.** When an evicted key still owes part of its
+**Eviction does not reset a limit.** When an evicted key still owes part of its
 allowance, its shard records the debt — units spent, and when they would all
 be back. A key inserted before its debt is repaid resumes **no more permissive
 than it left**: the token and leaky buckets resume exactly where they were (the
@@ -1226,42 +1246,58 @@ held back for up to one window longer.
 
 The debts live in a per-shard recovery table, allocated the first time the
 shard evicts an unrecovered key and released by `retain_recent` once every
-debt has expired. It costs 64 bytes per key of capacity (64 MiB at the default
-cap; up to twice that when a shard's share of the cap is just past a power of
-two):
+debt has expired. The **exact records** are 16 bytes each, two per key of
+capacity, in a cuckoo-hashed table: each key has two candidate buckets of four
+records, and a full pair is made room in by moving records to their other
+bucket (at most 16 moves), which fills the table past 90 % before anything is
+left over. A key reads back only its own record. While a shard's still-limited
+evicted keys fit — about twice its share of the cap at once; the binding
+quantity is the rate at which still-limited keys are evicted times their
+recovery time, not the size of the population — no evicted key is reset, no
+other key is charged, and nothing is refused.
 
-- **Exact records** — 16 bytes each, two per key of capacity, in a
-  cuckoo-hashed table: each key has two candidate buckets of four records, and
-  a full pair is made room in by moving records to their other bucket (at most
-  16 moves), which fills the table past 90 % before anything spills. A key
-  reads back only its own record. While a shard's unrecovered evicted keys fit
-  (about twice its share of the cap, live at once), no other key is ever
-  charged and nothing is refused.
-- **Overflow sketch** — four 8-byte cells per key of capacity. A debt the
-  exact table cannot place is written to two cells, each keeping the larger
-  deadline and spend; a key being stored is charged the smaller of its two
-  cells while both are live. That never undercharges a key whose own debt
-  spilled, but a key that never owed anything is charged when both its cells
-  hold others' debts: it starts partly or wholly drained (fail closed).
-- **No spreading** — a key charged from the sketch is never written back into
-  it: its debt goes only into the exact table, marked so it is never moved
-  out. If its candidate records all hold such marked debts it is not evicted,
-  and a full shard with nothing else to evict **refuses the newcomer** with a
-  retry time (`Metrics::keys_refused`) rather than exceed the cap or forget a
-  debt.
+Past that bound, [`Overflow`](#eviction) decides:
 
-Measured (`docs/BENCHMARKS.md`; 128 shards): after a flood of unique keys that
-each drain their quota, no newcomer is denied up to a flood of 3x the cap
-(cap 100,000), 3 % at 4x, 39 % at 6x; a well-behaved population of 3x the
-cap (cap 10,000) sees no false denials, 10x the cap 4 %. 1.1.0 denied none of
-them because it forgot every debt — which let a flood reset any key's limit.
+- **`Overflow::Forget`** (the default) drops the debt that is left over. That
+  key may come back with a fresh allowance, as every evicted key did in 1.1;
+  nothing else changes, and `Metrics::debts_forgotten` counts the drops. Under
+  a sustained flood that evicts far more still-limited keys than the table
+  holds, a targeted key can be reset again and again.
+- **`Overflow::FailClosed`** spills it into a shared **overflow sketch** of four
+  8-byte cells per key of capacity; each cell keeps the larger deadline and
+  spend (a spend beyond the cell's 24 bits is charged as everything). A key
+  being stored is charged the smaller of its two cells while both are live:
+  never less than its own spilled debt, but a key that never owed anything is
+  charged when both its cells hold others' debts — it starts partly or wholly
+  drained. A key charged from the sketch is never written back into it (its
+  debt goes only into the exact table, marked so it is never moved out), so
+  sketch charges cannot spread or ratchet; if its candidate records all hold
+  such marked debts it is not evicted, and a full shard with nothing else to
+  evict **refuses the newcomer** with a retry time (`Metrics::keys_refused`).
+
+Measured with the 1.2.0 re-audit's harness (`docs/BENCHMARKS.md`; ManualClock,
+128 shards; cap 100,000 for floods, 10,000 for populations):
+
+| | `Forget` | `FailClosed` |
+|---|---:|---:|
+| Newcomers denied after a drain flood of 3x / 4x / 6x / 9x the cap | 0 / 0 / 0 / 0 % | 0 / 3 / 38 / 86 % |
+| False denials, well-behaved population of 10x the cap at 5,000 / 20,000 visits/s | 0 / 0 % | 4 / 72 % |
+| Evicted, still-limited keys reset past the bound | yes | never |
+| Recovery tables at the default cap | 32 MiB | 64 MiB |
+
+The recovery tables cost 32 bytes per key of capacity, plus 32 more for
+`FailClosed`'s sketch (up to twice that when a shard's share of the cap is
+just past a power of two).
 
 The idle TTL is raised to the quota's recovery time, so idle expiry normally
 removes only recovered keys; a key with a longer per-key quota that expires
-while still limited has its debt recorded like any other eviction. `remove`,
-`reset`, and `clear` forget a key's own record — they are explicit resets —
-but a sketch charge is shared and cannot be cleared for one key (it expires
-within one recovery period; `clear` drops the whole table).
+while still limited has its debt recorded like any other eviction — the eviction judges such a key by its current
+state, not by a recovery time cached before it last spent. `remove`, `reset`,
+and `clear` forget a key's own record — they are explicit resets — but a
+sketch charge is shared and cannot be cleared for one key (it expires within
+one recovery period; `clear` drops the whole table). A sketch charge carries
+the debt's own deadline, so under per-key tiers a slow tier's long debt can
+drain a fast-tier newcomer for that long.
 
 ---
 
@@ -1293,8 +1329,9 @@ races.
   (65,536) for memory; `build` does not.
 - **Keys:** a token-bucket key is 128 bytes in its shard — about 138 bytes of
   heap per key at the default cap, up to ~210 just after a shard's tables have
-  doubled — so the default cap bounds the store at roughly 140 MiB, plus up to
-  64 MiB of recovery records under eviction pressure, plus the bytes of any key
+  doubled — so the default cap bounds the store at roughly 140 MiB, plus the
+  recovery tables under eviction pressure (32 MiB with `Overflow::Forget`,
+  64 MiB with `FailClosed`: about 170 or 202 MiB in all), plus the bytes of any key
   longer than 22 (bounded with `max_key_len`, or fixed at 16 with
   `digest_keys_longer_than`). `tests/memory.rs` asserts a 256 B/key budget.
 

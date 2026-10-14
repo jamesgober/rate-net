@@ -1,9 +1,10 @@
 name: Latest dependencies
 
 # The main CI builds against the committed Cargo.lock. This workflow resolves
-# the newest versions every dependency's requirement allows (still on the
-# 1.85 MSRV, through the MSRV-aware resolver) and builds, tests, lints, and
-# audits against them — weekly, and on every pull request — so an upstream
+# the newest versions every dependency's requirement allows and builds, tests,
+# lints, and audits against them: on 1.99.0 the true latest (the MSRV-aware
+# resolver is told to ignore rust-version), on 1.85 the latest that still
+# supports the MSRV — weekly, and on every pull request — so an upstream
 # release that breaks rate-net, or a new advisory, shows up before a user hits
 # it. A failure here means: update the lock (or a requirement) in a PR.
 
@@ -20,14 +21,19 @@ env:
 
 jobs:
   latest:
-    name: Latest compatible dependencies (${{ matrix.rust }})
+    name: Latest dependencies (${{ matrix.rust }}, rust-version ${{ matrix.incompatible }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.99.0", "1.85"]
+        include:
+          - rust: "1.99.0"
+            incompatible: allow
+          - rust: "1.85"
+            incompatible: fallback
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: ${{ matrix.incompatible }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master

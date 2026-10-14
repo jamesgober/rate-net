@@ -93,14 +93,15 @@ Legitimate-key check latency, default limiter at its cap:
 
 | Scenario | p50 | p99 | p99.9 |
 |----------|----:|----:|------:|
-| no flood | 100 ns | 100–200 ns | 300–700 ns |
-| flood of recovered keys | 100 ns | 300–400 ns | 600–700 ns |
-| flood of drained keys (every eviction records a debt) | 100 ns | 600 ns | 1.3 µs |
+| no flood | 100 ns | 100 ns | 300 ns |
+| flood of recovered keys | 100 ns | 300 ns | 500–600 ns |
+| flood of drained keys (every eviction records a debt), `Overflow::Forget` | 100 ns | 400 ns | 1.3 µs |
+| the same, `Overflow::FailClosed` | 100 ns | 600 ns | 1.2 µs |
 | `v1.1.0`, flood | 100 ns | 300–500 ns | 0.5–1.0 µs |
 | `v1.0.0`, flood (audit, 2026-10-13) | — | — | 128 µs |
 
-(Flood rows re-run on the final 1.2.0 recovery table, 2026-10-14, same host
-and load conditions.)
+(Flood rows re-run on the final 1.2.0 build, 2026-10-14, same host at about
+40 % load.)
 
 The maximum is not in the table: on this loaded host it was set by the OS
 preempting a thread (0.3–160 ms in *every* scenario, the no-flood one
@@ -156,29 +157,51 @@ shipped as a known issue, to be revisited and optimised in a future release.
 
 ## Liveness under eviction pressure
 
-Eviction never resets a limit (`tests/eviction_bypass.rs`; the 1.2.0 re-audit
-harness found no over-admission in any of 60 eviction configurations, re-run
-on the final table). The price is that a store evicting more still-limited
-keys than its exact recovery table holds — about twice the cap at once —
-charges some keys that never owed anything, from the shared overflow sketch.
-Measured with the re-audit's harness (ManualClock, 128 shards):
+A still-limited key that is evicted keeps its debt, exactly and without
+affecting any other key, while the store's still-limited evicted keys fit
+about twice the cap (`tests/eviction_bypass.rs`, `tests/eviction_liveness.rs`).
+Past that, `Overflow::Forget` (the default) drops the debts that do not fit and
+`Overflow::FailClosed` keeps them in a shared sketch that can charge or refuse
+keys that never owed anything. Measured with the 1.2.0 re-audit's harness
+(ManualClock, 128 shards; re-run on the final build, 2026-10-14):
 
-| Scenario | First 1.2.0 candidate | 1.2.0 | 1.1.0 |
-|----------|---------------------:|------:|------:|
-| Newcomers denied after a drain flood of 1.5x the cap (cap 100,000) | 23 % | 0 % | 0 % |
-| … 2x the cap | 61 % | 0 % | 0 % |
-| … 3x the cap (2x unrecovered evictions) | 88 % | 0 % | 0 % |
-| … 4x the cap | — | 3 % | 0 % |
-| … 6x the cap | 98 % | 39 % | 0 % |
-| False denials, well-behaved population 3x the cap (cap 10,000) | 0.6–87 % | 0 % | 0 % |
-| … 10x the cap | 89 % | 4 % | 0 % |
-| … 2x the cap (cap 50,000) | 0.6 % | 0 % | 0 % |
-| Newcomers denied after one-request floods at the default cap | 50 % | 0 % | 0 % |
+| Scenario | First 1.2.0 candidate | 1.2.0 `Forget` | 1.2.0 `FailClosed` | 1.1.0 |
+|----------|---------------------:|------:|------:|------:|
+| Newcomers denied after a drain flood of 1.5x the cap (cap 100,000) | 23 % | 0 % | 0 % | 0 % |
+| … 2x the cap | 61 % | 0 % | 0 % | 0 % |
+| … 3x the cap | 88 % | 0 % | 0 % | 0 % |
+| … 4x the cap | — | 0 % | 3 % | 0 % |
+| … 6x the cap | 98 % | 0 % | 38 % | 0 % |
+| … 9x the cap | — | 0 % | 86 % | 0 % |
+| False denials, well-behaved population 3x the cap (cap 10,000) | 0.6–87 % | 0 % | 0 % | 0 % |
+| … 5x the cap, 5,000 visits/s | — | 0 % | 1.4 % | 0 % |
+| … 10x the cap, 5,000 visits/s | 89 % | 0 % | 4.2 % | 0 % |
+| … 10x the cap, 20,000 visits/s | — | 0 % | 72 % | 0 % |
+| … 2x the cap (cap 50,000) | 0.6 % | 0 % | 0 % | 0 % |
+| Configurations with over-admission, of 60 capacity-eviction bypass runs (500 drained victims; caps 64 and 10,000; floods 2–100x) | 0 | 48 | 0 | — |
+| Real-clock race, 4 drained victims vs drain-flood threads (cap 32): max units a victim got (bound 141–160) | 140 | up to 548,000 | 140 | — |
 
-1.1.0 never denied these keys because it forgot every debt on eviction —
-which let a flood of throwaway keys reset any key's limit. `tests/eviction_liveness.rs`
-runs the same scenarios scaled down, inside the exact table's bound.
+The population rows depend on churn, not on the population: the binding
+quantity is how many still-limited keys are evicted within one recovery period
+(the eviction rate times the recovery time), against about twice the cap.
 
+`Forget` never denies a key that owed nothing, and resets evicted keys only
+once more of them are owed at once than the table holds — then, under a
+sustained flood, over and over (the last two rows). `FailClosed` never resets a
+key, and denies keys that owed nothing once the same bound is passed. Choose
+`FailClosed` for limiters keyed by identities an attacker can target; see the
+README's "Choosing an overflow policy".
+
+Memory at the default cap after twice the cap of drained churn (counting
+allocator): 138 MiB of per-key state, plus 32 MiB of recovery tables under
+`Forget` (170 MiB) or 64 MiB under `FailClosed` (202 MiB).
+
+### A blocked key
+
+`check/blocked_key` — a key whose `quota_for` override admits nothing — is
+denied without taking the shard write lock: 53 ns per check (criterion median,
+same host). With 8 threads hammering such a key, a legitimate key in the same
+shard sees p50 400 ns and p99.9 1.5 µs (before: 2.2 µs and 30.9 µs).
 
 ## Head-to-head vs `governor`
 

@@ -24,7 +24,7 @@
         Built for <b>throughput</b>, <b>low overhead</b>, and <b>correctness under hostile traffic</b> on <b>Linux</b>, <b>macOS</b>, and <b>Windows</b>.
     </p>
     <p>
-        Per-key state lives in a <b>sharded store</b>: an existing key costs one shard read lock plus the algorithm's atomic accounting, so unrelated keys rarely contend. Memory is <b>bounded</b> by O(1) eviction: a flood of unique keys hits a cap instead of growing without limit, eviction never scans the store, and evicting a key <b>never resets its limit</b> — the difference between a rate limiter and a denial-of-service vector you built yourself.
+        Per-key state lives in a <b>sharded store</b>: an existing key costs one shard read lock plus the algorithm's atomic accounting, so unrelated keys rarely contend. Memory is <b>bounded</b> by O(1) eviction: a flood of unique keys hits a cap instead of growing without limit, eviction never scans the store, and evicting a still-limited key <b>keeps its debt instead of resetting its limit</b> — the difference between a rate limiter and a denial-of-service vector you built yourself.
     </p>
     <p>
         The common case is one line — <code>RateLimiter::per_second(100)</code> then <code>limiter.check(key)</code>. Power users pick the algorithm, quota, burst, shard count, eviction policy, and clock through a validating builder. rate-net does not reimplement token-bucket math; it consumes <a href="https://crates.io/crates/better-bucket"><code>better-bucket</code></a> for that and adds the per-key, multi-algorithm, retry-after machinery around it.
@@ -41,8 +41,9 @@
 > `Retry-After` / `RateLimit` header helpers; `tower` middleware; key
 > management; an un-keyed `DirectLimiter` and a `no_std` `Gcra` core; a fast
 > `CoarseClock`; optional metrics and an async layer with bounded waits.
-> `1.2.0` closes the last eviction loophole — an evicted key can no longer come
-> back with a fresh allowance — and cuts per-key memory by a third; see the
+> `1.2.0` closes the last eviction loophole — an evicted, still-limited key
+> keeps its debt instead of coming back with a fresh allowance (always, with
+> `Overflow::FailClosed`) — and cuts per-key memory by a third; see the
 > [CHANGELOG](./CHANGELOG.md).
 
 <br>
@@ -54,7 +55,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 - **Atomic accounting, sharded locking.** The token bucket, leaky bucket, and fixed window account each key with a single compare-and-swap; the sliding-window algorithms hold a short per-key lock. Keys are found under a per-shard read lock, so checks of unrelated keys proceed in parallel.
 - **Never over-admits.** Admissions for a key never exceed its algorithm's documented bound, under any interleaving of threads, on a real clock. Checked by `loom` against the production code, property-tested per algorithm, and regression-tested by many threads hammering one key on the OS clock.
 - **Bounded memory, O(1) eviction.** A capacity cap evicts by CLOCK (second chance) with a bounded scan, and an idle TTL drains incrementally. Capped shards are kept to 16,384 keys, so even the occasional amortized index growth stays short. A token-bucket key costs ~138 bytes; key bytes can be capped or digested.
-- **Eviction never resets a limit.** Flooding the store with throwaway keys cannot reset a target's allowance: a key evicted before it recovered has its debt recorded and resumes no more permissive than it left. Debts are kept exactly for about twice the cap's worth of evicted keys; past that the store fails closed (some keys that owed nothing start drained, or a newcomer is refused with a retry time), never open.
+- **Eviction does not reset a limit.** A key evicted before it recovered has its debt recorded and resumes no more permissive than it left — exactly, and without affecting any other key, while the still-limited evicted keys fit about twice the cap. Past that you choose: `Overflow::Forget` (default) drops the debts that do not fit, as 1.1 did for every key; `Overflow::FailClosed` keeps them all, so no flood can ever reset a key, at the cost of charging or refusing some keys that owed nothing. See [Choosing an overflow policy](#choosing-an-overflow-policy).
 - **Five algorithms, one trait.** Token bucket, leaky bucket (GCRA), fixed window, sliding-window log, sliding-window counter — swap the strategy without touching call sites.
 - **HTTP-ready.** Denials carry an honest `retry-after`; `retry_after_secs()` rounds it **up** for the header, `peek` feeds the `RateLimit-*` headers (and the current IETF draft's structured `RateLimit` / `RateLimit-Policy` fields) on every response, and an optional `tower` layer does all of it in front of any service.
 - **Safe keys.** Tagged keys (`Key::id`, `Key::ip`) cannot collide with attacker-chosen strings, and `Key::ipv6_prefix(addr, 64)` stops a client rotating through its own `/64`.
@@ -463,13 +464,15 @@ it must run inside a Tokio runtime), and only under the `async` feature.
 With the `metrics` feature, `limiter.metrics()` returns cumulative counters —
 `allowed`, `denied`, `keys_inserted`, `keys_evicted`, `keys_expired`,
 `keys_removed`, `keys_remembered` (evicted keys whose debt was recorded),
-`keys_restored` (new keys charged a recorded debt), `debts_overflowed` (debts
-spilled past the exact recovery table into the shared sketch, which can charge
-keys that never owed anything), `keys_refused` (newcomers refused because a
-full shard held only still-limited keys whose debts could not be kept), and
-`keys_rejected` (over-long keys) — kept per shard beside the lock word a check
-already touches. Any sustained `debts_overflowed` or `keys_refused` means the
-cap is too small for the traffic. Without the feature the counters do not
+`keys_restored` (new keys charged a recorded debt), `debts_forgotten` (debts
+dropped past the exact recovery table under `Overflow::Forget` — those keys may
+come back with a fresh allowance), `debts_overflowed` (debts spilled into the
+shared sketch under `Overflow::FailClosed`, which can charge keys that never
+owed anything), `keys_refused` (newcomers refused because a full shard held
+only still-limited keys whose debts could not be kept), and `keys_rejected`
+(over-long keys) — kept per shard beside the lock word a check already
+touches. Any sustained `debts_forgotten`, `debts_overflowed`, or
+`keys_refused` means the cap is too small for the traffic. Without the feature the counters do not
 exist at all.
 
 <br>
@@ -556,7 +559,7 @@ the full table are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 An insert at the cap costs ~58 ns more than in `1.1.0` (see
 [Known issues](#known-issues)): the eviction now reads each candidate's state
-so that it never resets a limit.
+so that it does not evict and reset a still-limited key.
 
 Under a unique-key flood (three threads inserting new keys as fast as they can,
 the default limiter at its 1,048,576-key cap), a legitimate key's check latency
@@ -564,9 +567,10 @@ barely moves:
 
 | Scenario | p50 | p99 | p99.9 |
 |----------|----:|----:|------:|
-| no flood | 100 ns | 200 ns | 300–700 ns |
-| flood of keys that recover at once | 100 ns | 500 ns | 0.7–1.1 µs |
-| flood of keys that each drain their quota | 100 ns | 500–700 ns | 1.0–1.4 µs |
+| no flood | 100 ns | 100 ns | 300 ns |
+| flood of keys that recover at once | 100 ns | 300 ns | 500–600 ns |
+| flood of keys that each drain their quota (`Overflow::Forget`) | 100 ns | 400 ns | 1.3 µs |
+| the same, `Overflow::FailClosed` | 100 ns | 600 ns | 1.2 µs |
 
 (`Instant` resolution on Windows is 100 ns.)
 
@@ -592,19 +596,24 @@ default `SystemClock` reads `Instant::now()` (~26 ns on Windows); on
   never resetting a still-limited key. Checks of keys already tracked are
   unaffected, and below the cap nothing changes. This is planned to be
   revisited and optimised in a future release.
-- **Past about twice the cap of unrecovered evictions, the store fails closed
-  for some keys.** Debts of evicted, still-limited keys are kept exactly for
-  about twice the cap's worth of such keys at once. Beyond that, debts spill
-  into a shared sketch that can charge a key that never owed anything (it
-  starts partly or wholly drained), and a full shard holding only
-  still-limited keys refuses a newcomer with a retry time. Measured: no false
-  denials for drain floods up to 3x the cap or well-behaved populations of
-  3x the cap; about 3 % of newcomers denied after a 4x drain flood, 39 % after 6x;
-  about 4 % false denials for a well-behaved population of 10x the cap
-  (`docs/BENCHMARKS.md`). `reset` and `remove` cannot clear a sketch charge for
-  one key; it expires within one recovery period. Size the cap above your real
-  key cardinality; `debts_overflowed` and `keys_refused` (feature `metrics`)
-  show when it is too small.
+- **Past about twice the cap of still-limited evictions, one side gives.**
+  Debts of evicted, still-limited keys are kept exactly for about twice the
+  cap's worth of such keys at once (what counts is the rate at which they are
+  evicted times their recovery time). Beyond that, the default
+  `Overflow::Forget` drops debts, so those keys may come back with a fresh
+  allowance — a sustained unique-key flood can reset a targeted key over and
+  over — while `Overflow::FailClosed` keeps them, so keys that never owed
+  anything may start drained or be refused with a retry time: no false
+  denials up to a 3x-cap drain flood, about 3 % of newcomers denied after 4x,
+  38 % after 6x; a well-behaved population of 10x the cap sees about 4 %
+  false denials at 5,000 visits a second but **72 % at 20,000**
+  (`docs/BENCHMARKS.md`). See
+  [Choosing an overflow policy](#choosing-an-overflow-policy). Size the cap
+  above your real key cardinality; `debts_forgotten`, `debts_overflowed`, and
+  `keys_refused` (feature `metrics`) show when it is too small.
+- **Under `FailClosed`, a sketch charge is shared**: `reset` and `remove`
+  cannot clear it for one key (it expires within one recovery period), and a
+  slow tier's long deadline can drain a fast-tier newcomer for that long.
 
 <br>
 
@@ -639,11 +648,13 @@ least once per revolution of the hand keeps its state through it. Each key's
 state is stored typed, with no enum tag: a token-bucket key is 128 bytes in its
 shard, about 138 bytes of heap per key at the default cap (measured by
 `tests/memory.rs`; up to ~210 bytes just after a shard's tables double), so the
-default cap of 1,048,576 keys bounds the store at roughly 140 MiB, plus the
-bytes of keys longer than 22 bytes (cap them with `max_key_len`, or digest them).
-Size the cap to your real key cardinality.
+default cap of 1,048,576 keys bounds the per-key state at roughly 140 MiB.
+Under eviction pressure the recovery tables add 32 MiB (`Overflow::Forget`)
+or 64 MiB (`Overflow::FailClosed`) at the default cap — about 170 or 202 MiB
+in all — plus the bytes of keys longer than 22 bytes (cap them with
+`max_key_len`, or digest them). Size the cap to your real key cardinality.
 
-### Eviction never resets a limit
+### Eviction does not reset a limit
 
 Evicting a key that is still being limited would hand it a fresh allowance when
 it returns — a way to reset anyone's limit by flooding the store with throwaway
@@ -656,20 +667,49 @@ algorithms (held back up to one window longer).
 
 The debts go into a cuckoo-hashed table of 16-byte records, two per key of
 capacity, allocated on first use. A key reads back only its own record, so
-while a shard's unrecovered evicted keys fit — about twice its share of the
-cap — no other key is ever affected. Past that, debts spill into a shared
-sketch (four 8-byte cells per key of capacity) that charges a key the smaller
-of its two cells: never less than its own spilled debt, but a key that never
-owed anything can be charged as well (fail closed). A key charged from the
-sketch never writes that debt back, so it cannot spread or ratchet; if its debt
-cannot be kept exactly, the key stays, and a full shard with nothing else to
-evict refuses the newcomer with a retry time. Measured at cap 100,000: no
-newcomer is denied after a drain flood of up to 3x the cap (3 % at 4x, 39 %
-at 6x); a well-behaved population of 3x the cap (cap 10,000) sees no false
-denials, 10x the cap 4 %. See [Known issues](#known-issues) and
-`docs/BENCHMARKS.md`. An idle TTL is raised to the quota's recovery time
-(`try_build` rejects a shorter one), so idle expiry normally removes only
-recovered keys too.
+while a shard's still-limited evicted keys fit — about twice its share of the
+cap at once — no evicted key is reset and no other key is ever affected. An
+idle TTL is raised to the quota's recovery time (`try_build` rejects a shorter
+one), so idle expiry normally removes only recovered keys; a key under a
+slower per-key quota that expires anyway is judged by its current state and
+has its debt recorded too.
+
+#### Choosing an overflow policy
+
+Past that bound, `Eviction::with_overflow` decides what gives:
+
+| | `Overflow::Forget` (default) | `Overflow::FailClosed` |
+|---|---|---|
+| A debt that does not fit | is dropped | spills into a shared sketch (four 8-byte cells per key of capacity) |
+| Evicted, still-limited keys | may come back with a fresh allowance, as in 1.1 | never come back looser than they left |
+| Keys that never owed anything | never charged, never refused | may start partly or wholly drained, or be refused with a retry time |
+| Drain flood of 4x / 6x / 9x the cap: newcomers denied | 0 / 0 / 0 % | 3 / 38 / 86 % |
+| Well-behaved population of 10x the cap, 5,000 / 20,000 visits a second | 0 / 0 % false denials | 4 / 72 % false denials |
+| Recovery tables at the default cap | 32 MiB | 64 MiB |
+
+Measured with the 1.2.0 re-audit's harness (ManualClock, 128 shards; cap
+100,000 for floods, 10,000 for populations). Under `FailClosed`, a key charged
+from the sketch never writes that charge back, so it cannot spread or ratchet,
+and a spent count beyond the sketch's 24 bits is charged as everything.
+
+**Use `FailClosed` for limiters keyed by identities an attacker can target** —
+usernames, API keys, account ids: login attempts, password resets, paid
+quotas — where resetting a key is the attack and a flood that locks out
+newcomers is the lesser harm:
+
+```rust
+use rate_net::{Eviction, Overflow, RateLimiter};
+
+let logins = RateLimiter::builder()
+    .per_minute(5)
+    .eviction(Eviction::capacity(1_000_000).with_overflow(Overflow::FailClosed))
+    .build();
+assert!(logins.check("alice").is_allow());
+```
+
+`Forget` suits load shedding in front of a service, keyed by client address,
+where keeping newcomers admitted under a flood matters more than a perfect
+memory of every evicted key.
 
 ### The no-over-admit invariant
 
@@ -741,8 +781,9 @@ contributor and every CI job builds the same thing:
 - Every CI job that claims a toolchain (MSRV, stable, nightly) selects it
   explicitly and prints `rustc -V`. A separate *latest dependencies* job runs
   weekly and on every pull request: it runs `cargo update`, then builds, tests,
-  lints, and audits against the newest compatible versions, so a breaking
-  upstream release shows up before it reaches users.
+  lints, and audits against the newest versions — on 1.99.0 the true latest
+  (whatever their `rust-version`), on 1.85 the newest that still support the
+  MSRV — so a breaking upstream release shows up before it reaches users.
 - Every non-dev dependency is justified in writing (purpose, in-house
   alternative, cost, verdict) before it is added.
 
