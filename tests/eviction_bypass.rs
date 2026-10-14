@@ -88,8 +88,8 @@ fn test_partly_spent_key_resumes_with_no_more_than_it_had() {
 fn test_overloaded_store_fails_closed_never_open() {
     for algorithm in algorithms() {
         // Thousands of unrecovered evictions overload a 64-key store's
-        // recovery table: records merge, and keys may come back *more*
-        // restricted than they left — never less.
+        // recovery table: debts spill into the shared overflow sketch, and
+        // keys may come back *more* restricted than they left — never less.
         let (_clock, limiter) = limiter(algorithm, 64);
         assert!(limiter.check_n("victim", 3).is_allow());
         for key in 0..5_000u64 {

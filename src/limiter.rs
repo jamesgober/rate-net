@@ -728,9 +728,16 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// refill completely. The key stays tracked.
     ///
     /// For administrative unblocks ("this customer was throttled by mistake")
-    /// and tests. Any debt recorded for the key when it was evicted (see
+    /// and tests. A debt recorded for the key itself when it was evicted (see
     /// [`Eviction`]) is forgotten too. Returns `true` if the key had state or a
-    /// recorded debt, `false` if neither (it already had its full allowance).
+    /// recorded debt of its own, `false` if neither.
+    ///
+    /// A tracked key's allowance is whole afterwards. An untracked key's own
+    /// record is cleared, but if the store has been evicting unrecovered keys
+    /// faster than its exact recovery table holds them (see [`Eviction`]), its
+    /// next check can still be charged from the shared overflow, which no
+    /// single key can clear; that charge expires within one recovery period,
+    /// and [`clear`](Self::clear) drops it at once.
     /// A key the limiter refuses outright ([`Builder::max_key_len`](crate::Builder::max_key_len))
     /// has neither.
     ///
@@ -757,9 +764,12 @@ impl<C: Clock + Clone> RateLimiter<C> {
     }
 
     /// Forgets `key` entirely, releasing its state and any debt recorded for it
-    /// when it was evicted. Its next check starts from a fresh allowance.
+    /// when it was evicted. Its next check starts from a fresh allowance —
+    /// unless, as for [`reset`](Self::reset), the shared overflow of an
+    /// overloaded recovery table charges it, which expires within one recovery
+    /// period.
     ///
-    /// Returns `true` if the key had state or a recorded debt.
+    /// Returns `true` if the key had state or a recorded debt of its own.
     ///
     /// # Examples
     ///

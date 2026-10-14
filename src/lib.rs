@@ -28,8 +28,9 @@
 //! helpers, key management, the un-keyed [`DirectLimiter`], the `no_std`
 //! [`Gcra`] core, the fast [`CoarseClock`], and optional `AsyncLimiter`
 //! (`async`), `Metrics` (`metrics`), and `tower` middleware (`tower`) layers.
-//! The steady-state check is allocation-free, and every public type is
-//! `Send + Sync + 'static`, asserted at compile time.
+//! Checking an already-tracked key allocates nothing when the key is passed
+//! by reference (`check_bytes`, `check_n_bytes`) or is at most 22 bytes, and
+//! every public type is `Send + Sync + 'static`, asserted at compile time.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {

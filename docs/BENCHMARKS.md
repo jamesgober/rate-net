@@ -60,8 +60,9 @@ one thread while three other threads insert unique keys as fast as they can, and
 reports the legitimate checks' p50 / p99 / p99.9 / max. Three scenarios: no
 flood; a flood of keys that have recovered by the time they are evicted
 (lossless evictions); and a flood of keys that each drain a 1-per-minute quota,
-so every eviction records a debt and the recovery table overflows (records
-merge). Timing uses `Instant::now()`, whose resolution on Windows is 100 ns —
+so every eviction records a debt — millions within one recovery period, far
+past what the exact recovery table holds, so most spill into the overflow
+sketch. Timing uses `Instant::now()`, whose resolution on Windows is 100 ns —
 hence the round numbers.
 
 **Conditions.** Windows 11 x86_64 (32 logical CPUs), Rust 1.99.0, Criterion
@@ -92,11 +93,14 @@ Legitimate-key check latency, default limiter at its cap:
 
 | Scenario | p50 | p99 | p99.9 |
 |----------|----:|----:|------:|
-| no flood | 100 ns | 200 ns | 300–700 ns |
-| flood of recovered keys | 100 ns | 500 ns | 0.7–1.1 µs |
-| flood of drained keys (every eviction records a debt) | 100 ns | 500–700 ns | 1.0–1.4 µs |
+| no flood | 100 ns | 100–200 ns | 300–700 ns |
+| flood of recovered keys | 100 ns | 300–400 ns | 600–700 ns |
+| flood of drained keys (every eviction records a debt) | 100 ns | 600 ns | 1.3 µs |
 | `v1.1.0`, flood | 100 ns | 300–500 ns | 0.5–1.0 µs |
 | `v1.0.0`, flood (audit, 2026-10-13) | — | — | 128 µs |
+
+(Flood rows re-run on the final 1.2.0 recovery table, 2026-10-14, same host
+and load conditions.)
 
 The maximum is not in the table: on this loaded host it was set by the OS
 preempting a thread (0.3–160 ms in *every* scenario, the no-flood one
@@ -117,14 +121,64 @@ What changed:
 - **One clock read, as late as possible.** The limiter reads the clock itself
   (the bucket no longer carries one) immediately before the key's
   compare-and-swap, so a contended CAS acts on a fresh time and retries less.
-- **Insertion at capacity costs more — on purpose.** To never reset a limit,
-  the CLOCK hand now reads each candidate's state to prefer a recovered key, and
-  an unrecovered victim's debt is recorded. At the default cap that is one more
-  cache line per eviction: ~50 ns, still about a thousand times cheaper than
-  `1.0.0`'s ~329 µs scan. On a small, cache-resident shard
+- **Insertion at capacity costs more — a known issue.** To never reset a
+  limit, the CLOCK hand now reads each candidate's state to prefer a recovered
+  key, and an unrecovered victim's debt is recorded. At the default cap that is
+  one more cache line per eviction: ~58 ns (see below), still about a thousand
+  times cheaper than `1.0.0`'s ~329 µs scan. On a small, cache-resident shard
   (`eviction_sweep`) it is lost in the other savings.
 - **Under a flood**, legitimate tail latency stays around a microsecond even
-  when every eviction must record a debt and the recovery table overflows.
+  when every eviction must record a debt and most debts spill past the exact
+  recovery table. A cuckoo walk through a full table costs a cache miss per
+  move, so after a walk fails the next 32 debts spill without one; without
+  that back-off the drained-flood p99.9 was 2.1–2.8 µs.
+
+## Known issue: new key at capacity (+58 ns)
+
+When the key table is full, inserting a never-seen key costs about +58 ns:
+`check/insert_at_default_cap` is **293 ns in 1.1.0 and 351 ns in 1.2.0**
+(criterion medians, best of several alternating runs on the loaded host above,
+so approximate). Eviction checks that each candidate has fully recovered
+before evicting it — the price of never resetting a still-limited key — and
+that read is an extra cache line per candidate. Checks of keys already tracked
+are unaffected, and below the cap nothing changes.
+
+A second measurement, with less scheduler noise: each variant built as its own
+binary, one fresh process per measurement, pinned to one core, the variants
+alternated round by round (6 rounds), median per variant — `1.1.0` ~242 ns,
+`1.2.0` ~250 ns. The 1.2.0 build already includes one small, cheap,
+guarantee-preserving improvement: each slot keeps a "recovers at" hint beside
+its CLOCK reference bit, so a candidate already seen to have recovered is not
+re-read. The deeper fixes (a dense coarse recovery tick derived from the
+bucket state when it is written anyway, storing the state inline in the slot,
+prefetching the next candidate) have **not yet been attempted**. The cost is
+shipped as a known issue, to be revisited and optimised in a future release.
+
+## Liveness under eviction pressure
+
+Eviction never resets a limit (`tests/eviction_bypass.rs`; the 1.2.0 re-audit
+harness found no over-admission in any of 60 eviction configurations, re-run
+on the final table). The price is that a store evicting more still-limited
+keys than its exact recovery table holds — about twice the cap at once —
+charges some keys that never owed anything, from the shared overflow sketch.
+Measured with the re-audit's harness (ManualClock, 128 shards):
+
+| Scenario | First 1.2.0 candidate | 1.2.0 | 1.1.0 |
+|----------|---------------------:|------:|------:|
+| Newcomers denied after a drain flood of 1.5x the cap (cap 100,000) | 23 % | 0 % | 0 % |
+| … 2x the cap | 61 % | 0 % | 0 % |
+| … 3x the cap (2x unrecovered evictions) | 88 % | 0 % | 0 % |
+| … 4x the cap | — | 3 % | 0 % |
+| … 6x the cap | 98 % | 39 % | 0 % |
+| False denials, well-behaved population 3x the cap (cap 10,000) | 0.6–87 % | 0 % | 0 % |
+| … 10x the cap | 89 % | 4 % | 0 % |
+| … 2x the cap (cap 50,000) | 0.6 % | 0 % | 0 % |
+| Newcomers denied after one-request floods at the default cap | 50 % | 0 % | 0 % |
+
+1.1.0 never denied these keys because it forgot every debt on eviction —
+which let a flood of throwaway keys reset any key's limit. `tests/eviction_liveness.rs`
+runs the same scenarios scaled down, inside the exact table's bound.
+
 
 ## Head-to-head vs `governor`
 
@@ -178,9 +232,10 @@ with no automatic eviction. The many-key gap is the same cost.
 
 ## What's next
 
-- Keeping the CLOCK reference bit in the same cache line as the token bucket's
-  state would take back most of the ~50 ns an at-capacity insert gained in
-  `1.2.0`; it needs `better-bucket` to expose a smaller-than-a-line core.
+- The ~58 ns an at-capacity insert gained in `1.2.0` is a known issue to be
+  resolved in a future release (see above): keeping a coarse recovery tick or
+  the state itself beside the CLOCK reference bit would avoid the extra cache
+  line per candidate.
 - A lock-free read path for existing keys (an epoch- or seqlock-protected index)
   would remove the read-lock acquire from the keyed check; it is deferred until
   it can be model-checked as thoroughly as the current store.

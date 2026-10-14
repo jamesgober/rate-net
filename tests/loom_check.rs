@@ -205,6 +205,36 @@ fn loom_evicted_drained_key_is_never_reset() {
     });
 }
 
+/// Two drained keys taking turns in a one-key shard: each re-check evicts the
+/// other key (recording its debt) and re-creates itself from its own recorded
+/// debt (taking it). Run concurrently, in every interleaving both stay
+/// refused: recording and taking a debt never lose one, whichever order the
+/// two write locks are granted in.
+#[test]
+fn loom_concurrent_record_and_take_never_reset_a_debt() {
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_minute(1)
+            .shards(1)
+            .eviction(Eviction::capacity(1))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("a").is_allow()); // "a" is drained
+        assert!(limiter.check("b").is_allow()); // "b" is drained; "a" recorded
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        let handle = thread::spawn(move || other.check("a").is_allow());
+        let b_again = limiter.check("b").is_allow();
+        let a_again = handle.join().expect("model thread panicked");
+
+        assert!(!a_again && !b_again, "a recorded debt was lost");
+        assert!(limiter.check("a").is_deny(), "a recorded debt was lost");
+        assert!(limiter.check("b").is_deny(), "a recorded debt was lost");
+    });
+}
+
 /// RN-COR-03: a thread whose timestamp falls in a window another thread has
 /// already closed must count against the newer window, never write its older
 /// window back and wipe the newer window's count.

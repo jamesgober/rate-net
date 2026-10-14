@@ -17,15 +17,17 @@
 ## [1.2.0] — 2026-10-14
 
 **Eviction never resets a limit, and the HTTP surface is complete.** A minor
-release: every change is additive or a fix, and nothing `1.0` or `1.1` offered
-changes (`cargo semver-checks`: no semver update required beyond minor). It
-closes the last eviction loophole from the 2026-10-13 audit — a key evicted at
-capacity used to come back with a fresh allowance — stores per-key state a third
-smaller, checks long keys without allocating, and adds per-key quotas, key-length
+release: no public item was removed or changed (`cargo semver-checks`: no
+semver update required beyond minor), but two behaviours are observable — an
+evicted, still-limited key now keeps its debt (in `1.1.0` it came back with a
+fresh allowance), and past about twice the cap of such evictions the store
+fails closed for some keys (see Known issues). It closes the last eviction
+loophole from the 2026-10-13 audit, stores per-key state a third smaller,
+checks long keys without allocating, and adds per-key quotas, key-length
 limits, bounded async waits, the current IETF structured headers, and `tower`
-middleware. Finding IDs below are the audit's (`RN-001`…`RN-023`); the
-[1.1.0](#110--2026-10-13) entry used an earlier numbering, cross-referenced at
-the end of this entry.
+middleware. Finding IDs below are the audit's (`RN-001`…`RN-023`) and the
+1.2.0 re-audit's (`RN2-001`…`RN2-017`); the [1.1.0](#110--2026-10-13) entry
+used an earlier numbering, cross-referenced at the end of this entry.
 
 ### Security
 
@@ -35,26 +37,39 @@ the end of this entry.
   store with throwaway keys reset any target's limit (login attempts for one
   username, say). The hand now prefers keys whose allowance has fully
   recovered, and when it must evict one that has not, the shard records the
-  debt (units spent, and when they would all be back) in a lazily allocated
-  recovery table of half the shard's capacity (16 bytes a record). A key that
-  returns before its debt is repaid resumes **no more permissive than it left**:
-  exactly, to within one unit, for the token and leaky buckets; with the spent
-  units charged at the return for the window algorithms. When more unrecovered
-  keys are evicted within one recovery period than the table holds, records
-  merge — keeping the larger debt and the later deadline — and a merged record
-  applies to every new key that maps to it until it expires: under extreme
-  pressure the store fails closed for some newcomers instead of open for evicted
-  keys. An idle-TTL eviction of a key that is still owed (a per-key quota with a
-  longer recovery) records its debt the same way. `remove`, `reset`, and
-  `clear` forget debts. Regression tests (`tests/eviction_bypass.rs`) fail
-  against `1.1.0` for every algorithm; a `loom` model covers a drained key being
-  evicted while it is checked; a property test and a fuzz target check that no
-  amount of eviction lets a key exceed its token-bucket bound.
+  debt (units spent, and when they would all be back). A key that returns
+  before its debt is repaid resumes **no more permissive than it left**:
+  exactly where it was for the token and leaky buckets; with the spent units
+  charged at the return for the window algorithms (held back up to one window
+  longer). Debts go into a lazily allocated, cuckoo-hashed table of 16-byte
+  records, two per key of capacity, where a key reads back only its own record;
+  only when a shard's still-limited evicted keys outgrow it (about twice the
+  cap at once) do debts spill into a shared overflow sketch (four 8-byte cells
+  per key of capacity), which charges a key the smaller of its two cells and so
+  can charge keys that never owed anything — failing closed, never open. A key
+  charged from the sketch never writes that charge back (RN2-001: the first
+  1.2.0 candidate's merged records spread and ratcheted debt onto innocent
+  keys), and a full shard that can neither evict nor record refuses a newcomer
+  with a retry time. An idle-TTL eviction of a key that is still owed (a
+  per-key quota with a longer recovery) records its debt the same way.
+  `remove`, `reset`, and `clear` forget a key's own record. Regression tests
+  (`tests/eviction_bypass.rs`) fail against `1.1.0` for every algorithm; liveness
+  tests (`tests/eviction_liveness.rs`) bound false denials under floods; `loom`
+  models cover a drained key evicted while it is checked and concurrent
+  record-and-take; property tests check that no recorded debt is ever lost and
+  that no amount of eviction lets a key exceed its token-bucket bound; a fuzz
+  target drives a heavily evicting store against an oracle.
 - **Key bytes were unbounded (RN-006).** `Builder::max_key_len` refuses
   over-long keys (denied as impossible, never stored), and
   `Builder::digest_keys_longer_than` stores long keys as a 16-byte digest of two
   independently, randomly seeded hashes, so a store's memory is bounded in bytes,
-  not just keys.
+  not just keys. `tower::HeaderKey` stores values over 64 bytes as a digest
+  by default (RN2-006).
+- **`X-Forwarded-For` could be forged by a client reaching the service
+  directly (RN2-005).** `ForwardedFor::only_from(network, prefix_len)` uses the
+  header only when the connection's peer is inside the proxies' network and
+  keys by the peer otherwise; the docs no longer claim the header is never
+  client-written. Bracketed and zoned IPv6 entries now parse.
 
 ### Fixed
 
@@ -72,14 +87,30 @@ the end of this entry.
   over all four threads' checks), which read about four times faster than any
   caller sees; it is now per-check latency, measured per thread after a
   barrier.
+- **The `quota_for` resolver ran under the shard write lock (RN2-003)**, so a
+  resolver that called back into the limiter deadlocked and a slow one stalled
+  its shard. It now runs before any lock is taken; the rules (may call other
+  keys, must not check the key being resolved, should be fast, panics
+  propagate) are documented.
+- **Per-key overrides bypassed `try_build`'s checks (RN2-010).** An override is
+  validated like the default quota; an invalid one makes its key fail closed.
+- **`tower`: `with_cost(0)` disabled limiting (RN2-008)** — a cost of `0` now
+  counts as `1`; **`RateLimit-Policy` described the default quota for keys
+  with an override (RN2-009)** — it now describes the key's own quota.
+- **The CI fuzz job could not start (RN2-002)**: it now creates the corpus
+  directories first, as do the README's commands.
+- **`deny(warnings)` broke the nightly miri and fuzz builds (RN2-012)**: it is
+  now off under `miri` and `fuzzing` as well as `docsrs`.
 
 ### Added
 
 - `RateLimiter::check_bytes`, `check_n_bytes`, `peek_bytes` — allocation-free
   checks of raw keys of any length.
 - `Builder::quota_for` — per-key quota overrides (tiered limits) from a
-  resolver called when a key is first stored; an override that admits nothing
-  blocks the key (fail closed, never stored).
+  resolver called, outside any lock, when a key is about to be stored; an
+  invalid override, or one that admits nothing, blocks the key (fail closed,
+  never stored). `RateLimiter::quota_of(key)` reports the quota a key is
+  under.
 - `Builder::max_key_len`, `Builder::digest_keys_longer_than` — the key-length
   policies above.
 - `AsyncLimiter::until_ready_within` / `until_ready_n_within` and the same on
@@ -95,17 +126,21 @@ the end of this entry.
 - `tower` feature: `rate_net::tower::RateLimitLayer` for inbound HTTP in front
   of any `tower::Service` (axum, hyper, tonic), with `KeyExtractor`
   implementations `PeerIp`, `ForwardedFor` (trusting a fixed number of
-  proxies — never a client-written entry), `HeaderKey`, and closures over
+  proxies, optionally only from their network), `HeaderKey`, and closures over
   `RequestInfo`; denied requests get `429` with `Retry-After` and the rate-limit
-  headers without reaching the inner service. Adds `http`, `tower-layer`,
-  `tower-service`, and `pin-project-lite` (not `tower` itself).
-  `examples/tower_layer.rs`.
-- `Metrics`: `keys_remembered`, `keys_restored`, `records_merged`,
-  `keys_rejected`.
+  headers without reaching the inner service. `with_anonymous(Anonymous)`
+  chooses what requests with no identity are charged to — one shared key (the
+  default), a key of your choice, or nothing, rejected with a status (RN2-007).
+  Adds `http`, `tower-layer`, `tower-service`, and `pin-project-lite` (not
+  `tower` itself). `examples/tower_layer.rs`.
+- `Metrics`: `keys_remembered`, `keys_restored`, `debts_overflowed`,
+  `keys_refused`, `keys_rejected`.
 - `Key::len`, `Key::is_empty`, `From<[u8; N]>`, `From<&[u8; N]>` for `Key`.
-- Tests: `tests/eviction_bypass.rs`, `tests/key_options.rs`, the eviction
-  property test, allocation audits for long keys and every algorithm, a `loom`
-  model of the evict-and-return race, unwind-safety assertions.
+- Tests: `tests/eviction_bypass.rs`, `tests/eviction_liveness.rs`,
+  `tests/key_options.rs`, the eviction and recovery-table property tests,
+  allocation audits for long keys and every algorithm, `loom` models of the
+  evict-and-return race and of concurrent record-and-take, unwind-safety
+  assertions.
 - Fuzzing: `fuzz/` with `limiter_ops` (arbitrary checks, clock advances, resets,
   removals, and sweeps on a heavily evicting store, against a token-bucket
   oracle) and `http_keys` (key extraction from hostile headers, and structured
@@ -125,10 +160,19 @@ the end of this entry.
   stored.
 - `better-bucket` is used without features (only `BucketCore`), so it no longer
   pulls `clock-lib` and `error-forge` in a second time.
-- An insert at capacity costs ~50 ns more at the default cap (~0.35 µs) because
-  eviction now reads each candidate's state to prefer recovered keys; a small,
-  cache-resident shard's insert got slightly faster. Many-key checks and `peek`
-  are faster (fewer cache lines per key). See `docs/BENCHMARKS.md`.
+- An insert at capacity costs ~58 ns more at the default cap (293 → 351 ns)
+  because eviction now reads each candidate's state to prefer recovered keys —
+  a known issue (below); a small, cache-resident shard's insert got slightly
+  faster. Many-key checks and `peek` are faster (fewer cache lines per key).
+  See `docs/BENCHMARKS.md`.
+- The recovery table costs 64 bytes per key of capacity once a shard first
+  evicts a still-limited key (64 MiB at the default cap).
+- `Cargo.lock` is committed and `rust-toolchain.toml` pins Rust 1.99.0 for
+  development (excluded from the package); every CI job selects its toolchain
+  explicitly and prints `rustc -V`; a weekly and per-PR *latest dependencies*
+  job runs `cargo update` before building, testing, linting, and auditing; the
+  package no longer ships `REPS.md`, `.github/`, or editor configuration
+  (RN2-016).
 - `#![deny(warnings)]` stays in the crate root as REPS requires, but not on
   docs.rs (`cfg(docsrs)`), whose nightly rustdoc can add lints after a release
   and fail the published docs; downstream builds were never affected (Cargo caps
@@ -138,7 +182,7 @@ the end of this entry.
 - CI: `actions/checkout@v7`; an each-feature matrix via `cargo-hack` (clippy,
   tests, and docs for every feature alone, on stable and the MSRV); pedantic,
   release-mode stress, coverage, and fuzz-smoke jobs; `semver-checks` on all
-  features; miri over the recovery-table tests.
+  features; miri over the recovery-table and eviction tests.
 - `tests/memory.rs` budget tightened from 512 to 256 B per key.
 
 ### Not changed, with reasons
@@ -154,12 +198,6 @@ the end of this entry.
 - **The default capacity stays at 1,048,576 keys (RN-006).** Lowering it would
   change behaviour for existing users; the bound (~140 MiB) is now documented
   precisely instead.
-- **No `rust-toolchain.toml` and no committed `Cargo.lock` (RN-023).** The
-  portfolio convention for libraries (shared with `better-bucket`): CI tests
-  stable and the 1.85 MSRV explicitly, which a pinned toolchain file would
-  override, and resolves a fresh lockfile so the audit sees what a consumer
-  builds. The MSRV-aware resolver keeps that resolution on 1.85-compatible
-  versions.
 - **`DynLimiter` has no `Send + Sync` supertrait (RN-017).** Adding one would
   break 1.1 implementors; `Arc<dyn DynLimiter + Send + Sync>` is the documented
   form.
@@ -170,6 +208,24 @@ the end of this entry.
 - **`CHANGELOG` dates for 0.9.0–1.0.0 (RN-023).** The entries are a historical
   record and are not rewritten; the "soak" wording there describes intent, not a
   measured period.
+
+### Known issues
+
+- **Inserting a new key into a full store costs ~58 ns more than in `1.1.0`**
+  (≈293 → 351 ns at the default 1,048,576-key cap; measured on a loaded Windows
+  host, best of runs, so approximate), because eviction checks that each
+  candidate has fully recovered before evicting it — the price of never
+  resetting a still-limited key. Checks of tracked keys are unaffected, and
+  below the cap nothing changes. To be revisited and optimised in a future
+  release.
+- **Past about twice the cap of still-limited evictions, some keys that owed
+  nothing are charged** (fail closed). Measured (ManualClock, 128 shards): no
+  newcomer denied after drain floods up to 3x the cap; about 3 % at 4x and
+  39 % at 6x; no false denials for a well-behaved population of 3x the cap,
+  about 4 % at 10x. `reset` and `remove` cannot clear such a shared charge for
+  one key (it expires within one recovery period).
+- **`clock-lib` 1.1.0 does not build under `--cfg loom` (RN2-015)**; the `loom`
+  job pins 1.0.0 until it is fixed upstream.
 
 ### Audit cross-reference (2026-10-13, `RN-0xx`)
 
@@ -197,7 +253,7 @@ the end of this entry.
 | RN-020 broken link, README compile | Fixed in 1.1.0 |
 | RN-021 no reclamation / shrink | Fixed in 1.1.0 (key management); background sweep declined (above) |
 | RN-022 `error-forge` weight | 1.0.2 in 1.1.0; optional feature deferred to 2.0 (above) |
-| RN-023 CI / process | **1.2.0**: checkout v7, feature matrix, coverage, fuzz; toolchain/lock declined (above) |
+| RN-023 CI / process | **1.2.0**: checkout v7, feature matrix, coverage, fuzz; toolchain pinned, lock committed |
 
 The `1.1.0` entry's identifiers come from an earlier pass and map as:
 RN-COR-01 = RN-001; RN-SEC-01 = RN-003 and RN-004; RN-COR-03 = RN-002;

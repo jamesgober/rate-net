@@ -169,7 +169,10 @@ An existing-key check takes the shard read lock and runs the algorithm's
 accounting (one compare-and-swap for the token bucket, leaky bucket, and fixed
 window; a short per-key mutex for the sliding-window algorithms). It allocates
 nothing beyond building the `Key` itself, which copies a key longer than 22
-bytes to the heap — use [`check_bytes`](#borrowed-keys) for long keys. The first
+bytes to the heap — use [`check_bytes`](#borrowed-keys) for long keys — except
+that a sliding-window-log key's run-length log grows amortized (a few
+allocations per thousand checks of a high-limit key, until it reaches its
+working size). The first
 check of a new key takes the shard write lock and may evict one other key
 ([Sharding and eviction](#sharding-and-eviction)), which never resets that key's
 limit.
@@ -279,6 +282,7 @@ limiter.shrink_to_fit();
 
 ```rust ignore
 pub fn quota(&self) -> Quota
+pub fn quota_of(&self, key: impl Into<Key>) -> Quota
 pub const fn algorithm(&self) -> Algorithm
 pub fn shards(&self) -> usize
 pub const fn eviction(&self) -> Eviction
@@ -286,7 +290,10 @@ pub fn tracked_keys(&self) -> usize
 ```
 
 `quota` and `eviction` report the configuration as given (an idle TTL raised
-to the recovery time is reported unraised). `tracked_keys` is a momentary,
+to the recovery time is reported unraised). `quota_of(key)` is the quota a key
+is under: its valid `quota_for` override, a quota with limit `0` if the
+override is invalid (the key fails closed), otherwise `quota()`; it calls the
+resolver each time. `tracked_keys` is a momentary,
 advisory count, bounded by the eviction policy.
 
 ```rust
@@ -371,11 +378,21 @@ sharding, bounded eviction, `SystemClock`); the quota defaults to a limit of
 Three key options shape per-key behaviour:
 
 - **`quota_for(resolve)`** — tiered limits from one limiter. `resolve` is called
-  with a key when it is first stored (and when an untracked key is peeked);
-  `Some(quota)` gives the key that quota, `None` the default. It is never
-  called on an existing key's check, must be deterministic for a key (an
-  evicted key that returns is resolved again), and an override that admits
-  nothing makes that key fail closed (a blocked tenant).
+  with a key when it is about to be stored (and when an untracked key is
+  peeked or passed to `quota_of`); `Some(quota)` gives the key that quota,
+  `None` the default. It is never called for a tracked key. It runs on the
+  caller's thread **before the limiter takes any lock**, so it never blocks
+  other keys and may call into the limiter for *other* keys — but it must not
+  check the key it is resolving (that recurses), should be fast (it delays the
+  first request of every new key), and must be deterministic for a key (an
+  evicted key that returns is resolved again). A panic propagates to the
+  caller; nothing is stored. An override is validated like `try_build`
+  validates the default quota (zero limit, period, or bucket burst; a leaky
+  bucket above one unit per nanosecond; a sliding-window-log limit above
+  `MAX_SLIDING_LOG_LIMIT`): an invalid one makes that key **fail closed** (a
+  blocked tenant). The idle TTL is raised to the *default* quota's recovery
+  time; a key with a longer override that expires while still limited has its
+  debt recorded like any eviction.
 - **`max_key_len(len)`** — a check of a key longer than `len` bytes is denied as
   impossible and the key is never stored, so the store's memory is bounded in
   bytes, not just keys.
@@ -943,8 +960,9 @@ pub struct Metrics {
     pub keys_expired: u64,   // keys reclaimed by the idle sweep
     pub keys_removed: u64,   // remove / clear / retain_recent
     pub keys_remembered: u64, // evicted before recovering: debt recorded
-    pub keys_restored: u64,   // new keys resumed from a recorded debt
-    pub records_merged: u64,  // recovery-table overflows (failing closed)
+    pub keys_restored: u64,   // new keys charged a recorded debt
+    pub debts_overflowed: u64, // debts spilled into the shared overflow sketch
+    pub keys_refused: u64,    // newcomers refused: shard saturated with debtors
     pub keys_rejected: u64,   // refused by max_key_len
 }
 ```
@@ -955,9 +973,14 @@ counters. `keys_evicted` should normally be zero: a steady rate means the cap is
 below the live key population or the limiter is under a unique-key flood (a
 `keys_inserted` spike is the other signature). `keys_remembered` counts the
 evictions that had to record a debt and `keys_restored` the keys that came back
-to one; `records_merged` should be zero — any sustained rate means the
-recovery table is overloaded and new keys are being started drained (the store
-failing closed). Without the feature the counters do not exist.
+to one (including keys charged from the shared overflow sketch). Both
+`debts_overflowed` and `keys_refused` should be zero: a sustained
+`debts_overflowed` means more still-limited keys are being evicted than the
+exact recovery table holds, so keys that never owed anything can start drained;
+`keys_refused` counts newcomers denied with a retry time because a full shard
+held only still-limited keys whose debts could not be kept (both are the store
+failing closed). Either means the cap is too small for the traffic. Without
+the feature the counters do not exist.
 
 ---
 
@@ -1053,7 +1076,11 @@ pub mod tower {
     pub fn with_policy(self, name: impl Into<String>) -> Self
     pub fn with_headers_on_success(self, enabled: bool) -> Self
     pub fn with_impossible_status(self, status: http::StatusCode) -> Self
+    pub fn with_anonymous(self, anonymous: Anonymous) -> Self
     pub const fn limiter(&self) -> &Arc<RateLimiter<C>>
+
+    #[non_exhaustive]
+    pub enum Anonymous { Shared, Key(Key), Reject(http::StatusCode) }
 
     pub struct RateLimited<S, K, C = SystemClock>   // the Service
     pub struct ResponseFuture<F, B>                 // its future
@@ -1064,22 +1091,30 @@ pub mod tower {
     pub struct RequestInfo<'a>   // method(), uri(), headers(), extensions()
     pub struct PeerIp            // the peer address from the request extensions
     pub struct ForwardedFor      // X-Forwarded-For, trusting a fixed number of proxies
+        // trusting(n), only_from(network: IpAddr, prefix_len: u8), with_prefixes(v4, v6)
     pub struct HeaderKey         // the value of one header
+        // new(name), with_digest_over(len)
 }
 ```
 
 A `tower::Layer` for inbound HTTP (`http::Request` → `http::Response<B>` with
 `B: Default`): an axum `Router`, a hyper service, a tonic server. Each request
-is charged `cost` units (default 1) to the key its extractor picks; a request
-with no extractable identity is charged to one shared anonymous key. The
-decision is made synchronously in `call`:
+is charged `cost` units (default 1; a cost of `0` counts as `1`, so it never
+disables limiting) to the key its extractor picks. A request with no
+extractable identity is handled by the layer's `Anonymous` policy: `Shared`
+(the default) charges one shared anonymous key, which never equals an
+extracted key; `Key(key)` charges the given key, which can have its own
+`quota_for` tier; `Reject(status)` answers with that status and charges
+nothing. The decision is made synchronously in `call`:
 
 - **Admitted** — the inner service's own future runs (no boxing); with
   `with_headers_on_success(true)` its response also gets the rate-limit headers.
 - **Denied** — the inner service is not called. The response is `429` with the
   body type's `Default`, `Retry-After` (whole seconds, rounded up), and
   `RateLimit-Limit` / `-Remaining` / `-Reset`; with `with_policy(name)` also the
-  structured `RateLimit` and `RateLimit-Policy` fields. A request that can never
+  structured `RateLimit` and `RateLimit-Policy` fields, which describe the
+  quota the key is actually under (its `quota_for` override, if it has one). A
+  request that can never
   be admitted ([`Decision::is_impossible`](#decision)) gets
   `with_impossible_status` (default `429`) and no `Retry-After`.
 
@@ -1087,10 +1122,17 @@ Extractors: `PeerIp` keys by the connection's address (an `IpAddr` or
 `SocketAddr` the server put in the request extensions), IPv4 exactly and IPv6
 by `/64` (`with_prefixes` to change). `ForwardedFor::trusting(n)` takes the
 `X-Forwarded-For` entry `n` places from the right — the address your `n`th
-proxy saw — and never a client-written entry: a header with fewer entries
-yields no key. `HeaderKey` keys by a header's raw value (pair it with
-`max_key_len` or `digest_keys_longer_than` when clients choose it). With axum,
-read `ConnectInfo<SocketAddr>` in a closure extractor.
+proxy saw; a header with fewer entries yields no key. That entry was written by
+your proxy only if the request came through your proxies: a client that can
+reach the service directly writes the whole header itself. Add
+`.only_from(network, prefix_len)` (repeatable) to use the header only when the
+connection's peer address is inside one of the proxies' networks — otherwise
+the peer address itself is the key. IPv6 entries may be bracketed and carry a
+zone (`[fe80::1%eth0]`), and IPv4-mapped peers match IPv4 networks.
+`HeaderKey` keys by a header's value, stored verbatim up to 64 bytes and as a
+16-byte keyed digest beyond (`with_digest_over` to change), so a client cannot
+fill memory with huge values. With axum, read `ConnectInfo<SocketAddr>` in a
+closure extractor.
 
 ```rust
 use std::convert::Infallible;
@@ -1176,25 +1218,50 @@ live count stays within one key per shard of the configured maximum.
 
 **Eviction never resets a limit.** When an evicted key still owes part of its
 allowance, its shard records the debt — units spent, and when they would all
-be back — in a recovery table: 16-byte records, half the shard's capacity (at
-least 8, at most 8,192 per shard), allocated the first time the shard evicts an
-unrecovered key and released by `retain_recent` once every record has expired.
-A key inserted before its debt is repaid resumes **no more permissive than it
-left**: the token and leaky buckets resume where they were, to within one unit
-(rounded against the key); the window algorithms resume with the spent units
-charged at the return, so they may be held back for up to one window longer.
-Each key has two candidate records; when both hold other keys' live debts —
-more unrecovered keys evicted within one recovery period than the table holds —
-the debt is merged into one of them, which keeps the larger debt and the later
-deadline and then applies to every new key that maps to it until it expires.
-Merging never loses a debt; it can only start an unrelated newcomer partly or
-wholly drained. Under extreme eviction pressure the store therefore **fails
-closed** for some new keys rather than open for evicted ones
-(`Metrics::records_merged` counts merges). The idle TTL is raised to the quota's
-recovery time, so idle expiry normally removes only recovered keys; a key with
-a longer per-key quota that expires while still limited has its debt recorded
-like any other eviction. `remove`, `reset`, and `clear` forget debts — they are
-explicit resets.
+be back. A key inserted before its debt is repaid resumes **no more permissive
+than it left**: the token and leaky buckets resume exactly where they were (the
+deadline rounded up to the millisecond, against the key); the window
+algorithms resume with the spent units charged at the return, so they may be
+held back for up to one window longer.
+
+The debts live in a per-shard recovery table, allocated the first time the
+shard evicts an unrecovered key and released by `retain_recent` once every
+debt has expired. It costs 64 bytes per key of capacity (64 MiB at the default
+cap; up to twice that when a shard's share of the cap is just past a power of
+two):
+
+- **Exact records** — 16 bytes each, two per key of capacity, in a
+  cuckoo-hashed table: each key has two candidate buckets of four records, and
+  a full pair is made room in by moving records to their other bucket (at most
+  16 moves), which fills the table past 90 % before anything spills. A key
+  reads back only its own record. While a shard's unrecovered evicted keys fit
+  (about twice its share of the cap, live at once), no other key is ever
+  charged and nothing is refused.
+- **Overflow sketch** — four 8-byte cells per key of capacity. A debt the
+  exact table cannot place is written to two cells, each keeping the larger
+  deadline and spend; a key being stored is charged the smaller of its two
+  cells while both are live. That never undercharges a key whose own debt
+  spilled, but a key that never owed anything is charged when both its cells
+  hold others' debts: it starts partly or wholly drained (fail closed).
+- **No spreading** — a key charged from the sketch is never written back into
+  it: its debt goes only into the exact table, marked so it is never moved
+  out. If its candidate records all hold such marked debts it is not evicted,
+  and a full shard with nothing else to evict **refuses the newcomer** with a
+  retry time (`Metrics::keys_refused`) rather than exceed the cap or forget a
+  debt.
+
+Measured (`docs/BENCHMARKS.md`; 128 shards): after a flood of unique keys that
+each drain their quota, no newcomer is denied up to a flood of 3x the cap
+(cap 100,000), 3 % at 4x, 39 % at 6x; a well-behaved population of 3x the
+cap (cap 10,000) sees no false denials, 10x the cap 4 %. 1.1.0 denied none of
+them because it forgot every debt — which let a flood reset any key's limit.
+
+The idle TTL is raised to the quota's recovery time, so idle expiry normally
+removes only recovered keys; a key with a longer per-key quota that expires
+while still limited has its debt recorded like any other eviction. `remove`,
+`reset`, and `clear` forget a key's own record — they are explicit resets —
+but a sketch charge is shared and cannot be cleared for one key (it expires
+within one recovery period; `clear` drops the whole table).
 
 ---
 
@@ -1227,7 +1294,7 @@ races.
 - **Keys:** a token-bucket key is 128 bytes in its shard — about 138 bytes of
   heap per key at the default cap, up to ~210 just after a shard's tables have
   doubled — so the default cap bounds the store at roughly 140 MiB, plus up to
-  8 MiB of recovery records under eviction pressure, plus the bytes of any key
+  64 MiB of recovery records under eviction pressure, plus the bytes of any key
   longer than 22 (bounded with `max_key_len`, or fixed at 16 with
   `digest_keys_longer_than`). `tests/memory.rs` asserts a 256 B/key budget.
 

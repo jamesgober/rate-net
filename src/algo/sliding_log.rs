@@ -14,6 +14,11 @@
 //! costs one. The worst case per key is therefore `16 * limit` bytes, which is
 //! why the validating builder caps the limit at
 //! [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT).
+//!
+//! The log is a `VecDeque` that grows by doubling as a key's traffic rises, so
+//! unlike the other algorithms a check is not strictly allocation-free: a
+//! high-limit key allocates a few times per thousand checks until its log
+//! reaches its working size (amortized, never per check).
 
 use core::time::Duration;
 use std::collections::VecDeque;

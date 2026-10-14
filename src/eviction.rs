@@ -7,7 +7,7 @@ use core::time::Duration;
 /// Roughly a million keys. Generous for legitimate traffic, but a hard ceiling
 /// so a flood of unique keys can never grow the store without limit. At this
 /// cap a default token-bucket limiter holds about 138 MiB of per-key state
-/// (measured: `tests/memory.rs`), plus up to 8 MiB of recovery records under
+/// (measured: `tests/memory.rs`), plus up to 64 MiB of recovery records under
 /// eviction pressure, plus the bytes of any key longer than 22 bytes. Pick a
 /// value that matches your real key cardinality with [`Eviction::capacity`].
 pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
@@ -48,27 +48,49 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// they would all be back. A key inserted before that time resumes **no more
 /// permissive than it left**:
 ///
-/// - token and leaky buckets resume where they were, to within one unit
-///   (rounded against the key);
+/// - token and leaky buckets resume exactly where they were (the deadline is
+///   rounded up to the millisecond, against the key);
 /// - window algorithms resume with the spent units charged at the return, so
 ///   they may be held back for up to one window longer than the original.
 ///
-/// The records live in a per-shard table of half the shard's capacity (16
-/// bytes each, at most 8,192 per shard, allocated the first time a shard evicts
-/// an unrecovered key; `retain_recent` releases a table once its records have
-/// all expired). Each key has two candidate records. When more unrecovered keys
-/// are evicted within one recovery period than the table can hold — a flood far
-/// beyond the cap — a new record is **merged** into an existing one, which
-/// then keeps the larger debt and the later deadline and applies to *every*
-/// key that maps to it until it expires. Merging never forgets a debt; it can
-/// only make an unrelated newcomer start partly or wholly drained. Under
-/// extreme pressure the limiter therefore **fails closed** for some new keys
-/// instead of failing open for evicted ones. `Metrics::records_merged`
-/// (feature `metrics`) counts merges; any sustained rate means the cap is far
+/// The debts live in a per-shard recovery table, allocated the first time a
+/// shard evicts an unrecovered key (`retain_recent` releases it once every
+/// debt has expired):
+///
+/// - an **exact** cuckoo-hashed table of 16-byte records, two per key of
+///   capacity. A key reads back only its own record. While a shard's
+///   unrecovered evicted keys fit — about twice its share of the cap, live at
+///   once — eviction costs nothing in liveness: no key that never owed
+///   anything is charged, and nothing is refused;
+/// - beyond that, an **overflow sketch** of four 8-byte cells per key of
+///   capacity. A debt the exact table cannot place is written to two cells; a
+///   key being stored is charged the smaller of its two cells while both are
+///   live. That never undercharges a key whose own debt overflowed, but it can
+///   charge a key that never owed anything — it then starts partly or wholly
+///   drained (fail closed);
+/// - a key charged from the sketch is never written back into it when it is
+///   evicted again, so sketch charges cannot spread or ratchet. If its debt
+///   finds no place in the exact table either, the key is not evicted, and a
+///   full shard with nothing else to evict **refuses** the newcomer with a
+///   retry time instead of exceeding the cap or forgetting a debt.
+///
+/// Measured (`docs/BENCHMARKS.md`; 128 shards, cap 100,000 for the floods and
+/// 10,000 for the populations): newcomers after a flood of
+/// unique keys that each drain their quota are never denied up to a flood of
+/// 3x the cap (2x unrecovered evictions), about 3 % at 4x and 39 % at 6x; a
+/// population of well-behaved users three times the cap sees no false
+/// denials, ten times the cap 4 %. 1.1.0 denied none of them, because it
+/// forgot every debt — and so let any key's limit be reset by a flood. The
+/// table costs 64 bytes per key of capacity (64 MiB at the default cap; up
+/// to twice that when a shard's share of the cap is just past a power of two);
+/// `Metrics::debts_overflowed` and `Metrics::keys_refused` (feature
+/// `metrics`) count spills and refusals: any sustained rate means the cap is
 /// too small for the traffic.
 ///
-/// `remove`, `reset`, and `clear` forget a key's record along with its state;
-/// they are explicit resets.
+/// `remove`, `reset`, and `clear` forget a key's own record along with its
+/// state; they are explicit resets. A sketch charge is shared and cannot be
+/// cleared for one key (it expires within one recovery period); `clear`
+/// drops the whole table.
 ///
 /// Size the cap above your real key cardinality so only flood keys are ever
 /// evicted. A tracked token-bucket key costs about 138 bytes of heap at the

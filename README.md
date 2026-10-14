@@ -54,7 +54,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 - **Atomic accounting, sharded locking.** The token bucket, leaky bucket, and fixed window account each key with a single compare-and-swap; the sliding-window algorithms hold a short per-key lock. Keys are found under a per-shard read lock, so checks of unrelated keys proceed in parallel.
 - **Never over-admits.** Admissions for a key never exceed its algorithm's documented bound, under any interleaving of threads, on a real clock. Checked by `loom` against the production code, property-tested per algorithm, and regression-tested by many threads hammering one key on the OS clock.
 - **Bounded memory, O(1) eviction.** A capacity cap evicts by CLOCK (second chance) with a bounded scan, and an idle TTL drains incrementally. Capped shards are kept to 16,384 keys, so even the occasional amortized index growth stays short. A token-bucket key costs ~138 bytes; key bytes can be capped or digested.
-- **Eviction never resets a limit.** Flooding the store with throwaway keys cannot reset a target's allowance: a key evicted before it recovered has its debt recorded and resumes no more permissive than it left. Under extreme pressure the store fails closed, never open.
+- **Eviction never resets a limit.** Flooding the store with throwaway keys cannot reset a target's allowance: a key evicted before it recovered has its debt recorded and resumes no more permissive than it left. Debts are kept exactly for about twice the cap's worth of evicted keys; past that the store fails closed (some keys that owed nothing start drained, or a newcomer is refused with a retry time), never open.
 - **Five algorithms, one trait.** Token bucket, leaky bucket (GCRA), fixed window, sliding-window log, sliding-window counter — swap the strategy without touching call sites.
 - **HTTP-ready.** Denials carry an honest `retry-after`; `retry_after_secs()` rounds it **up** for the header, `peek` feeds the `RateLimit-*` headers (and the current IETF draft's structured `RateLimit` / `RateLimit-Policy` fields) on every response, and an optional `tower` layer does all of it in front of any service.
 - **Safe keys.** Tagged keys (`Key::id`, `Key::ip`) cannot collide with attacker-chosen strings, and `Key::ipv6_prefix(addr, 64)` stops a client rotating through its own `/64`.
@@ -215,9 +215,17 @@ With the `tower` feature, `RateLimitLayer` puts a limiter in front of any
 `tower::Service` over `http` requests. A `KeyExtractor` picks who each request
 is charged to — `PeerIp` (the connection's address from the request
 extensions), `ForwardedFor::trusting(n)` (the client address `n` trusted
-proxies report, never one the client chose), `HeaderKey` (an API key), or any
-closure. Denied requests never reach the inner service: they get a `429` with
-`Retry-After` and the rate-limit headers.
+proxies report), `HeaderKey` (an API key), or any closure. Denied requests
+never reach the inner service: they get a `429` with `Retry-After` and the
+rate-limit headers.
+
+`ForwardedFor` reads `X-Forwarded-For`, which the client can write. It keys
+by the address the trusted proxies appended only if every request reaches the
+service through them; if the service is also reachable directly, add
+`.only_from(network, prefix_len)` so the header is used only when the
+connection's peer is in the proxies' network, and the peer itself is the key
+otherwise. `HeaderKey` stores a value longer than 64 bytes as a 16-byte keyed
+digest, so a client cannot fill memory with huge header values.
 
 ```rust
 use std::convert::Infallible;
@@ -244,8 +252,13 @@ let _ = serve; // run it on your Tokio runtime
 ```
 
 With axum, add the layer to a `Router` (`.layer(layer)`) and read the peer
-address from axum's `ConnectInfo` with a closure extractor. Unidentifiable
-requests share one anonymous key rather than going unlimited.
+address from axum's `ConnectInfo` with a closure extractor. By default,
+requests the extractor cannot identify share one anonymous key rather than
+going unlimited; `.with_anonymous(Anonymous::Key(key))` charges them to a key
+of your choice (which can have its own `quota_for` tier) and
+`.with_anonymous(Anonymous::Reject(status))` answers them without charging
+anything. `.with_cost(n)` charges `n` units a request (`0` counts as `1`), and
+the `RateLimit-Policy` header describes the quota the key is actually under.
 
 <br>
 
@@ -273,7 +286,15 @@ assert!(limiter.check_bytes(token).is_allow());
 
 `check(key)` copies a key longer than 22 bytes into a new allocation on every
 call; `check_bytes` borrows it, so the check of an existing key allocates
-nothing whatever its length. The digest is two independently, randomly seeded
+nothing whatever its length.
+
+The `quota_for` resolver runs on the caller's thread before the limiter takes
+any lock, once for each key being stored (never for a tracked key). It may call
+back into the limiter for *other* keys, but must not check the key it is
+resolving; it should be fast and deterministic. An override that `try_build`
+would reject (a zero limit, an over-fast leaky bucket, a sliding-log limit
+above `MAX_SLIDING_LOG_LIMIT`) makes its key fail closed. `quota_of(key)`
+reports the quota a key is under. The digest is two independently, randomly seeded
 64-bit hashes — a caller cannot aim a long key at someone else's limit — but it
 is not a cryptographic hash.
 
@@ -442,9 +463,13 @@ it must run inside a Tokio runtime), and only under the `async` feature.
 With the `metrics` feature, `limiter.metrics()` returns cumulative counters —
 `allowed`, `denied`, `keys_inserted`, `keys_evicted`, `keys_expired`,
 `keys_removed`, `keys_remembered` (evicted keys whose debt was recorded),
-`keys_restored`, `records_merged` (the recovery table overflowing — the store
-failing closed), and `keys_rejected` (over-long keys) — kept per shard beside
-the lock word a check already touches. Without the feature the counters do not
+`keys_restored` (new keys charged a recorded debt), `debts_overflowed` (debts
+spilled past the exact recovery table into the shared sketch, which can charge
+keys that never owed anything), `keys_refused` (newcomers refused because a
+full shard held only still-limited keys whose debts could not be kept), and
+`keys_rejected` (over-long keys) — kept per shard beside the lock word a check
+already touches. Any sustained `debts_overflowed` or `keys_refused` means the
+cap is too small for the traffic. Without the feature the counters do not
 exist at all.
 
 <br>
@@ -487,10 +512,15 @@ cargo run --example tower_layer --features tower       # 429s from tower middlew
 cargo test --all-features
 cargo test --no-default-features      # the no_std core
 
-# Concurrency model checking of the production limiter
+# Concurrency model checking of the production limiter (clock-lib 1.1.0 does
+# not build under --cfg loom, so pin 1.0.0 for this run, as CI does)
+cargo update -p clock-lib --precise 1.0.0
 RUSTFLAGS="--cfg loom" cargo test --test loom_check --features algorithms --release
+git checkout Cargo.lock
 
-# Fuzzing (nightly + cargo-fuzz): the limiter against an oracle, and the HTTP surface
+# Fuzzing (nightly + cargo-fuzz): the limiter against an oracle, and the HTTP
+# surface. The corpus directories are not committed; create them first.
+mkdir -p fuzz/corpus/limiter_ops fuzz/corpus/http_keys
 cargo +nightly fuzz run limiter_ops fuzz/corpus/limiter_ops fuzz/seeds/limiter_ops
 cargo +nightly fuzz run http_keys fuzz/corpus/http_keys fuzz/seeds/http_keys
 
@@ -524,8 +554,9 @@ the full table are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 | `DirectLimiter` check / on `CoarseClock` | 38.1 ns / 12.2 ns | 37.2 ns / 11.1 ns |
 | `peek` | 80.4 ns | 54.1 ns |
 
-An insert at the cap costs ~50 ns more than in `1.1.0` by design: the eviction
-now reads each candidate's state so that it never resets a limit.
+An insert at the cap costs ~58 ns more than in `1.1.0` (see
+[Known issues](#known-issues)): the eviction now reads each candidate's state
+so that it never resets a limit.
 
 Under a unique-key flood (three threads inserting new keys as fast as they can,
 the default limiter at its 1,048,576-key cap), a legitimate key's check latency
@@ -551,6 +582,32 @@ default `SystemClock` reads `Instant::now()` (~26 ns on Windows); on
 
 <br>
 
+## Known issues
+
+- **Inserting a new key into a full store is ~58 ns slower than in 1.1.0.**
+  When the key table is at its cap, inserting a never-seen key costs about
+  +58 ns (≈293 → 351 ns at the default 1,048,576-key cap; criterion medians on
+  a loaded Windows host, best of runs, so approximate), because eviction checks
+  that each candidate has fully recovered before evicting it — the price of
+  never resetting a still-limited key. Checks of keys already tracked are
+  unaffected, and below the cap nothing changes. This is planned to be
+  revisited and optimised in a future release.
+- **Past about twice the cap of unrecovered evictions, the store fails closed
+  for some keys.** Debts of evicted, still-limited keys are kept exactly for
+  about twice the cap's worth of such keys at once. Beyond that, debts spill
+  into a shared sketch that can charge a key that never owed anything (it
+  starts partly or wholly drained), and a full shard holding only
+  still-limited keys refuses a newcomer with a retry time. Measured: no false
+  denials for drain floods up to 3x the cap or well-behaved populations of
+  3x the cap; about 3 % of newcomers denied after a 4x drain flood, 39 % after 6x;
+  about 4 % false denials for a well-behaved population of 10x the cap
+  (`docs/BENCHMARKS.md`). `reset` and `remove` cannot clear a sketch charge for
+  one key; it expires within one recovery period. Size the cap above your real
+  key cardinality; `debts_overflowed` and `keys_refused` (feature `metrics`)
+  show when it is too small.
+
+<br>
+
 ## Design
 
 ### Sharded store, bounded memory
@@ -558,8 +615,11 @@ default `SystemClock` reads `Instant::now()` (~26 ns on Windows); on
 Per-key state lives in a sharded store. A `check` is: hash the key once →
 pick the shard from one set of hash bits → find the slot under the shard's read
 lock using another → run the key's algorithm. Shards sit on their own cache
-lines. The steady-state `check` allocates nothing; allocation happens only the
-first time a key is seen.
+lines. Checking an already-tracked key allocates nothing when the key is
+borrowed (`check_bytes`) or at most 22 bytes; otherwise allocation happens only
+the first time a key is seen (a `check` of an owned key longer than 22 bytes
+allocates the `Key` itself on every call — use `check_bytes`). A sliding-log
+key's run-length log grows amortized, so it occasionally allocates as well.
 
 Memory is **bounded by eviction**, which runs only while inserting a new key and
 does a fixed amount of work: a CLOCK hand evicts the first key not checked since
@@ -589,16 +649,27 @@ Evicting a key that is still being limited would hand it a fresh allowance when
 it returns — a way to reset anyone's limit by flooding the store with throwaway
 keys. So the CLOCK hand prefers keys that have fully recovered (forgetting them
 loses nothing), and when it must evict one that has not, its shard records the
-debt — units spent, and when they would all be back — in a small table (16
-bytes a record, half the shard's capacity, allocated on first use). A key that
-returns before its debt is repaid resumes no more permissive than it left:
-exactly, to within one unit, for the buckets; with the spent units charged at
-the return for the window algorithms. If a flood evicts more unrecovered keys
-within one recovery period than the table holds, records merge, and a merged
-record applies to every new key that maps to it until it expires — the store
-fails closed for some newcomers rather than open for evicted keys. An idle TTL
-is raised to the quota's recovery time (`try_build` rejects a shorter one), so
-idle expiry normally removes only recovered keys too.
+debt — units spent, and when they would all be back. A key that returns before
+its debt is repaid resumes no more permissive than it left: exactly where it
+was for the buckets; with the spent units charged at the return for the window
+algorithms (held back up to one window longer).
+
+The debts go into a cuckoo-hashed table of 16-byte records, two per key of
+capacity, allocated on first use. A key reads back only its own record, so
+while a shard's unrecovered evicted keys fit — about twice its share of the
+cap — no other key is ever affected. Past that, debts spill into a shared
+sketch (four 8-byte cells per key of capacity) that charges a key the smaller
+of its two cells: never less than its own spilled debt, but a key that never
+owed anything can be charged as well (fail closed). A key charged from the
+sketch never writes that debt back, so it cannot spread or ratchet; if its debt
+cannot be kept exactly, the key stays, and a full shard with nothing else to
+evict refuses the newcomer with a retry time. Measured at cap 100,000: no
+newcomer is denied after a drain flood of up to 3x the cap (3 % at 4x, 39 %
+at 6x); a well-behaved population of 3x the cap (cap 10,000) sees no false
+denials, 10x the cap 4 %. See [Known issues](#known-issues) and
+`docs/BENCHMARKS.md`. An idle TTL is raised to the quota's recovery time
+(`try_build` rejects a shorter one), so idle expiry normally removes only
+recovered keys too.
 
 ### The no-over-admit invariant
 
@@ -645,7 +716,7 @@ standalone, with no obligation to adopt the rest of the family.
 
 ## Cross-Platform Support
 
-**Tested in CI on every push:**
+**Tested in CI on every pull request and every push to `main` and `dev`:**
 - ✅ Linux x86_64 (stable and the 1.85 MSRV)
 - ✅ macOS Apple Silicon (stable and MSRV)
 - ✅ Windows x86_64 (stable and MSRV)
@@ -656,6 +727,24 @@ Linux aarch64 and macOS x86_64 are expected to work (the code has no
 platform-specific paths) but are not exercised by CI.
 
 <br><br>
+
+## Development
+
+The repository pins its toolchain and its dependency versions so every
+contributor and every CI job builds the same thing:
+
+- `rust-toolchain.toml` selects Rust **1.99.0** with `rustfmt` and `clippy` for
+  local work. It is not packaged, so it never affects users of the crate.
+- `Cargo.lock` is committed. CI builds, tests, audits (`cargo audit`), and
+  checks licenses and advisories (`cargo deny`) against exactly that lock, and
+  it resolves on the 1.85 MSRV.
+- Every CI job that claims a toolchain (MSRV, stable, nightly) selects it
+  explicitly and prints `rustc -V`. A separate *latest dependencies* job runs
+  weekly and on every pull request: it runs `cargo update`, then builds, tests,
+  lints, and audits against the newest compatible versions, so a breaking
+  upstream release shows up before it reaches users.
+- Every non-dev dependency is justified in writing (purpose, in-house
+  alternative, cost, verdict) before it is added.
 
 ## Contributing
 
