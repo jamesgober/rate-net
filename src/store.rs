@@ -53,7 +53,9 @@
 //!   [`EXACT_PER_KEY`] records per key of shard capacity. A key has two
 //!   candidate buckets; when both are full, records are moved to their other
 //!   bucket (at most [`MAX_KICKS`] moves), which fills the table past 90 %
-//!   before anything spills. A key reads back only its own record.
+//!   before anything spills; after a walk fails, the next [`WALK_BACKOFF`]
+//!   debts spill without one, so a sustained flood stays cheap. A key reads
+//!   back only its own record.
 //! - **Overflow sketch.** A debt the table cannot place goes into two cells of
 //!   a shared sketch ([`CELLS_PER_KEY`] cells per key), each keeping the larger
 //!   deadline and spend. A key being stored is charged the *smaller* of its two
@@ -154,6 +156,13 @@ const EXACT_PER_KEY: usize = 2;
 /// four-record buckets per key this fills the table past 90 % before anything
 /// overflows.
 const MAX_KICKS: usize = 16;
+
+/// After a cuckoo walk fails — the table is full of live debts — this many
+/// following debts skip the walk and spill to the overflow sketch at once. A
+/// walk through a full table would almost surely fail again, and costs a cache
+/// miss per move under the shard write lock; backing off keeps a sustained
+/// flood's evictions cheap, while a table with room is walked as usual.
+const WALK_BACKOFF: u8 = 32;
 
 /// The bit of [`Record::until_ms`] that marks a debt charged (in part) from
 /// the shared overflow sketch: see [`Recovery::record`].
@@ -446,6 +455,9 @@ struct Recovery {
     cells: Box<[u64]>,
     /// Rotates which record of a full bucket a cuckoo walk moves first.
     turn: usize,
+    /// Debts still to spill without a walk after the last failed one (see
+    /// [`WALK_BACKOFF`]).
+    backoff: u8,
 }
 
 impl Recovery {
@@ -454,6 +466,7 @@ impl Recovery {
             buckets: Box::new([]),
             cells: Box::new([]),
             turn: 0,
+            backoff: 0,
         }
     }
 
@@ -590,6 +603,18 @@ impl Recovery {
         }
         // Both buckets are full of live debts: walk, starting from a bucket
         // with a record that may move (an inherited debt must displace one).
+        // Right after a failed walk, skip it: a plain debt spills at once, an
+        // inherited one displaces a single record, which spills.
+        let budget = if self.backoff > 0 {
+            self.backoff -= 1;
+            if !inherited {
+                self.overflow(new, probe.buckets[0], now_ms);
+                return Some(Recorded::Overflowed);
+            }
+            1
+        } else {
+            MAX_KICKS
+        };
         let mut start = None;
         for b in probe.buckets {
             if let Some(r) = self.movable_in(b, now_ms) {
@@ -605,20 +630,25 @@ impl Recovery {
             return Some(Recorded::Overflowed);
         };
         let mut homeless = new;
-        for _ in 0..MAX_KICKS {
+        for kick in 1..=budget {
             homeless = self.put(b, r, homeless);
             b = alt_bucket(b, homeless.tag, self.buckets.len());
             if let Some(free) = self.free_in(b, now_ms) {
                 let _empty = self.put(b, free, homeless);
                 return Some(Recorded::Exact);
             }
+            if kick == budget {
+                break;
+            }
             match self.movable_in(b, now_ms) {
                 Some(next) => r = next,
                 None => break,
             }
         }
-        // Only a debt that was moved can be left homeless here, and only a
-        // debt that is not inherited is ever moved.
+        // Only a debt that was moved can be left homeless here (the loop
+        // runs at least once), and only a debt that is not inherited is ever
+        // moved.
+        self.backoff = WALK_BACKOFF;
         self.overflow(homeless, b, now_ms);
         Some(Recorded::Overflowed)
     }
