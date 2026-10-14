@@ -1,0 +1,52 @@
+name: Latest dependencies
+
+# The main CI builds against the committed Cargo.lock. This workflow resolves
+# the newest versions every dependency's requirement allows (still on the
+# 1.85 MSRV, through the MSRV-aware resolver) and builds, tests, lints, and
+# audits against them — weekly, and on every pull request — so an upstream
+# release that breaks rate-net, or a new advisory, shows up before a user hits
+# it. A failure here means: update the lock (or a requirement) in a PR.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  latest:
+    name: Latest compatible dependencies (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.99.0", "1.85"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Toolchain
+        run: rustc -V && cargo -V
+      - name: Update to the latest compatible versions
+        run: cargo update --verbose
+      - name: Build (all features)
+        run: cargo build --all-targets --all-features
+      - name: Test (all features)
+        run: cargo test --all-features
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Audit
+        run: cargo audit

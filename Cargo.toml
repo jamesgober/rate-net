@@ -21,6 +21,23 @@ license = "Apache-2.0 OR MIT"
 # Readme
 readme = "README.md"
 
+# Repository tooling that is not part of the library: the development
+# toolchain pin, CI, editor and lint configuration, fuzzing, proptest seeds,
+# and the engineering standard.
+exclude = [
+    ".editorconfig",
+    ".gitattributes",
+    ".github/",
+    ".gitignore",
+    "clippy.toml",
+    "deny.toml",
+    "fuzz/",
+    "proptest-regressions/",
+    "REPS.md",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+]
+
 # Description
 description = "A rate limiter for Rust: five algorithms behind one trait, sharded per-key state with O(1) bounded-memory eviction, retry-after and RateLimit headers, a no_std single-key core, and a one-line Tier-1 API. Built against hostile traffic."
 
@@ -108,7 +125,7 @@ algorithms = []
 async = ["std", "dep:tokio"]
 
 # Operational counters (allowed, denied, keys inserted / evicted / expired /
-# removed / remembered / restored, merged records, rejected keys) read with
+# removed / remembered / restored, overflowed debts, refused and rejected keys) read with
 # `metrics()`. Off by default: without it the counters do not exist, so they
 # cost nothing.
 metrics = ["std"]
