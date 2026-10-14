@@ -1,44 +1,37 @@
 //! # rate-net
 //!
-//! A powerful, lock-free rate limiter for Rust. It answers one question as fast
-//! as the hardware allows — *"is this key allowed right now?"* — and answers it
-//! with a [`Decision`](#) (allow / deny plus a `retry-after`), across multiple
-//! algorithms, while tracking per-key state under high contention. Per-key
-//! state lives in a sharded concurrent map, so unrelated keys never contend and
-//! throughput scales with core count; each key's bucket is lock-free and memory
-//! is bounded by eviction, so a flood of unique keys hits a cap instead of
-//! growing without limit.
+//! A rate limiter for Rust. It answers one question — *"is this key allowed
+//! right now?"* — with a [`Decision`] (allow, or deny plus a `retry-after`),
+//! across five algorithms, while tracking per-key state under heavy
+//! concurrency. Per-key state lives in a sharded store: an existing-key check
+//! takes one shard read lock plus the algorithm's atomic accounting, so
+//! unrelated keys rarely contend, and memory is bounded by O(1) eviction, so a
+//! flood of unique keys hits a cap instead of growing without limit.
 //!
 //! rate-net does not reimplement token-bucket accounting. It consumes
-//! [`better-bucket`](https://crates.io/crates/better-bucket) for that and reads
-//! time from [`clock-lib`](https://crates.io/crates/clock-lib), then adds the
-//! per-key, multi-algorithm, retry-after machinery around them. It is the
-//! anchor crate of the `-net` domain group and is consumed by gatekeepers (such
-//! as `bouncer-io`) through the clean decision API — they call `check` and never
-//! reach into its internal state.
+//! [`better-bucket`](https://crates.io/crates/better-bucket) (1.1 or newer) for
+//! that and reads time from [`clock-lib`](https://crates.io/crates/clock-lib),
+//! then adds the per-key, multi-algorithm, retry-after machinery around them.
+//! It is the anchor crate of the `-net` domain group and is consumed by
+//! gatekeepers (such as `bouncer-io`) through the clean decision API — they
+//! call `check` and never reach into its internal state.
 //!
 //! ## Status
 //!
-//! **Stable (`1.0.0`).** The public API is frozen until `2.0`. The five
-//! algorithms sit behind the one [`Limiter`] trait (token bucket by default; the
-//! leaky bucket and window algorithms under the `algorithms` feature), with the
-//! Tier-2 [`Builder`], an optional `AsyncLimiter` await-until-ready layer
-//! (`async` feature), runnable
-//! [examples](https://github.com/jamesgober/rate-net/tree/main/examples), and a
-//! `criterion` suite. Per-key state lives in a purpose-built **sharded store**
-//! (an existing-key [`check`](RateLimiter::check) takes only a shard read lock
-//! plus the algorithm's atomic accounting, so unrelated keys never contend),
-//! memory is **bounded by eviction**, and the steady-state check is
-//! **allocation-free**. Every public type is `Send + Sync + 'static`, asserted
-//! at compile time. The safety invariants — never over-admit, bounded memory —
-//! are proved by `proptest` (per algorithm), `loom`, a multi-threaded stress
-//! suite across every algorithm, an allocation audit, and an adversarial-traffic
-//! suite, and the surface is validated through a representative gatekeeper
-//! consumer.
+//! **Stable (`1.1.0`).** The public API is frozen until `2.0`; `1.1` only adds
+//! to it. The five algorithms sit behind the one [`Limiter`] trait (and the
+//! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
+//! window algorithms under the `algorithms` feature — with the validating
+//! [`Builder`], [`peek`](RateLimiter::peek) snapshots and HTTP
+//! [`headers`](mod@headers) helpers, key management, the un-keyed
+//! [`DirectLimiter`], the `no_std` [`Gcra`] core, the fast [`CoarseClock`], and
+//! optional `AsyncLimiter` (`async`) and `Metrics` (`metrics`) layers. The
+//! steady-state check is allocation-free, and every public type is
+//! `Send + Sync + 'static`, asserted at compile time.
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
-//! use rate_net::{RateLimiter, Decision};
+//! use rate_net::{Decision, RateLimiter};
 //!
 //! // 100 requests per second, per key.
 //! let limiter = RateLimiter::per_second(100);
@@ -48,8 +41,8 @@
 //!         // allowed — serve the request
 //!     }
 //!     Decision::Deny { retry_after } => {
-//!         // denied — return 429 with `Retry-After: retry_after`
-//!         let _ = retry_after;
+//!         // denied — return 429 with `Retry-After`, rounded up:
+//!         let _secs = Decision::Deny { retry_after }.retry_after_secs();
 //!     }
 //!     _ => {}
 //! }
@@ -58,30 +51,38 @@
 //!
 //! ## Design goals
 //!
-//! - **Lock-free per key.** Each key's bucket delegates to `better-bucket`'s
-//!   atomic compare-and-swap core; no lock sits on the check path.
-//! - **Sharded state.** Per-key state lives in a sharded concurrent map, so
-//!   unrelated keys land in different shards and never serialize on each other.
-//!   Throughput scales with cores; shard count is tunable.
+//! - **Never over-admits.** For any key, admitted requests never exceed the
+//!   algorithm's documented bound, under any interleaving of threads and on a
+//!   real clock where threads carry stale timestamps. Checked with `loom`
+//!   against the production code, with `proptest` per algorithm, and with
+//!   real-clock multi-thread contention tests.
+//! - **Atomic accounting, sharded locking.** The token bucket, leaky bucket, and
+//!   fixed window account each key with one compare-and-swap; the sliding-window
+//!   algorithms take a short per-key mutex. Keys are found under a per-shard
+//!   read lock, each shard on its own cache lines.
+//! - **Bounded memory, bounded work.** Eviction runs only when a new key is
+//!   inserted and does a fixed amount of work: a CLOCK sweep of at most 32
+//!   slots for the capacity cap, and 8 slots of incremental idle sweep. The
+//!   only shard-wide pass left is the amortized growth or rehash of a shard's
+//!   index, and capped shards are kept at 16,384 keys or fewer so it stays
+//!   short.
 //! - **Zero-allocation steady state.** A `check` on an existing key allocates
 //!   nothing; allocation happens only the first time a key is seen.
-//! - **Bounded memory.** Idle keys are evicted (LRU/TTL) on an amortized,
-//!   incremental schedule that never stops the world on the hot path. A hostile
-//!   unique-key flood reaches the eviction cap and stays there.
-//! - **Never over-admits.** For any key and window, admitted requests never
-//!   exceed the configured quota under any concurrent interleaving — proven per
-//!   algorithm with `loom` and `proptest`.
+//! - **Fail closed.** The infallible constructors turn a degenerate
+//!   configuration into a limiter that denies everything; the validating
+//!   [`Builder::try_build`] reports it instead.
 //! - **Lazy, runtime-free.** Refill and expiry are computed from a monotonic
-//!   clock on access; there is no background timer thread and the core has no
-//!   async-runtime dependency.
+//!   clock on access; there is no background thread (unless you start a
+//!   [`CoarseClock`] ticker) and the core has no async-runtime dependency.
 //!
 //! ## Feature flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`        | yes | Standard library. Required for the sharded per-key store and eviction. With it off the crate is `no_std`; the scaffold then exposes only [`VERSION`], and the pared-down single-key mode follows in a later release. |
-//! | `algorithms` | no  | The full algorithm suite beyond the default token bucket: leaky bucket, fixed window, sliding-window log, sliding-window counter. |
-//! | `async`      | no  | Optional async-friendly wrapper layer. Additive only — the core has no runtime dependency. |
+//! | `std`        | yes | The keyed limiter, [`DirectLimiter`], [`CoarseClock`], and the `error-forge` integration. With it off the crate is `no_std` and offers [`Gcra`] (on targets with 64-bit atomics), [`Quota`], [`Decision`], [`Snapshot`], the error types, and the [`headers`](mod@headers) names. |
+//! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
+//! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
+//! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`]; compiled out when off. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.
@@ -100,10 +101,15 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+// The crate docs above describe the full `std` surface. Without `std` those
+// items do not exist, so their links cannot resolve in a `no_std` doc build.
+#![cfg_attr(not(feature = "std"), allow(rustdoc::broken_intra_doc_links))]
 
-// The limiter surface requires the standard library (the concurrent per-key
-// store, the clock-driven token bucket, and the domain error type). With `std`
-// off the crate is no_std and exposes only `VERSION`.
+// The keyed limiter and everything clock-driven require the standard library
+// (the concurrent per-key store, the clock-driven token bucket, the domain
+// error integration). With `std` off the crate is no_std and exposes the
+// clock-free core: `Gcra`, `Quota`, `Decision`, `Snapshot`, the error types,
+// and the header names.
 #[cfg(feature = "std")]
 mod algo;
 #[cfg(feature = "std")]
@@ -113,38 +119,54 @@ mod async_limiter;
 #[cfg(feature = "std")]
 mod builder;
 #[cfg(feature = "std")]
+mod coarse_clock;
 mod decision;
 #[cfg(feature = "std")]
+mod direct;
 mod error;
 #[cfg(feature = "std")]
 mod eviction;
+#[cfg(target_has_atomic = "64")]
+mod gcra;
+pub mod headers;
 #[cfg(feature = "std")]
 mod key;
 #[cfg(feature = "std")]
 mod limiter;
-#[cfg(feature = "std")]
+#[cfg(feature = "metrics")]
+mod metrics;
 mod quota;
+mod snapshot;
 #[cfg(feature = "std")]
 mod store;
+mod sync;
 
 #[cfg(feature = "std")]
-pub use crate::algorithm::Algorithm;
+pub use crate::algorithm::{Algorithm, MAX_SLIDING_LOG_LIMIT};
 #[cfg(feature = "async")]
 pub use crate::async_limiter::AsyncLimiter;
 #[cfg(feature = "std")]
 pub use crate::builder::Builder;
 #[cfg(feature = "std")]
+pub use crate::coarse_clock::{CoarseClock, MIN_COARSE_RESOLUTION};
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
-pub use crate::error::RateLimiterError;
+pub use crate::direct::DirectLimiter;
+pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
 pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+#[cfg(target_has_atomic = "64")]
+pub use crate::gcra::Gcra;
 #[cfg(feature = "std")]
 pub use crate::key::Key;
 #[cfg(feature = "std")]
-pub use crate::limiter::{Limiter, RateLimiter};
-#[cfg(feature = "std")]
+pub use crate::limiter::{DynLimiter, Limiter, RateLimiter};
+#[cfg(feature = "metrics")]
+pub use crate::metrics::Metrics;
 pub use crate::quota::Quota;
+pub use crate::snapshot::Snapshot;
+#[cfg(feature = "std")]
+pub use crate::store::MAX_SHARDS;
 
 /// The version of this crate, taken from `Cargo.toml` at compile time.
 ///
@@ -161,6 +183,27 @@ pub use crate::quota::Quota;
 /// assert!(version.split('.').all(|part| !part.is_empty()));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// The README's and the API reference's examples, compiled and run as doctests
+// so they cannot drift from the code. They use every optional feature, so they
+// run in the all-features test pass.
+#[cfg(all(
+    doctest,
+    feature = "algorithms",
+    feature = "async",
+    feature = "metrics"
+))]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
+
+#[cfg(all(
+    doctest,
+    feature = "algorithms",
+    feature = "async",
+    feature = "metrics"
+))]
+#[doc = include_str!("../docs/API.md")]
+mod api_doctests {}
 
 #[cfg(test)]
 mod tests {

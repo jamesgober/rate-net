@@ -133,7 +133,16 @@ fn public_types_are_send_sync_and_static() {
     assert_send_sync_static::<rate_net::Algorithm>();
     assert_send_sync_static::<rate_net::RateLimiterError>();
     assert_send_sync_static::<rate_net::Key>();
+    assert_send_sync_static::<rate_net::DirectLimiter>();
+    assert_send_sync_static::<rate_net::Gcra>();
+    assert_send_sync_static::<rate_net::Snapshot>();
+    assert_send_sync_static::<rate_net::CoarseClock>();
+    assert_send_sync_static::<rate_net::InsufficientCapacity>();
+    assert_send_sync_static::<rate_net::Builder>();
+    assert_send_sync_static::<rate_net::RateLimiter<rate_net::CoarseClock>>();
 
     #[cfg(feature = "async")]
     assert_send_sync_static::<rate_net::AsyncLimiter>();
+    #[cfg(feature = "metrics")]
+    assert_send_sync_static::<rate_net::Metrics>();
 }

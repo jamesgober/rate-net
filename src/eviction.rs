@@ -17,15 +17,27 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// compose:
 ///
 /// - **Capacity** — a hard ceiling on the number of live keys. When inserting a
-///   new key would exceed it, the least-recently-seen key is evicted. This is
-///   what caps a unique-key flood.
-/// - **Idle TTL** — keys not seen for longer than the TTL become evictable, so
-///   long-idle state is reclaimed rather than held forever.
+///   new key would exceed it, one key is evicted by CLOCK (second chance): the
+///   first key not checked since the sweeping hand last passed it, so a key
+///   seen once goes before a key in active use. This is what caps a unique-key
+///   flood.
+/// - **Idle TTL** — keys not seen for longer than the TTL are reclaimed, so
+///   long-idle state is not held forever. The effective TTL is never shorter
+///   than the quota's *recovery time* (the time an idle key needs to regain its
+///   full allowance): reclaiming a key sooner would hand it a fresh quota early.
+///   `Builder::try_build` rejects a shorter TTL; the other constructors raise
+///   it.
 ///
-/// Eviction is **lazy and incremental**: it happens while inserting a new key,
-/// touches only the one shard being written, and never sweeps the whole store or
-/// blocks the steady-state check path. The capacity is enforced approximately
-/// per shard, so the live-key count stays within a small factor of the cap.
+/// Eviction is **lazy and bounded**: it happens only while inserting a new key,
+/// touches only the one shard being written, and does a fixed amount of work —
+/// a CLOCK step of at most 32 slots and an idle sweep of 8 — however large the
+/// shard. It never sweeps the whole store. The capacity is divided evenly over
+/// the shards (rounded up, at least one key per shard), so the live-key count
+/// stays at or below the cap plus one key per shard.
+///
+/// An evicted key that returns starts with a fresh allowance. Size the cap
+/// above your real key cardinality so only flood keys are ever evicted; each
+/// tracked key costs roughly 200–300 bytes of heap.
 ///
 /// The [`Default`] is safe: a [`DEFAULT_MAX_KEYS`] capacity cap and no TTL —
 /// memory is bounded out of the box. Opt into unbounded growth explicitly with
@@ -190,12 +202,32 @@ impl Eviction {
     }
 
     /// The configured capacity cap, if any.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Eviction;
+    ///
+    /// assert_eq!(Eviction::capacity(10).max_keys(), Some(10));
+    /// assert_eq!(Eviction::unbounded().max_keys(), None);
+    /// ```
     #[must_use]
     pub const fn max_keys(&self) -> Option<usize> {
         self.max_keys
     }
 
-    /// The configured idle TTL, if any.
+    /// The configured idle TTL, if any — as given, before it is raised to the
+    /// quota's recovery time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::Eviction;
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(Eviction::idle(Duration::from_secs(9)).idle_ttl(), Some(Duration::from_secs(9)));
+    /// assert_eq!(Eviction::capacity(10).idle_ttl(), None);
+    /// ```
     #[must_use]
     pub const fn idle_ttl(&self) -> Option<Duration> {
         self.idle_ttl

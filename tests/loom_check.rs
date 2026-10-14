@@ -1,115 +1,249 @@
-//! Loom concurrency model checks for `rate-net`.
+//! Loom model checks of the production limiter.
 //!
-//! Compiled and run only under `RUSTFLAGS="--cfg loom" cargo test --test
-//! loom_check`; under a normal build the `#![cfg(loom)]` gate makes this file
-//! empty.
+//! Compiled and run only under
+//! `RUSTFLAGS="--cfg loom" cargo test --test loom_check --features algorithms --release`;
+//! under a normal build the `#![cfg(loom)]` gate makes this file empty.
 //!
-//! These models exhaustively explore the thread interleavings of the two
-//! concurrency mechanics the limiter relies on, asserting the safety invariant —
-//! **a key is never over-admitted** — holds under all of them. They model the
-//! protocols `src/store.rs` and `better-bucket` implement (loom cannot see
-//! through a dependency's `std` locks, so the model mirrors the production
-//! logic rather than driving it):
+//! Under `cfg(loom)` every atomic and lock in rate-net's own state (`src/sync.rs`)
+//! and in `better-bucket`'s token bucket is a loom primitive, so these models
+//! drive the real `RateLimiter` — the real sharded store, the real algorithm
+//! state — and loom explores every interleaving of their atomic operations.
+//! Each model asserts the safety invariant: **a key is never over-admitted**.
 //!
-//! 1. the per-key acquire kernel — a `compare_exchange` loop draining a shared
-//!    budget; and
-//! 2. the store's check protocol — a shard read-lock fast path, with a
-//!    write-lock insert-on-miss that uses get-or-insert so two racing
-//!    first-touches of the same key share one budget rather than creating two.
+//! The clock is a `ManualClock` shared with the model. A thread reads the time
+//! before its first loom operation; with a schedule point placed before the
+//! main thread advances the clock, loom explores the spawned thread reading the
+//! old time, stalling, and landing after the main thread has committed a later
+//! timestamp: exactly the stale-timestamp interleaving behind RN-COR-01 (token
+//! bucket) and RN-COR-03 (fixed window), which frozen-clock tests can never
+//! reach.
 
 #![cfg(loom)]
 
-use std::collections::HashMap;
+use std::sync::Arc as StdArc;
+use std::time::Duration;
 
+use clock_lib::{Clock, ManualClock, Monotonic, Wall};
+use loom::sync::Arc;
 use loom::sync::atomic::{AtomicU64, Ordering};
-use loom::sync::{Arc, RwLock};
 use loom::thread;
+use rate_net::{Eviction, RateLimiter};
 
-/// Admit one request against a shared budget via CAS, reporting whether it was
-/// admitted. The bare contention kernel of the per-key check.
-fn try_admit_one(budget: &AtomicU64) -> bool {
-    let mut current = budget.load(Ordering::Acquire);
-    loop {
-        if current == 0 {
-            return false;
+/// A manual clock whose reads and advances are loom operations.
+///
+/// `ManualClock` keeps its offset in a `std` atomic, which loom cannot see:
+/// a thread's clock read is then never a schedule point, and loom cannot
+/// interleave "read the time" and "act on it" the way a preempted thread does.
+/// Wrapping every read and advance in a loom atomic access makes each one a
+/// schedule point, so a model can reach a thread that reads the time, stalls,
+/// and acts after another thread has advanced the clock and committed — the
+/// RN-COR-01 race inside the token bucket's own `acquire`.
+#[derive(Clone)]
+struct LoomClock {
+    inner: StdArc<ManualClock>,
+    /// Advances published so far; read on every `now` to create a schedule
+    /// point in the reading thread.
+    advances: Arc<AtomicU64>,
+}
+
+impl LoomClock {
+    fn new() -> Self {
+        Self {
+            inner: StdArc::new(ManualClock::new()),
+            advances: Arc::new(AtomicU64::new(0)),
         }
-        match budget.compare_exchange_weak(
-            current,
-            current - 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
+    }
+
+    /// The schedule point comes first, so loom may let other threads read
+    /// the old time before it moves.
+    fn advance(&self, by: Duration) {
+        let _published = self.advances.fetch_add(1, Ordering::SeqCst);
+        self.inner.advance(by);
     }
 }
 
+impl Clock for LoomClock {
+    fn now(&self) -> Monotonic {
+        let reading = self.inner.now();
+        // The schedule point sits after the read: loom may run other threads
+        // here, before this thread acts on its (now possibly stale) reading.
+        let _seen = self.advances.load(Ordering::SeqCst);
+        reading
+    }
+
+    fn wall(&self) -> Wall {
+        self.inner.wall()
+    }
+}
+
+/// A token-bucket limiter on a shared manual clock, one shard, no eviction.
+fn limiter(
+    limit: u32,
+    period: Duration,
+    burst: u32,
+) -> (StdArc<ManualClock>, RateLimiter<StdArc<ManualClock>>) {
+    let clock = StdArc::new(ManualClock::new());
+    let limiter = RateLimiter::builder()
+        .quota(limit, period)
+        .burst(burst)
+        .shards(1)
+        .eviction(Eviction::unbounded())
+        .clock(StdArc::clone(&clock))
+        .build();
+    (clock, limiter)
+}
+
+/// Two threads first-touch the same key at once, racing through the read miss
+/// into the insert path: exactly one entry is created and the single unit is
+/// admitted at most once.
 #[test]
-fn loom_concurrent_admit_never_over_admits() {
+fn loom_concurrent_first_touch_shares_one_allowance() {
     loom::model(|| {
-        let budget = Arc::new(AtomicU64::new(1));
-        let racer = Arc::clone(&budget);
+        let (_clock, limiter) = limiter(1, Duration::from_secs(1), 1);
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
 
-        // Two threads race for a single available unit.
-        let handle = thread::spawn(move || try_admit_one(&racer));
-        let admitted_here = try_admit_one(&budget);
-        let admitted_there = handle.join().unwrap();
+        let handle = thread::spawn(move || u32::from(other.check("k").is_allow()));
+        let here = u32::from(limiter.check("k").is_allow());
+        let there = handle.join().expect("model thread panicked");
 
-        // Budget was 1: at most one side may be admitted — never both, and the
-        // remaining budget reflects exactly what was handed out.
-        let admitted = u64::from(admitted_here) + u64::from(admitted_there);
-        assert!(admitted <= 1, "over-admit: budget of 1 admitted {admitted}");
-        assert_eq!(budget.load(Ordering::Acquire), 1 - admitted);
+        assert!(
+            here + there <= 1,
+            "over-admit: a quota of 1 admitted {}",
+            here + there
+        );
+        assert_eq!(limiter.tracked_keys(), 1, "duplicate state for one key");
     });
 }
 
-/// A shard's key space: a budget per key behind a single `RwLock`, mirroring
-/// `Store`'s per-shard `RwLock<HashMap<Key, Entry>>`.
-type Shard = RwLock<HashMap<u64, Arc<AtomicU64>>>;
+/// RN-COR-01: a thread that read the clock *before* another thread committed a
+/// later grant must not see a negative gap as a huge refill. One token per
+/// millisecond, burst 1: once the burst is spent, at most one more unit fits in
+/// the first millisecond. With `better-bucket` 1.0's logic this model fails.
+#[test]
+fn loom_token_bucket_stale_timestamp_never_over_grants() {
+    loom::model(|| {
+        let clock = LoomClock::new();
+        let limiter = RateLimiter::builder()
+            .quota(1_000, Duration::from_secs(1))
+            .burst(1)
+            .shards(1)
+            .eviction(Eviction::unbounded())
+            .clock(clock.clone())
+            .build();
+        assert!(limiter.check("k").is_allow()); // spend the burst at t = 0
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
 
-/// The store's check protocol for one key: a shared read-lock fast path for an
-/// existing key, then an exclusive write-lock slow path that inserts on miss via
-/// get-or-insert (so a concurrent first-touch never creates a second budget).
-/// Returns whether the request was admitted.
-fn check(shard: &Shard, key: u64, initial_budget: u64) -> bool {
-    {
-        let map = shard.read().unwrap();
-        if let Some(budget) = map.get(&key) {
-            return try_admit_one(budget);
-        }
-    }
-    let budget = {
-        let mut map = shard.write().unwrap();
-        Arc::clone(
-            map.entry(key)
-                .or_insert_with(|| Arc::new(AtomicU64::new(initial_budget))),
-        )
-    };
-    try_admit_one(&budget)
+        // Reads the clock at t = 0 or t = 1ms, depending on the schedule.
+        let handle = thread::spawn(move || u32::from(other.check("k").is_allow()));
+        clock.advance(Duration::from_millis(1));
+        let here = u32::from(limiter.check("k").is_allow());
+        let there = handle.join().expect("model thread panicked");
+
+        assert!(
+            here + there <= 1,
+            "over-grant: {} admitted after the burst within one refill",
+            here + there
+        );
+    });
 }
 
+/// Capacity eviction racing a check of another key in the same full shard:
+/// the store stays bounded and no check panics or loses its decision.
 #[test]
-fn loom_concurrent_first_touch_shares_one_budget() {
+fn loom_eviction_races_a_concurrent_insert() {
     loom::model(|| {
-        let shard: Arc<Shard> = Arc::new(RwLock::new(HashMap::new()));
-        let other = Arc::clone(&shard);
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .per_second(1)
+            .shards(1)
+            .eviction(Eviction::capacity(1))
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("a").is_allow());
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
 
-        // Two threads check the same brand-new key at the same instant, racing
-        // through the read miss into the write path.
-        let handle = thread::spawn(move || u64::from(check(&other, 7, 1)));
-        let admitted_here = u64::from(check(&shard, 7, 1));
-        let admitted_there = handle.join().unwrap();
+        let handle = thread::spawn(move || other.check("b").is_allow());
+        let here = limiter.check("c").is_allow();
+        let there = handle.join().expect("model thread panicked");
 
-        // The single available unit goes to exactly one of them...
-        let admitted = admitted_here + admitted_there;
+        // Fresh keys always have their first unit.
+        assert!(here && there);
+        assert_eq!(limiter.tracked_keys(), 1, "capacity cap exceeded");
+    });
+}
+
+/// RN-COR-03: a thread whose timestamp falls in a window another thread has
+/// already closed must count against the newer window, never write its older
+/// window back and wipe the newer window's count.
+#[cfg(feature = "algorithms")]
+#[test]
+fn loom_fixed_window_late_thread_cannot_roll_back() {
+    use rate_net::Algorithm;
+
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .algorithm(Algorithm::FixedWindow)
+            .per_second(1)
+            .shards(1)
+            .eviction(Eviction::unbounded())
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("k").is_allow()); // window 0 is full
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        // Reads the clock in window 0 or window 1, depending on the schedule.
+        let handle = thread::spawn(move || u32::from(other.check("k").is_allow()));
+        // A schedule point: the other thread may read the clock (and stall)
+        // before time moves on.
+        thread::yield_now();
+        clock.advance(Duration::from_secs(1));
+        let first = u32::from(limiter.check("k").is_allow());
+        let second = u32::from(limiter.check("k").is_allow());
+        let there = handle.join().expect("model thread panicked");
+
+        // Window 0 had no room left and window 1 holds exactly one unit.
         assert!(
-            admitted <= 1,
-            "over-admit: shared budget of 1 admitted {admitted}"
+            first + second + there <= 1,
+            "over-admit: {} admitted across a full window and a 1-unit window",
+            first + second + there
         );
+    });
+}
 
-        // ...and exactly one budget was created for the key (no duplicate).
-        let map = shard.read().unwrap();
-        assert_eq!(map.len(), 1, "first-touch race created duplicate buckets");
+/// The leaky bucket's single compare-and-swap under the same stale-timestamp
+/// schedule: never more than the burst plus the intervals that elapsed.
+#[cfg(feature = "algorithms")]
+#[test]
+fn loom_leaky_bucket_stale_timestamp_never_over_admits() {
+    use rate_net::Algorithm;
+
+    loom::model(|| {
+        let clock = StdArc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .algorithm(Algorithm::LeakyBucket)
+            .quota(1_000, Duration::from_secs(1))
+            .burst(1)
+            .shards(1)
+            .eviction(Eviction::unbounded())
+            .clock(StdArc::clone(&clock))
+            .build();
+        assert!(limiter.check("k").is_allow());
+        let limiter = Arc::new(limiter);
+        let other = Arc::clone(&limiter);
+
+        let handle = thread::spawn(move || u32::from(other.check("k").is_allow()));
+        // A schedule point: the other thread may read the clock (and stall)
+        // before time moves on.
+        thread::yield_now();
+        clock.advance(Duration::from_millis(1));
+        let here = u32::from(limiter.check("k").is_allow());
+        let there = handle.join().expect("model thread panicked");
+
+        assert!(here + there <= 1, "over-admit: {}", here + there);
     });
 }

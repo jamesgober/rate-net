@@ -14,9 +14,10 @@
 </div>
 <br>
 
-> Numbers tracked at the `v1.0.0` tag. Treat absolute numbers as
-> machine-specific; the relative shape between paths and the head-to-head are
-> the signal.
+> Numbers recorded for `v1.1.0`. Treat absolute numbers as machine-specific;
+> the relative shape between paths, the before/after, and the head-to-head are
+> the signal. Single runs on a developer workstation: expect a few nanoseconds
+> of run-to-run noise.
 
 ## Method
 
@@ -24,47 +25,76 @@
 cargo bench --bench rate_bench
 ```
 
-The suite ([`benches/rate_bench.rs`](../benches/rate_bench.rs)) uses a limiter
+The suite ([`benches/rate_bench.rs`](../benches/rate_bench.rs)) uses limiters
 with no effective rate ceiling (default token bucket), so it measures the check
-machinery — key hash, shard read lock, map lookup, the per-key accounting — not
-the denial branch.
+machinery — key construction and hash, shard read lock, index probe, the
+per-key accounting, and the clock read — not the denial branch.
 
-- **`check/single_key`** — the steady-state hot path: one existing key.
-- **`check/many_keys`** — 10 000 distinct keys across 64 shards, cycled.
-- **`check/contended_single_key_4t`** — four threads hammering one key.
-- **`check/eviction_sweep`** — a single shard capped at 64 keys, a new key every
+- **`check/single_key`** — the steady-state hot path: one existing `&str` key.
+- **`check/single_key_coarse_clock`** — the same on a 1 ms
+  [`CoarseClock`](./API.md#coarseclock).
+- **`check/many_keys`** — 10,000 distinct `u64` keys across 64 shards, cycled.
+- **`check/contended_single_key_4t`** — four threads hammering one key; wall
+  time divided by the total number of checks (an aggregate throughput figure).
+- **`check/eviction_sweep`** — one shard capped at 64 keys, a new key every
   call, so each measurement inserts and evicts.
+- **`check/insert_at_default_cap`** — the default limiter (default shard count,
+  1,048,576-key cap) filled to its cap, a new key every call: the unique-key
+  flood steady state at realistic scale.
+- **`check/direct`**, **`check/direct_coarse_clock`** — a
+  [`DirectLimiter`](./API.md#directlimiter): no key, no map, no shard lock.
+- **`peek/existing_key`** — reading a snapshot for `RateLimit-*` headers.
 
-Recorded on Windows x86_64, Rust stable 1.95.x, Criterion `bench` profile
-(`opt-level = 3`).
+Recorded on Windows 11 x86_64 (32 logical CPUs), Rust 1.95.0, Criterion `bench`
+profile (`opt-level = 3`), against `better-bucket` 1.1.0.
 
 ## Results
 
-| Benchmark | Median |
-|-----------|-------:|
-| `check/single_key` | ~54 ns |
-| `check/many_keys` | ~54 ns |
-| `check/contended_single_key_4t` | ~54 ns/op |
-| `check/eviction_sweep` | ~217 ns |
+| Benchmark | v1.0.0 | v1.1.0 |
+|-----------|-------:|-------:|
+| `check/single_key` | 66.3 ns | 66.2 ns |
+| `check/single_key_coarse_clock` | — | **35.0 ns** |
+| `check/many_keys` | 86.6 ns | 54.9 ns |
+| `check/contended_single_key_4t` | 151.9 ns/op | 49.5 ns/op |
+| `check/eviction_sweep` (64-key shard) | 398 ns | 100.7 ns |
+| `check/insert_at_default_cap` | ~329 µs | **0.36 µs** |
+| `check/direct` | — | 33.4 ns |
+| `check/direct_coarse_clock` | — | **8.2 ns** |
+| `peek/existing_key` | — | 74.3 ns |
 
-Held within ~±2 ns across the beta soak — the numbers are stable, not a moving
-target.
+The `v1.0.0` column is the audit's quick-mode measurement of the `1.0.0` code
+on the same machine (the insert-at-cap figure is from its probe at the default
+cap); the numbers `1.0.0` itself published (~54 ns everywhere, ~217 ns for the
+sweep) could not be reproduced and are withdrawn.
 
-The optimization choices behind them:
+What changed:
 
-- **`ahash` instead of SipHash** for shard selection and the shard map — fast,
-  and still collision-attack resistant thanks to a random per-store seed.
-- **No redundant clock read.** For the default path (token bucket, capacity-only
-  eviction) the limiter no longer reads the clock at all: `better-bucket` already
-  reads it for refill, and least-recently-seen eviction orders by a cheap
-  per-shard logical counter instead of wall time. The clock is only read when a
-  window algorithm or an idle TTL actually needs real time.
-- **`#[inline]`** on the check path so it inlines across the crate boundary.
+- **Eviction is O(1).** At capacity, `1.0.0` scanned the whole shard for the
+  least-recently-seen key on every insert — ~329 µs at the default cap, roughly
+  a thousand times the cost of the insert itself, under the shard write lock.
+  CLOCK eviction examines at most 32 slots, so an insert at the default cap
+  costs ~0.36 µs, and a small capped shard ~0.1 µs.
+- **No shared counter on the check path.** `1.0.0` stamped every check with a
+  `fetch_add` on a per-shard sequence counter — a contended read-modify-write
+  that every thread touching the shard bounced. The CLOCK reference bit is
+  written only when it was clear, so a hot key's check writes nothing beyond the
+  bucket's own CAS. Four threads on one key went from 151.9 to 49.5 ns per check.
+- **One hash per check, padded shards.** The shard and the slot are found from
+  one hash (`1.0.0` hashed twice), and each shard sits on its own cache lines.
+  Many-key checks went from 86.6 to 54.9 ns.
+- **`CoarseClock`** replaces the ~26 ns OS clock read with one atomic load,
+  roughly halving the single-key check and taking the direct check to ~8 ns.
+- **`peek`** reads the clock once for both the remaining count and the reset
+  time.
+
+`check/single_key` is unchanged: its cost is the `&str` key, the shard read
+lock, `better-bucket`'s accounting, and above all the OS clock read (~26 ns on
+this machine), none of which this release changes on the default clock.
 
 ## Head-to-head vs `governor`
 
-`governor` is a benchmark-only dependency gated behind `cfg(comparison)` so it
-never enters the default tree or CI. Run:
+`governor` (0.10.4) is a benchmark-only dependency gated behind
+`cfg(comparison)` so it never enters the default tree or CI. Run:
 
 ```bash
 RUSTFLAGS="--cfg comparison" cargo bench --bench comparison
@@ -72,45 +102,44 @@ RUSTFLAGS="--cfg comparison" cargo bench --bench comparison
 
 | Path | rate-net | governor |
 |------|---------:|---------:|
-| single key | ~44 ns | **~17 ns** |
-| many keys | ~54 ns | **~18 ns** |
+| keyed, single `u64` key | 51.7 ns | **20.0 ns** |
+| keyed, single key, rate-net on `CoarseClock` | 22.6 ns | **19.2 ns** |
+| keyed, 10,000 keys | 56.4 ns | **21.2 ns** |
+| direct | 32.4 ns | **7.8 ns** |
+| direct, rate-net on `CoarseClock` | 8.6 ns | **8.3 ns** |
 
-**`governor` is currently faster, and the gap is almost entirely the clock.** By
-default `governor` reads time through [`quanta`](https://crates.io/crates/quanta),
-a TSC-based clock that costs ~5 ns. rate-net reads time through `better-bucket` →
-[`clock-lib`](https://crates.io/crates/clock-lib) → `std::time::Instant::now()`,
-which on Windows is `QueryPerformanceCounter` at ~20 ns. That ~15 ns difference,
-read on every check, accounts for the bulk of the gap; the rest is rate-net's
-extra layering (the sharded read-lock store over `better-bucket`) versus
-`governor`'s tightly-integrated GCRA-on-`quanta`.
+**On the default clock `governor` is faster, and most of the gap is the
+clock.** `governor` reads time through [`quanta`](https://crates.io/crates/quanta),
+a TSC-based clock costing a few nanoseconds; rate-net's default `SystemClock`
+reads `std::time::Instant::now()` (`QueryPerformanceCounter`, ~26 ns here). On
+`CoarseClock` the direct paths are at parity (8.6 vs 8.3 ns) and a keyed single
+key is within ~3.5 ns.
 
-rate-net's *own* per-key overhead — hash, shard read lock, dispatch — is
-competitive once the clock is held equal. It cannot beat `governor` end-to-end
-while its clock is ~4× slower, and that clock lives in `clock-lib` /
-`better-bucket` (sibling crates), not here. Closing the gap needs a fast
-TSC/`quanta`-style monotonic source in `clock-lib`; that is tracked as a separate
-sibling enhancement. This is recorded honestly rather than papered over.
+The remaining keyed gap is architecture: rate-net finds a key under a per-shard
+`RwLock` (a read-lock acquire and release per check) in a store that also
+supports bounded memory, CLOCK eviction, idle expiry, five algorithms, `peek`,
+and key management; `governor`'s keyed store is a `DashMap` over a GCRA cell
+with no automatic eviction. The many-key gap is the same cost.
 
 ## Reading the numbers
 
-- **Single-key** is now dominated by the one unavoidable clock read (in
-  `better-bucket`) plus the shard read lock; the hash and dispatch are a small
-  fraction.
-- **Many-key** matches single-key: unrelated keys land in different shards and
-  take only a read lock, so they do not serialise.
-- **Contended single-key** stays close to the uncontended cost — concurrent
-  checks of one key share a read lock and settle on the per-key atomic.
-- **Eviction sweep** is the cold path (write lock + scan of the small capped
-  shard), an order of magnitude more than a steady check, and paid only when a
-  new key displaces an old one.
+- **Single-key** on the default clock is dominated by the clock read; on
+  `CoarseClock`, by the shard read lock and the bucket's CAS.
+- **Many-key** costs about what a single key does: unrelated keys land in
+  different shards and take only a read lock.
+- **Contended single-key** scales: four threads on one key share the read lock
+  and settle on the bucket's atomic. The remaining shared writes are the read
+  lock's own reader count (an atomic increment and decrement per check) and the
+  bucket's compare-and-swap; the eviction marks are not rewritten.
+- **Eviction** is the cold path — the write lock plus a bounded CLOCK step — paid
+  only when a new key displaces an old one, and constant whatever the shard
+  size.
 
 ## What's next
 
-- A fast monotonic clock in `clock-lib` (raised separately) would cut the single
-  unavoidable clock read and is the path to beating `governor`.
-- A possible further micro-optimization: fuse the two key hashes (shard
-  selection and the map probe) into one via a precomputed-hash raw entry. It
-  saves only a few nanoseconds and is dwarfed by the clock, so it is deferred.
+- A lock-free read path for existing keys (an epoch- or seqlock-protected index)
+  would remove the read-lock acquire from the keyed check; it is deferred until
+  it can be model-checked as thoroughly as the current store.
 
 ---
 

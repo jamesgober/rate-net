@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "1.0.0"
+version = "1.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -22,7 +22,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "A powerful, lock-free rate limiter for Rust: multiple algorithms behind one trait, sharded per-key state, bounded-memory eviction, retry-after, and a one-line Tier-1 API. Built against hostile traffic."
+description = "A rate limiter for Rust: five algorithms behind one trait, sharded per-key state with O(1) bounded-memory eviction, retry-after and RateLimit headers, a no_std single-key core, and a one-line Tier-1 API. Built against hostile traffic."
 
 # Keywords (5 max)
 keywords = [
@@ -81,12 +81,14 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Default build: std on, all core algorithms available.
 default = ["std"]
 
-# Standard library. The limiter — the sharded per-key store, the token-bucket
-# core (better-bucket's clock-driven surface), the injectable clock, and the
-# domain error type — requires std, so std gates `better-bucket`'s `clock`
-# feature, `clock-lib`, and `error-forge`. With std off the crate is no_std and
-# exposes only `VERSION`; the pared-down single-key mode follows in a later
-# release.
+# Standard library. The keyed limiter — the sharded per-key store, the
+# token-bucket core (better-bucket's clock-driven surface), the injectable
+# clock, `DirectLimiter`, `CoarseClock`, and the error-forge integration —
+# requires std, so std gates `better-bucket`'s `clock` feature, `clock-lib`,
+# `error-forge`, `ahash`, and `hashbrown`. With std off the crate is no_std and
+# exposes the clock-free single-key core: `Gcra` (on targets with 64-bit
+# atomics), `Quota`, `Decision`, `Snapshot`, the error types, and the header
+# names.
 std = [
     "dep:better-bucket",
     "better-bucket/clock",
@@ -94,6 +96,7 @@ std = [
     "clock-lib/std",
     "dep:error-forge",
     "dep:ahash",
+    "dep:hashbrown",
 ]
 
 # The full algorithm suite beyond the default token bucket: leaky bucket,
@@ -105,6 +108,11 @@ algorithms = []
 # store.
 async = ["std", "dep:tokio"]
 
+# Operational counters (allowed, denied, keys inserted / evicted / expired /
+# removed) read with `metrics()`. Off by default: without it the counters do
+# not exist, so they cost nothing.
+metrics = ["std"]
+
 
 
 # DEPENDENCIES
@@ -112,17 +120,34 @@ async = ["std", "dep:tokio"]
 [dependencies]
 # Token-bucket accounting (the single source of truth; we never re-implement it).
 # Pulled in by `std` with its `clock` feature, which exposes the `Bucket` surface.
-better-bucket = { version = "1.0", default-features = false, optional = true }
+# 1.1 is the floor: 1.0 over-granted under multi-threaded contention on a real
+# clock (a stale timestamp read as a ~49.7-day refill), capped capacity at ~4.29M
+# tokens, and lacked `with_config_and_clock` / `time_until`.
+better-bucket = { version = "1.1", default-features = false, optional = true }
 # Monotonic, mockable time for deterministic tests and the clock-injection seam.
 clock-lib     = { version = "1.0", default-features = false, optional = true }
 # Domain error type metadata (kind/caption), shared across the portfolio stack.
-error-forge   = { version = "1.0", optional = true }
+# 1.0.2 dropped its unused `thiserror` dependency (and `syn` with it).
+error-forge   = { version = "1.0.2", optional = true }
 # Fast, DoS-resistant hashing for the shard map and shard selection. A random
 # per-store seed (runtime-rng) keeps it collision-attack resistant on hostile
 # keys; required by `std` for the hot path.
 ahash         = { version = "0.8", optional = true }
+# The per-shard index. `HashTable` stores slot indices and takes the one
+# precomputed hash, which is what makes O(1) swap-remove eviction possible
+# without storing every key twice, and keeps a check to a single hash pass.
+# It is std's own map implementation (rust-lang maintained, MSRV 1.85); with
+# default features off it pulls in no dependencies of its own.
+hashbrown     = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
 # Optional async-friendly wrapper layer; additive only. Only the timer is used.
 tokio         = { version = "1", default-features = false, features = ["time"], optional = true }
+
+# `loom` replaces the limiter's own atomics and locks (`src/sync.rs`) under
+# `cfg(loom)` model-checking builds, so the loom suite drives the production
+# code. Never part of a normal build. (A regular, not dev, dependency because
+# the library itself switches to it.)
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 
 
@@ -131,10 +156,6 @@ tokio         = { version = "1", default-features = false, features = ["time"], 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-
-# `loom` is only pulled in under `cfg(loom)` model-checking builds.
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 # A minimal runtime to drive the `async` wrapper's tests and example. Excluded
 # under `cfg(loom)`: a global `--cfg loom` switches tokio's internals to its own
@@ -147,17 +168,41 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt", "
 # `cfg(comparison)` (set via `RUSTFLAGS="--cfg comparison"`) so it never enters
 # the default tree, `--all-features`, or CI.
 [target.'cfg(comparison)'.dev-dependencies]
-governor = "0.8"
+governor = "0.10"
 
 
 
 # EXAMPLES
 # #################################
-# Most examples build on the always-available token bucket; these two need an
-# opt-in feature, so they are only compiled when it is enabled.
+# Every example drives the std limiter, so each declares the features it needs;
+# `cargo test --no-default-features` then skips them instead of failing.
+[[example]]
+name              = "per_second"
+required-features = ["std"]
+
+[[example]]
+name              = "per_key"
+required-features = ["std"]
+
+[[example]]
+name              = "mock_clock"
+required-features = ["std"]
+
+[[example]]
+name              = "retry_after"
+required-features = ["std"]
+
+[[example]]
+name              = "gatekeeper"
+required-features = ["std"]
+
+[[example]]
+name              = "direct"
+required-features = ["std"]
+
 [[example]]
 name              = "algorithms"
-required-features = ["algorithms"]
+required-features = ["std", "algorithms"]
 
 [[example]]
 name              = "async_wait"
@@ -168,8 +213,9 @@ required-features = ["async"]
 # BENCHMARKS
 # #################################
 [[bench]]
-name    = "rate_bench"
-harness = false
+name              = "rate_bench"
+harness           = false
+required-features = ["std"]
 
 [[bench]]
 name    = "comparison"

@@ -30,14 +30,20 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
-      # Default features = token bucket only; the `algorithms` feature is
-      # additive, so exercise the lean default build as well.
+      # Default features = token bucket only; every optional feature is
+      # additive, so exercise the lean default build and the no_std core too.
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Clippy (metrics only)
+        run: cargo clippy --all-targets --features metrics -- -D warnings
       - name: Test (all features)
         run: cargo test --all-features
       - name: Test (default features)
         run: cargo test
+      - name: Test (no default features)
+        run: cargo test --no-default-features
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
@@ -50,16 +56,76 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
 
   loom:
-    name: Loom (concurrency model check)
+    name: Loom (model check of the production limiter)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # clock-lib 1.1.0 uses `loom` in library code under cfg(loom) but declares
+      # it only as a dev-dependency, so it cannot build with --cfg loom; 1.0.0
+      # satisfies rate-net's (and better-bucket's) `clock-lib = "1.0"`.
+      - name: Pin clock-lib for the loom build
+        run: cargo update -p clock-lib --precise 1.0.0
       - name: Loom
-        run: cargo test --test loom_check
+        run: cargo test --test loom_check --features algorithms --release
         env:
           RUSTFLAGS: "--cfg loom"
+
+  miri:
+    name: Miri (atomic algorithm state and the store)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # Miri makes weak compare-and-swap fail spuriously, which native x86 runs
+      # never do; it is what exercises the CAS retry paths.
+      - name: Miri
+        run: |
+          cargo miri test --lib --all-features -- algo:: gcra:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan metrics::
+        env:
+          RUSTFLAGS: ""
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  no-std:
+    name: no_std (thumbv7em-none-eabihf, wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # thumbv7em has no 64-bit atomics, so this checks the data-type surface.
+      - name: Build the no_std core for an embedded target
+        run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
+      # wasm32 has 64-bit atomics: this builds `Gcra` itself without std.
+      - name: Build the no_std Gcra core
+        run: cargo build --lib --no-default-features --target wasm32-unknown-unknown
+
+  i686:
+    name: 32-bit (i686-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the 32-bit toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Test (all features, 32-bit)
+        run: cargo test --all-features --target i686-unknown-linux-gnu
+
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   security:
     name: Security (audit + deny)
@@ -72,6 +138,10 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
+      # Libraries do not commit Cargo.lock; resolve the latest compatible tree
+      # so the audit sees what a fresh consumer would build.
+      - name: Generate lockfile
+        run: cargo generate-lockfile
       - name: Audit
         run: cargo audit
       - name: Deny

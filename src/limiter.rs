@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use clock_lib::{Clock, Monotonic, SystemClock};
 
-use crate::algo::AlgoState;
+use crate::algo::{AlgoState, fresh_snapshot};
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
 use crate::key::Key;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
 use crate::store::Store;
 
 /// Default shard count when the caller does not choose one: four shards per
@@ -61,15 +62,80 @@ pub trait Limiter {
     }
 }
 
+/// The object-safe face of [`Limiter`], for holding "any limiter" behind a
+/// pointer.
+///
+/// `Limiter`'s methods are generic over `impl Into<Key>`, which keeps call
+/// sites short but means `dyn Limiter` cannot exist. `DynLimiter` has one
+/// non-generic method, so `&dyn DynLimiter`, `Box<dyn DynLimiter>`, and
+/// `Arc<dyn DynLimiter + Send + Sync>` all work — the shape middleware wants
+/// when the limiter is chosen at runtime. Every [`Limiter`] implements it
+/// automatically, and the trait objects implement `Limiter` again, so the
+/// ergonomic `check` / `check_n` stay available on them.
+///
+/// # Examples
+///
+/// ```
+/// use rate_net::{DynLimiter, Limiter, RateLimiter};
+/// use std::sync::Arc;
+///
+/// // Pick an implementation at runtime and hold it as a trait object.
+/// let limiter: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(1));
+///
+/// assert!(limiter.check_key("user:42".into(), 1).is_allow());
+/// // The trait object is itself a `Limiter`, so the generic helpers work too.
+/// assert!(limiter.check("user:42").is_deny());
+/// ```
+pub trait DynLimiter {
+    /// Checks `n` units against `key`. The non-generic core of
+    /// [`Limiter::check_n`].
+    fn check_key(&self, key: Key, n: u32) -> Decision;
+}
+
+impl<L: Limiter> DynLimiter for L {
+    #[inline]
+    fn check_key(&self, key: Key, n: u32) -> Decision {
+        self.check_n(key, n)
+    }
+}
+
+impl Limiter for dyn DynLimiter + '_ {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        self.check_key(key.into(), n)
+    }
+}
+
+impl Limiter for dyn DynLimiter + Send + Sync + '_ {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        self.check_key(key.into(), n)
+    }
+}
+
+// `Arc<L>` is not a fundamental type, so no downstream crate could have
+// implemented `Limiter` for `Arc<TheirType>`; this blanket impl is additive.
+// (`&L` and `Box<L>` are fundamental: a 1.0 user may implement `Limiter` for
+// `&TheirType` or `Box<TheirType>`, so blanket impls for them would break that
+// code and are left for 2.0.)
+impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
+    #[inline]
+    fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
+        (**self).check_n(key, n)
+    }
+}
+
 /// A keyed rate limiter.
 ///
 /// Tracks an independent allowance for every key it sees and answers
 /// [`check`](Self::check) in the time it takes to hash the key and run its
-/// bucket. Per-key state lives in a [sharded](Self::with_shards) concurrent
-/// store: unrelated keys land in different shards and never contend, an
-/// existing-key check takes only a shared read lock plus the bucket's atomic
-/// accounting, and memory is bounded by [eviction](Self::with_eviction) so a
-/// flood of unique keys hits a cap instead of growing without limit. The
+/// algorithm. Per-key state lives in a [sharded](Self::with_shards) concurrent
+/// store: unrelated keys usually land in different shards, an existing-key
+/// check takes only that shard's read lock plus the algorithm's accounting (one
+/// atomic compare-and-swap for the token bucket, leaky bucket, and fixed
+/// window; a short per-key mutex for the sliding windows), and memory is
+/// bounded by O(1) [eviction](Self::with_eviction) so a flood of unique keys
+/// hits a cap instead of growing without limit. The
 /// limiter is `Send + Sync` and is meant to be shared — behind an
 /// [`Arc`](std::sync::Arc), or as a `static` — across all the threads serving
 /// requests.
@@ -211,7 +277,9 @@ impl<C: Clock + Clone> RateLimiter<C> {
         eviction: Eviction,
     ) -> Self {
         let epoch = clock.now();
-        let store = Store::new(shards, eviction);
+        // An idle TTL never evicts a key before it could have recovered its
+        // full allowance; evicting sooner would hand out a fresh quota early.
+        let store = Store::new(shards, eviction, algorithm.recovery_time(&quota));
         // The token bucket reads its own clock and capacity-only eviction orders
         // by a logical counter, so that combination needs no clock read here.
         let reads_clock = algorithm != Algorithm::TokenBucket || eviction.idle_ttl().is_some();
@@ -370,8 +438,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
     ///
     /// Useful when a single request costs more than one unit (a batch, a
     /// weighted endpoint). Either all `n` units are admitted or none are.
-    /// Requesting `0` always succeeds; requesting more than the quota can never
-    /// succeed, and the denial's `retry_after` is [`Duration::MAX`].
+    /// Requesting `0` always succeeds; requesting more than the key's capacity
+    /// (the burst for the token and leaky buckets, the limit for the window
+    /// algorithms) can never succeed, and the denial's `retry_after` is
+    /// [`Duration::MAX`] ([`Decision::is_impossible`]).
     ///
     /// [`Duration::MAX`]: std::time::Duration::MAX
     ///
@@ -434,12 +504,25 @@ impl<C: Clock + Clone> RateLimiter<C> {
 
     /// The number of shards the per-key store is split across (a power of two).
     ///
+    /// This is the requested count rounded up to a power of two, raised if
+    /// needed so that no shard's share of the capacity cap exceeds 16,384 keys
+    /// (a shard occasionally grows or rehashes its index in one pass, and small
+    /// shards keep that pass short), and never above
+    /// [`MAX_SHARDS`](crate::MAX_SHARDS).
+    ///
     /// # Examples
     ///
     /// ```
-    /// use rate_net::RateLimiter;
+    /// use rate_net::{Eviction, RateLimiter};
     ///
-    /// assert_eq!(RateLimiter::per_second(1).with_shards(32).shards(), 32);
+    /// assert_eq!(RateLimiter::per_second(1).with_shards(128).shards(), 128);
+    ///
+    /// // A million-key cap spread over 4 shards would put 250,000 keys in each;
+    /// // the store uses 64 shards of at most 16,384 instead.
+    /// let big = RateLimiter::per_second(1)
+    ///     .with_shards(4)
+    ///     .with_eviction(Eviction::capacity(1_000_000));
+    /// assert_eq!(big.shards(), 64);
     /// ```
     #[must_use]
     pub fn shards(&self) -> usize {
@@ -464,6 +547,175 @@ impl<C: Clock + Clone> RateLimiter<C> {
     #[must_use]
     pub fn tracked_keys(&self) -> usize {
         self.store.len()
+    }
+
+    /// Reads `key`'s remaining allowance without consuming any.
+    ///
+    /// The [`Snapshot`] carries the key's capacity, what is left of it right
+    /// now, and the wait until it is whole again — what `RateLimit-*` response
+    /// headers report on every response, admitted or not. Peeking takes only
+    /// the shard read lock, never counts a unit, never creates state for an
+    /// unseen key (which reports its full allowance), and does not refresh the
+    /// key's eviction recency. Like any read of shared state it is advisory
+    /// under concurrency; the [`Decision`] from a check is the authority.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(10);
+    /// assert_eq!(limiter.peek("user:42").remaining(), 10); // unseen: full
+    ///
+    /// assert!(limiter.check_n("user:42", 4).is_allow());
+    /// let snapshot = limiter.peek("user:42");
+    /// assert_eq!(snapshot.limit(), 10);
+    /// assert_eq!(snapshot.remaining(), 6);
+    /// assert_eq!(limiter.tracked_keys(), 1); // peeking created nothing
+    /// ```
+    #[must_use]
+    pub fn peek(&self, key: impl Into<Key>) -> Snapshot {
+        let key = key.into();
+        self.store
+            .peek(&key, self.now())
+            .unwrap_or_else(|| fresh_snapshot(self.algorithm, &self.quota))
+    }
+
+    /// Restores `key`'s full allowance, as if it had been idle long enough to
+    /// refill completely. The key stays tracked.
+    ///
+    /// For administrative unblocks ("this customer was throttled by mistake")
+    /// and tests. Returns `true` if the key had state, `false` if it was not
+    /// tracked (an untracked key already has its full allowance).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_minute(2);
+    /// assert!(limiter.check_n("user:42", 2).is_allow());
+    /// assert!(limiter.check("user:42").is_deny());
+    ///
+    /// assert!(limiter.reset("user:42"));
+    /// assert!(limiter.check("user:42").is_allow());
+    /// assert!(!limiter.reset("never-seen"));
+    /// ```
+    pub fn reset(&self, key: impl Into<Key>) -> bool {
+        self.store.reset(&key.into())
+    }
+
+    /// Forgets `key` entirely, releasing its state. Its next check starts from
+    /// a fresh allowance.
+    ///
+    /// Returns `true` if the key had state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("user:42");
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    ///
+    /// assert!(limiter.remove("user:42"));
+    /// assert_eq!(limiter.tracked_keys(), 0);
+    /// assert!(!limiter.remove("user:42"));
+    /// ```
+    pub fn remove(&self, key: impl Into<Key>) -> bool {
+        self.store.remove(&key.into())
+    }
+
+    /// Forgets every key and releases the store's memory. Every key's next
+    /// check starts from a fresh allowance.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// for user in 0..100u64 {
+    ///     let _ = limiter.check(user);
+    /// }
+    /// limiter.clear();
+    /// assert_eq!(limiter.tracked_keys(), 0);
+    /// ```
+    pub fn clear(&self) {
+        self.store.clear();
+    }
+
+    /// Forgets every key whose allowance has fully recovered, returning how
+    /// many were removed.
+    ///
+    /// A key with its whole allowance back behaves exactly like a key never
+    /// seen, so this cleanup changes no decision — it only returns memory.
+    /// Eviction already bounds the store, so calling this is optional; it suits
+    /// a periodic maintenance task that wants the store to shrink back after a
+    /// traffic spike. Each shard is walked in short chunks with the lock
+    /// released in between, so concurrent checks keep flowing; the cost is
+    /// proportional to the number of tracked keys.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    /// use clock_lib::ManualClock;
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let limiter = RateLimiter::per_second(10).with_clock(Arc::clone(&clock));
+    /// let _ = limiter.check("busy");
+    /// let _ = limiter.check("quiet");
+    ///
+    /// clock.advance(Duration::from_secs(1)); // both refill completely
+    /// let _ = limiter.check("busy");         // ...and one spends again
+    ///
+    /// assert_eq!(limiter.retain_recent(), 1); // "quiet" is forgotten
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    /// ```
+    pub fn retain_recent(&self) -> usize {
+        self.store.retain_recent(self.now())
+    }
+
+    /// Releases memory the store holds beyond its current keys — for example
+    /// after [`retain_recent`](Self::retain_recent) or a burst of evictions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("k");
+    /// limiter.shrink_to_fit();
+    /// assert_eq!(limiter.tracked_keys(), 1);
+    /// ```
+    pub fn shrink_to_fit(&self) {
+        self.store.shrink_to_fit();
+    }
+
+    /// The limiter's cumulative counters: checks allowed and denied, and keys
+    /// inserted, evicted, expired, and removed. Requires the `metrics` feature;
+    /// see [`Metrics`](crate::Metrics) for what each counter means.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let _ = limiter.check("a");
+    /// let _ = limiter.check("a");
+    /// let metrics = limiter.metrics();
+    /// assert_eq!((metrics.allowed, metrics.denied), (1, 1));
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn metrics(&self) -> crate::Metrics {
+        self.store.metrics()
     }
 
     /// The shared check path: hand the key to the store as of the elapsed time,
@@ -522,10 +774,11 @@ mod tests {
 
     use clock_lib::ManualClock;
 
-    use super::{Limiter, RateLimiter};
+    use super::{DynLimiter, Limiter, RateLimiter};
     use crate::algorithm::Algorithm;
     use crate::decision::Decision;
     use crate::eviction::Eviction;
+    use crate::key::Key;
     use crate::quota::Quota;
 
     fn manual() -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
@@ -638,7 +891,9 @@ mod tests {
 
     #[test]
     fn test_with_shards_rounds_to_power_of_two() {
-        let limiter = RateLimiter::per_second(1).with_shards(5);
+        let limiter = RateLimiter::per_second(1)
+            .with_shards(5)
+            .with_eviction(Eviction::unbounded());
         assert_eq!(limiter.shards(), 8);
     }
 
@@ -674,6 +929,36 @@ mod tests {
         }
         let limiter = RateLimiter::per_second(3);
         assert_eq!(count_admitted(&limiter, "k", 10), 3);
+    }
+
+    #[test]
+    fn test_dyn_limiter_holds_any_limiter_as_a_trait_object() {
+        let clock = Arc::new(ManualClock::new());
+        let limiters: Vec<Box<dyn DynLimiter>> = vec![
+            Box::new(RateLimiter::per_second(1)),
+            Box::new(RateLimiter::per_second(1).with_clock(Arc::clone(&clock))),
+        ];
+        for limiter in &limiters {
+            assert!(limiter.check_key(Key::from("k"), 1).is_allow());
+            // The boxed trait object is itself a `Limiter`.
+            assert!(limiter.check("k").is_deny());
+            assert!(limiter.check_n("other", 1).is_allow());
+        }
+        let shared: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(2));
+        assert!(shared.check("k").is_allow());
+        let by_ref: &dyn DynLimiter = &*limiters[0];
+        assert!(by_ref.check("fresh").is_allow());
+    }
+
+    #[test]
+    fn test_limiter_is_implemented_for_arc() {
+        fn admit<L: Limiter>(limiter: L) -> bool {
+            limiter.check("k").is_allow()
+        }
+        let limiter = Arc::new(RateLimiter::per_second(2));
+        assert!(admit(Arc::clone(&limiter)));
+        assert!(admit(Arc::clone(&limiter)));
+        assert!(!admit(limiter));
     }
 
     #[test]

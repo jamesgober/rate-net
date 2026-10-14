@@ -8,10 +8,11 @@
 //! It ignores the quota's `burst`.
 
 use core::time::Duration;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::decision::Decision;
 use crate::quota::Quota;
+use crate::snapshot::Snapshot;
+use crate::sync::{self, Mutex};
 
 /// Clamps a duration-since-epoch to nanoseconds.
 fn nanos(now: Duration) -> u64 {
@@ -31,16 +32,18 @@ struct State {
 /// Sliding-counter state for one key.
 pub(crate) struct SlidingCounter {
     state: Mutex<State>,
+    /// Window length in ns. Zero only for a degenerate (zero-period) quota,
+    /// which is denied before any division.
     period_ns: u64,
     limit: u32,
 }
 
 impl SlidingCounter {
     pub(crate) fn new(quota: &Quota, now: Duration) -> Self {
-        let period_ns = nanos(quota.period()).max(1);
+        let period_ns = nanos(quota.period());
         Self {
             state: Mutex::new(State {
-                window: nanos(now) / period_ns,
+                window: nanos(now).checked_div(period_ns).unwrap_or(0),
                 prev: 0,
                 curr: 0,
             }),
@@ -53,18 +56,81 @@ impl SlidingCounter {
         if n == 0 {
             return Decision::Allow;
         }
-        if self.limit == 0 || n > self.limit {
+        // A zero period is degenerate (fail closed); a zero limit or `n > limit`
+        // can never fit.
+        if self.limit == 0 || self.period_ns == 0 || n > self.limit {
             return Decision::Deny {
                 retry_after: Duration::MAX,
             };
         }
 
-        let now_ns = nanos(now);
-        let window_number = now_ns / self.period_ns;
-        let offset = now_ns % self.period_ns;
-        let mut state = self.lock();
+        let real_now_ns = nanos(now);
+        let mut state = sync::lock(&self.state);
+        let (now_ns, offset) = self.roll(&mut state, real_now_ns);
 
-        // Roll the windows forward if time has moved into a later window.
+        if self.fits(&state, offset, n) {
+            state.curr = state.curr.saturating_add(n);
+            return Decision::Allow;
+        }
+
+        // Denied: the wait is the exact earliest instant at which the same
+        // request fits, so retrying after `retry_after` (absent other traffic)
+        // is admitted. A late thread waits from its own, earlier, instant.
+        let wait_ns = self.earliest_fit(&state, offset, n);
+        let late_by = now_ns - real_now_ns;
+        Decision::Deny {
+            retry_after: Duration::from_nanos(wait_ns.saturating_add(late_by).max(1)),
+        }
+    }
+
+    /// The weighted count, scaled by the period so it stays an exact integer:
+    /// `prev * (period - offset) + curr * period`. The previous window's
+    /// contribution fades linearly across the current window — full at the
+    /// boundary, zero at the next.
+    fn weighted(&self, state: &State, offset: u64) -> u128 {
+        let period = u128::from(self.period_ns);
+        u128::from(state.prev) * (period - u128::from(offset)) + u128::from(state.curr) * period
+    }
+
+    /// Whether `n` more units fit at `offset`: `weighted + n * period <=
+    /// limit * period`, in exact integer arithmetic.
+    fn fits(&self, state: &State, offset: u64, n: u32) -> bool {
+        let period = u128::from(self.period_ns);
+        self.weighted(state, offset) + u128::from(n) * period <= u128::from(self.limit) * period
+    }
+
+    /// Nanoseconds from `offset` until `n` units first fit, assuming no other
+    /// traffic. The caller has checked they do not fit now and `n <= limit`.
+    fn earliest_fit(&self, state: &State, offset: u64, n: u32) -> u64 {
+        let period = u128::from(self.period_ns);
+        let (prev, curr) = (u128::from(state.prev), u128::from(state.curr));
+        let (limit, n) = (u128::from(self.limit), u128::from(n));
+        if curr + n <= limit && prev > 0 {
+            // Still in this window, once the previous window's share has
+            // faded enough: `prev * (period - o) <= (limit - n - curr) *
+            // period`, so `o >= period - floor((limit - n - curr) * period /
+            // prev)`.
+            let slack = (limit - n - curr) * period / prev;
+            let fit_at = period - slack.min(period);
+            (fit_at as u64).saturating_sub(offset).max(1)
+        } else {
+            // Only in the next window, where this window's count becomes the
+            // fading one: `curr * (period - x) <= (limit - n) * period`, so
+            // `x >= period - floor((limit - n) * period / curr)`.
+            let slack = ((limit - n) * period).checked_div(curr).unwrap_or(period);
+            let x = period - slack.min(period);
+            (self.period_ns - offset).saturating_add(x as u64)
+        }
+    }
+    /// Rolls the windows forward to `real_now_ns` and returns the effective
+    /// instant and its offset into the current window.
+    ///
+    /// A late thread — its `now` read before another thread rolled the
+    /// windows forward — is treated as arriving at the start of the current
+    /// window, never as reaching back into a window already rolled past.
+    fn roll(&self, state: &mut State, real_now_ns: u64) -> (u64, u64) {
+        let now_ns = real_now_ns.max(state.window.saturating_mul(self.period_ns));
+        let window_number = now_ns / self.period_ns;
         if window_number > state.window {
             state.prev = if window_number == state.window + 1 {
                 state.curr
@@ -74,34 +140,46 @@ impl SlidingCounter {
             state.curr = 0;
             state.window = window_number;
         }
-
-        // The previous window's contribution fades linearly across the current
-        // window: full at the boundary, zero at the next.
-        let period = self.period_ns as f64;
-        let weight = (self.period_ns - offset) as f64 / period;
-        let estimated = f64::from(state.prev) * weight + f64::from(state.curr);
-
-        if estimated + f64::from(n) <= f64::from(self.limit) {
-            state.curr = state.curr.saturating_add(n);
-            return Decision::Allow;
-        }
-
-        // Denied: estimate how long until the weighted count falls enough. While
-        // the previous window still contributes, its term decays at `prev /
-        // period` per nanosecond; otherwise wait for the next window boundary.
-        let deficit = estimated + f64::from(n) - f64::from(self.limit);
-        let wait_ns = if state.prev > 0 {
-            ((deficit * period / f64::from(state.prev)) as u64).min(self.period_ns)
-        } else {
-            self.period_ns - offset
-        };
-        Decision::Deny {
-            retry_after: Duration::from_nanos(wait_ns),
-        }
+        (now_ns, now_ns % self.period_ns)
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Units admissible right now, and the wait until both windows' counts
+    /// have faded out (the full allowance is back).
+    pub(crate) fn peek(&self, now: Duration) -> Snapshot {
+        if self.limit == 0 || self.period_ns == 0 {
+            return Snapshot::closed();
+        }
+        let real_now_ns = nanos(now);
+        let mut state = sync::lock(&self.state);
+        let (now_ns, offset) = self.roll(&mut state, real_now_ns);
+        // The largest `k` with `weighted + k * period <= limit * period`.
+        let period = u128::from(self.period_ns);
+        let headroom =
+            (u128::from(self.limit) * period).saturating_sub(self.weighted(&state, offset));
+        let remaining = u32::try_from(headroom / period).unwrap_or(u32::MAX);
+        let to_boundary = self.period_ns - offset;
+        let full_in = if state.curr > 0 {
+            // The current window's count fades out over the next one.
+            to_boundary.saturating_add(self.period_ns)
+        } else if state.prev > 0 {
+            to_boundary
+        } else {
+            0
+        };
+        let late_by = now_ns - real_now_ns;
+        let reset_after = if full_in == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(full_in.saturating_add(late_by))
+        };
+        Snapshot::new(self.limit, remaining, reset_after)
+    }
+
+    /// Clears both windows: the key has its full allowance again.
+    pub(crate) fn reset(&self) {
+        let mut state = sync::lock(&self.state);
+        state.prev = 0;
+        state.curr = 0;
     }
 }
 
@@ -110,6 +188,7 @@ mod tests {
     use super::SlidingCounter;
     use crate::decision::Decision;
     use crate::quota::Quota;
+    use crate::snapshot::Snapshot;
     use core::time::Duration;
 
     fn at(ms: u64) -> Duration {
@@ -151,16 +230,43 @@ mod tests {
     }
 
     #[test]
-    fn test_denial_reports_a_bounded_retry_after() {
+    fn test_denial_reports_the_exact_earliest_fit() {
+        // Two spent at t=0. One more fits only once window 1 is half over:
+        // `2 * (1000 - x) / 1000 + 1 <= 2` gives x >= 500ms, so from t=100ms
+        // the wait is 900ms + 500ms.
         let sc = SlidingCounter::new(&Quota::per_second(2), at(0));
         assert!(sc.acquire(2, at(0)).is_allow());
-        match sc.acquire(1, at(100)) {
-            Decision::Deny { retry_after } => {
-                assert!(retry_after > Duration::ZERO);
-                assert!(retry_after <= Duration::from_secs(1));
-            }
-            other => panic!("expected denial, got {other:?}"),
-        }
+        assert_eq!(sc.acquire(1, at(100)).retry_after(), Some(at(1_400)));
+        assert!(sc.acquire(1, at(1_499)).is_deny());
+        assert!(sc.acquire(1, at(1_500)).is_allow());
+    }
+
+    #[test]
+    fn test_retry_after_is_never_early_within_the_window() {
+        // 10/s, all ten spent at t=0, then a check at t=500ms (the audit's
+        // case). In window 1 the previous count weighs 10 at the boundary, so
+        // one more fits only at x >= 100ms: a 600ms wait, not 500ms.
+        let sc = SlidingCounter::new(&Quota::per_second(10), at(0));
+        assert!(sc.acquire(10, at(0)).is_allow());
+        let wait = sc.acquire(1, at(500)).retry_after().unwrap_or_default();
+        assert_eq!(wait, at(600));
+        assert!(
+            sc.acquire(1, at(500) + wait - Duration::from_nanos(1))
+                .is_deny()
+        );
+        assert!(sc.acquire(1, at(500) + wait).is_allow());
+    }
+
+    #[test]
+    fn test_retry_after_while_the_previous_window_fades() {
+        // Window 1 inherits 4 from window 0; 4 more are spent in window 1, so
+        // at t=1200ms the estimate is 4 * 0.8 + 4 = 7.2 of 8. Two more need
+        // `4 * (1000 - o) / 1000 + 4 + 2 <= 8`: o >= 500ms, a 300ms wait.
+        let sc = SlidingCounter::new(&Quota::per_second(8), at(0));
+        assert!(sc.acquire(4, at(0)).is_allow());
+        assert!(sc.acquire(4, at(1_000)).is_allow());
+        assert_eq!(sc.acquire(2, at(1_200)).retry_after(), Some(at(300)));
+        assert!(sc.acquire(2, at(1_500)).is_allow());
     }
 
     #[test]
@@ -172,5 +278,49 @@ mod tests {
                 retry_after: Duration::MAX
             }
         );
+    }
+
+    #[test]
+    fn test_late_thread_is_judged_against_the_current_window() {
+        let sc = SlidingCounter::new(&Quota::per_second(4), at(0));
+        // Window 1 is opened and filled.
+        for _ in 0..4 {
+            assert!(sc.acquire(1, at(1_000)).is_allow());
+        }
+        // A late arrival stamped in window 0 must not escape window 1's count
+        // by using a window-0 offset against window-1 state.
+        assert!(sc.acquire(1, at(999)).is_deny());
+    }
+
+    #[test]
+    fn test_zero_period_denies_everything() {
+        let quota = Quota::from_parts(10, Duration::ZERO, 10);
+        let sc = SlidingCounter::new(&quota, at(0));
+        assert_eq!(sc.acquire(1, at(5)).retry_after(), Some(Duration::MAX));
+        assert_eq!(sc.acquire(0, at(5)), Decision::Allow);
+        assert_eq!(sc.peek(at(5)), Snapshot::closed());
+    }
+
+    #[test]
+    fn test_peek_reports_weighted_remaining_and_fade_out() {
+        let sc = SlidingCounter::new(&Quota::per_second(10), at(0));
+        assert_eq!(sc.peek(at(0)), Snapshot::full(10));
+        assert!(sc.acquire(4, at(200)).is_allow());
+        let snapshot = sc.peek(at(200));
+        assert_eq!(snapshot.remaining(), 6);
+        // The current window ends in 800ms and its count fades over the next.
+        assert_eq!(snapshot.reset_after(), at(1_800));
+        // Half way through the next window, half of the 4 still counts.
+        assert_eq!(sc.peek(at(1_500)).remaining(), 8);
+        assert_eq!(sc.peek(at(2_000)), Snapshot::full(10));
+    }
+
+    #[test]
+    fn test_reset_clears_both_windows() {
+        let sc = SlidingCounter::new(&Quota::per_second(3), at(0));
+        assert!(sc.acquire(3, at(0)).is_allow());
+        assert!(sc.acquire(1, at(1_000)).is_deny());
+        sc.reset();
+        assert!(sc.acquire(3, at(1_000)).is_allow());
     }
 }

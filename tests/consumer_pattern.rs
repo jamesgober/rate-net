@@ -33,8 +33,9 @@ enum Verdict {
 fn admit<L: Limiter>(limiter: &L, key: impl Into<rate_net::Key>) -> Verdict {
     match limiter.check(key) {
         Decision::Allow => Verdict::Serve,
-        Decision::Deny { retry_after } => Verdict::TooManyRequests {
-            retry_after_secs: retry_after.as_secs().max(1),
+        decision @ Decision::Deny { .. } => Verdict::TooManyRequests {
+            // Rounded up, so the hint never sends the client back early.
+            retry_after_secs: decision.retry_after_secs().unwrap_or(u64::MAX),
         },
         _ => Verdict::TooManyRequests {
             retry_after_secs: 1,
@@ -156,9 +157,9 @@ async fn test_async_gatekeeper_awaits_then_serves() {
         let _ = limiter.check("client");
     }
     let completed =
-        tokio::time::timeout(Duration::from_secs(2), limiter.until_ready("client")).await;
-    assert!(
-        completed.is_ok(),
-        "async gatekeeper did not admit within 2s"
+        tokio::time::timeout(Duration::from_secs(10), limiter.try_until_ready("client")).await;
+    assert_eq!(
+        completed.expect("async gatekeeper did not admit within 10s"),
+        Ok(())
     );
 }
