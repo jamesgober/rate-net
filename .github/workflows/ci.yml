@@ -156,11 +156,12 @@ jobs:
         run: rustc -V && cargo -V
       # Miri makes weak compare-and-swap fail spuriously, which native x86 runs
       # never do; it is what exercises the CAS retry paths. The store tests
-      # cover eviction, the recovery table's exact records, cuckoo moves, the
-      # overflow sketch, and saturation.
+      # cover eviction, the recovery table's exact records, cuckoo moves, and
+      # the overflow sketch (the saturation tests run tens of thousands of
+      # checks, too slow under miri; they run natively in every test job).
       - name: Miri
         run: |
-          cargo miri test --locked --lib --all-features -- algo:: gcra:: metrics:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear store::tests::test_recovery store::tests::test_an_overloaded_recovery_table store::tests::test_newcomers_are_charged store::tests::test_seeded_keys store::tests::test_a_saturated_shard
+          cargo miri test --locked --lib --all-features -- algo:: gcra:: metrics:: store::tests::test_peek store::tests::test_capacity_boundaries store::tests::test_clock_scan store::tests::test_evicted_key_resumes store::tests::test_remove_reset_and_clear store::tests::test_recovery store::tests::test_an_overloaded_recovery_table store::tests::test_newcomers_are_charged
         env:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"

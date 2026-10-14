@@ -1883,7 +1883,10 @@ mod tests {
     fn test_recovery_table_is_lazy_and_bounded() {
         let store = make_store(1, Eviction::capacity(100));
         assert_eq!(store.recovery_bytes(), 0);
-        for k in 0..10_000u64 {
+        // Far past what the table holds either way; smaller under miri, which
+        // runs this test too.
+        let flood = if cfg!(miri) { 1_000 } else { 10_000u64 };
+        for k in 0..flood {
             let _ = check(&store, k, 1, 0, slow(5));
         }
         // Two records per key of capacity (50 buckets of 4, rounded up to 64)
