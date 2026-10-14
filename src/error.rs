@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(err.requested(), 42);
         assert!(err.to_string().contains("42"));
         assert_eq!(err.kind(), "InsufficientCapacity");
-        assert!(!err.caption().is_empty());
+        assert_ne!(err.caption(), "");
         assert!(!err.is_retryable());
         let boxed: Box<dyn std::error::Error> = Box::new(err);
         assert!(boxed.to_string().contains("exceeds"));

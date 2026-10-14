@@ -87,7 +87,11 @@
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
-#![deny(warnings)]
+// REPS: warnings are errors. Not on docs.rs, whose nightly rustdoc can grow new
+// lints after a release and would then fail to build the published docs;
+// downstream builds are unaffected either way (Cargo caps lints for
+// dependencies), and CI enforces `-D warnings` on stable and the MSRV.
+#![cfg_attr(not(docsrs), deny(warnings))]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]

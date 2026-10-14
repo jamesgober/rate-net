@@ -418,7 +418,10 @@ mod tests {
             .retry_after()
             .unwrap_or_default();
         assert_eq!(wait, Duration::from_nanos(333_333_334));
-        assert!(lb.check_n_at(1, wait - Duration::from_nanos(1)).is_deny());
+        assert!(
+            lb.check_n_at(1, wait.saturating_sub(Duration::from_nanos(1)))
+                .is_deny()
+        );
         assert!(lb.check_n_at(1, wait).is_allow());
     }
 
@@ -552,7 +555,7 @@ mod tests {
             1_000_000_000,
             u64::MAX,
         ] {
-            let exact = (u128::from(ns) * 3 / 1_000_000_000) as u64;
+            let exact = u64::try_from(u128::from(ns) * 3 / 1_000_000_000).unwrap_or(u64::MAX);
             assert_eq!(lb.intervals_at(ns), exact, "ns={ns}");
         }
         let one_per_ns = Gcra::new(Quota::from_parts(1_000, Duration::from_micros(1), 1));

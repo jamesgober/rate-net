@@ -112,7 +112,7 @@ impl Key {
             // `bytes.len() <= INLINE_CAP <= u8::MAX`, so the cast cannot truncate.
             Self(Repr::Inline {
                 kind,
-                len: bytes.len() as u8,
+                len: u8::try_from(bytes.len()).unwrap_or(u8::MAX),
                 buf,
             })
         } else {
@@ -333,7 +333,7 @@ fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
     let bits = u128::from(addr);
     if bits >> 32 == 0 && bits > 1 {
         // The top 96 bits are zero, so the low 32 are the whole address.
-        return Some(Ipv4Addr::from(bits as u32));
+        return u32::try_from(bits).ok().map(Ipv4Addr::from);
     }
     None
 }
@@ -653,10 +653,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "a, b, c and x, y name the addresses under comparison"
+    )]
     fn test_prefix_keys_mask_and_encode_length() {
-        let a = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6);
-        let b = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0xffff, 0, 0, 1);
-        let c = Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 3, 4, 5, 6);
+        let (a, b, c) = (
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6),
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0xffff, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 3, 4, 5, 6),
+        );
         assert_eq!(Key::ipv6_prefix(a, 64), Key::ipv6_prefix(b, 64));
         assert_ne!(Key::ipv6_prefix(a, 64), Key::ipv6_prefix(c, 64));
         assert_eq!(Key::ipv6_prefix(a, 48), Key::ipv6_prefix(c, 48));

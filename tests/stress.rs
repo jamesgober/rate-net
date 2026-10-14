@@ -44,7 +44,8 @@ fn stress_many_keys_never_over_or_under_admit() {
             for _ in 0..PASSES {
                 for key in 0..KEYS {
                     if limiter.check(key).is_allow() {
-                        let _ = admitted[key as usize].fetch_add(1, Ordering::Relaxed);
+                        let _ =
+                            admitted[usize::try_from(key).unwrap()].fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -55,7 +56,7 @@ fn stress_many_keys_never_over_or_under_admit() {
     }
 
     for key in 0..KEYS {
-        let count = admitted[key as usize].load(Ordering::Relaxed);
+        let count = admitted[usize::try_from(key).unwrap()].load(Ordering::Relaxed);
         assert_eq!(
             count, LIMIT,
             "key {key} admitted {count}, expected exactly {LIMIT} (frozen clock)"

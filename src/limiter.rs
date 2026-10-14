@@ -94,9 +94,7 @@ enum Admitted<'a> {
 /// shards means less contention between unrelated keys, at the cost of a little
 /// more memory.
 pub(crate) fn default_shard_count() -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(1);
+    let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     (parallelism.saturating_mul(4))
         .next_power_of_two()
         .clamp(1, 4096)
@@ -974,7 +972,7 @@ impl<C: Clock + Clone> fmt::Debug for RateLimiter<C> {
             .field("eviction", &self.eviction)
             .field("keys", &self.options)
             .field("tracked_keys", &self.store.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1137,8 +1135,8 @@ mod tests {
     fn test_limiter_trait_generic() {
         fn count_admitted<L: Limiter>(limiter: &L, key: &str, attempts: u32) -> u32 {
             (0..attempts)
-                .filter(|_| limiter.check(key).is_allow())
-                .count() as u32
+                .map(|_| u32::from(limiter.check(key).is_allow()))
+                .sum()
         }
         let limiter = RateLimiter::per_second(3);
         assert_eq!(count_admitted(&limiter, "k", 10), 3);
@@ -1165,6 +1163,10 @@ mod tests {
 
     #[test]
     fn test_limiter_is_implemented_for_arc() {
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "the test takes the limiter by value on purpose"
+        )]
         fn admit<L: Limiter>(limiter: L) -> bool {
             limiter.check("k").is_allow()
         }

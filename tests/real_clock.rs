@@ -76,14 +76,14 @@ fn hammer(algorithm: Algorithm, threads: usize) -> (u64, Duration) {
 /// Whole periods elapsed (rounded down).
 #[cfg(feature = "algorithms")]
 fn periods(elapsed: Duration) -> u64 {
-    (elapsed.as_nanos() / PERIOD.as_nanos()) as u64
+    u64::try_from(elapsed.as_nanos() / PERIOD.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The bucket bound: the initial burst plus the rate times the elapsed time,
 /// plus one unit of rounding slack.
 fn bucket_ceiling(elapsed: Duration) -> u64 {
     let refilled = u128::from(LIMIT) * elapsed.as_nanos() / PERIOD.as_nanos();
-    u64::from(LIMIT) + refilled as u64 + 1
+    u64::from(LIMIT) + u64::try_from(refilled).unwrap_or(u64::MAX - 1_000) + 1
 }
 
 fn assert_bounded(algorithm: Algorithm, ceiling: impl Fn(Duration) -> u64) {

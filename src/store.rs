@@ -238,7 +238,12 @@ impl Probe {
         if second == first {
             second = (first + 1) & mask;
         }
-        let tag = match hash as u32 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the tag is deliberately the hash's low 32 bits"
+        )]
+        let low = hash as u32;
+        let tag = match low {
             MERGED => 1,
             tag => tag,
         };
@@ -561,6 +566,7 @@ impl<S: KeyState> Shard<S> {
         }
     }
 
+    #[cfg_attr(not(feature = "metrics"), allow(clippy::unused_self))]
     #[inline]
     fn on_decision(&self, decision: Decision) -> Decision {
         #[cfg(feature = "metrics")]
@@ -1528,7 +1534,7 @@ mod tests {
         let store = make_store(2, Eviction::unbounded());
         // 3_000 keys: spans several retain chunks per shard.
         for k in 0..3_000u64 {
-            let n = if k % 3 == 0 { 0 } else { 1 };
+            let n = u32::from(k % 3 != 0);
             let _ = check(&store, k, n, 0, slow(5));
         }
         // Every third key spent nothing, so it is full and forgettable.

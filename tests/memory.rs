@@ -7,6 +7,13 @@
 //! it ships.
 
 #![cfg(feature = "std")]
+// Allocation sizes are far below `isize::MAX`; the byte arithmetic is signed
+// so live bytes can be differenced.
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    reason = "allocation sizes and key counts are far below isize::MAX"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
