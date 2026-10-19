@@ -14,7 +14,7 @@
 
 ---
 
-## [2.0.0] — 2026-10-18
+## [2.0.0] — 2026-10-19
 
 **Eviction never resets a limit by default, and the HTTP surface is
 complete.** A major release. Its headline change is a security default: a

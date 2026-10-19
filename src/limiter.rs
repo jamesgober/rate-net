@@ -917,9 +917,12 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// store runs out of room to keep evicted keys' debts (see
     /// [`RecoveryLoad`](crate::RecoveryLoad) and [`Eviction`]).
     ///
-    /// Walks every shard's recovery table under its read lock (up to 32 bytes
-    /// per key of capacity), so call it from a periodic exporter — every few
-    /// seconds — never per request. Requires the `metrics` feature.
+    /// Walks every shard's recovery table under its read lock — up to 64 bytes
+    /// per key of capacity under the default
+    /// [`Overflow::FailClosed`](crate::Overflow) (32 of exact records, 32 of
+    /// overflow sketch), 32 under [`Overflow::Forget`](crate::Overflow) (exact
+    /// records only) — so call it from a periodic exporter, every few seconds,
+    /// never per request. Requires the `metrics` feature.
     ///
     /// # Examples
     ///

@@ -1026,7 +1026,9 @@ the feature the counters do not exist.
 evicted keys' debts the store holds against the exact capacity it has for
 them, overall and in the fullest shard. Past `1.0` the overflow policy takes
 over, so alert at about `0.7`. It walks every shard's recovery table under its
-read lock (up to 32 bytes per key of capacity): export it every few seconds,
+read lock — up to 64 bytes per key of capacity under the default
+`Overflow::FailClosed` (32 of exact records, 32 of overflow sketch), 32 under
+`Overflow::Forget` (exact records only): export it every few seconds,
 never per request. With the `tracing` feature the limiter also logs a
 `warn!` (target `rate_net::eviction`) on the first spill, drop, or refusal,
 and at most once a minute while they continue, with the count since the last
@@ -1231,7 +1233,7 @@ allocates. On a target without 64-bit atomics (for example
 
 ```toml
 [dependencies]
-rate-net = { version = "1.2", default-features = false }
+rate-net = { version = "2.0", default-features = false }
 ```
 
 ---
