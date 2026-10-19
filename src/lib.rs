@@ -19,15 +19,16 @@
 //!
 //! ## Status
 //!
-//! **Stable (`1.2.0`).** The public API is frozen until `2.0`; each `1.x` only
-//! adds to it. The five algorithms sit behind the one [`Limiter`] trait (and the
+//! **Stable (`2.0.0`).** The public API is frozen until `3.0`; each `2.x` only
+//! adds to it (`docs/MIGRATION_1_TO_2.md` lists what changed from `1.x`). The five algorithms sit behind the one [`Limiter`] trait (and the
 //! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
 //! window algorithms under the `algorithms` feature — with the validating
 //! [`Builder`] (per-key quotas, key-length limits, long-key digests),
 //! [`peek`](RateLimiter::peek) snapshots and HTTP [`headers`](mod@headers)
 //! helpers, key management, the un-keyed [`DirectLimiter`], the `no_std`
 //! [`Gcra`] core, the fast [`CoarseClock`], and optional `AsyncLimiter`
-//! (`async`), `Metrics` (`metrics`), and `tower` middleware (`tower`) layers.
+//! (`async`), `Metrics` and `RecoveryLoad` (`metrics`), saturation warnings
+//! (`tracing`), and `tower` middleware (`tower`) layers.
 //! Checking an already-tracked key allocates nothing when the key is passed
 //! by reference (`check_bytes`, `check_n_bytes`) or is at most 22 bytes, and
 //! every public type is `Send + Sync + 'static`, asserted at compile time.
@@ -73,10 +74,11 @@
 //! - **Eviction does not reset a limit.** A key evicted before its allowance
 //!   recovered has its debt recorded, and resumes no more permissive than it
 //!   left — unconditionally while the still-limited evicted keys fit about
-//!   twice the cap. Past that, [`Overflow`] chooses: drop the debts that do
-//!   not fit (`Forget`, the default) or keep them all and fail closed for
-//!   some other keys (`FailClosed`, for identity-keyed limiters). See
-//!   [`Eviction`].
+//!   twice the cap. Past that, [`Overflow`] chooses: keep them all and fail
+//!   closed for some other keys (`FailClosed`, the default — no flood ever
+//!   resets a key) or drop the debts that do not fit (`Forget`, an opt-out
+//!   for availability-first limiters). See [`Eviction`] for the trade-off and
+//!   how to size the cap so neither happens.
 //! - **Zero-allocation steady state.** A check on an existing key allocates
 //!   nothing: always through [`check_bytes`](RateLimiter::check_bytes), which
 //!   borrows the key, and through [`check`](RateLimiter::check) for keys of up
@@ -93,10 +95,12 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`        | yes | The keyed limiter, [`DirectLimiter`], [`CoarseClock`], and the `error-forge` integration. With it off the crate is `no_std` and offers [`Gcra`] (on targets with 64-bit atomics), [`Quota`], [`Decision`], [`Snapshot`], the error types, and the [`headers`](mod@headers) names. |
+//! | `std`        | yes | The keyed limiter, [`DirectLimiter`], and [`CoarseClock`]. With it off the crate is `no_std` and offers [`Gcra`] (on targets with 64-bit atomics), [`Quota`], [`Decision`], [`Snapshot`], the error types, and the [`headers`](mod@headers) names. |
 //! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
 //! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
-//! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`]; compiled out when off. |
+//! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`], and `RateLimiter::recovery_load`, the gauge to alert on before eviction runs out of room; compiled out when off. |
+//! | `tracing`    | no  | Rate-limited `tracing` warnings (target `rate_net::eviction`) when evicted keys' debts spill, are dropped, or newcomers are refused. Nothing on the check path. Adds `tracing` (no proc-macros). |
+//! | `forge`      | no  | `error_forge::ForgeError` on the error types. Adds `error-forge`. |
 //! | `tower`      | no  | `rate_net::tower` middleware: `RateLimitLayer` with key extractors and `429` responses. Adds `http`, `tower-layer`, `tower-service`, `pin-project-lite`. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
@@ -185,7 +189,7 @@ pub use crate::key::Key;
 #[cfg(feature = "std")]
 pub use crate::limiter::{DynLimiter, Limiter, RateLimiter};
 #[cfg(feature = "metrics")]
-pub use crate::metrics::Metrics;
+pub use crate::metrics::{Metrics, RecoveryLoad};
 pub use crate::quota::Quota;
 pub use crate::snapshot::Snapshot;
 #[cfg(feature = "std")]
@@ -229,6 +233,10 @@ mod readme_doctests {}
 ))]
 #[doc = include_str!("../docs/API.md")]
 mod api_doctests {}
+
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../docs/MIGRATION_1_TO_2.md")]
+mod migration_doctests {}
 
 #[cfg(test)]
 mod tests {

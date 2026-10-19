@@ -28,7 +28,7 @@ fn test_decisions_and_inserts_are_counted() {
 fn test_capacity_evictions_are_counted() {
     let limiter = RateLimiter::per_second(1)
         .with_shards(1)
-        .with_eviction(Eviction::capacity(10).with_overflow(Overflow::FailClosed));
+        .with_eviction(Eviction::capacity(10));
     for user in 0..100u64 {
         let _ = limiter.check(user);
     }
@@ -54,11 +54,11 @@ fn test_capacity_evictions_are_counted() {
     assert_eq!((metrics.keys_inserted, metrics.keys_evicted), (100, 90));
     assert_eq!((metrics.keys_remembered, metrics.keys_refused), (0, 0));
 
-    // The default `Overflow::Forget`: every evicted debt is either kept
-    // exactly or dropped (counted), nothing spills or is refused.
+    // `Overflow::Forget`: every evicted debt is either kept exactly or
+    // dropped (counted), nothing spills or is refused.
     let forgetting = RateLimiter::per_second(1)
         .with_shards(1)
-        .with_eviction(Eviction::capacity(10));
+        .with_eviction(Eviction::capacity(10).with_overflow(Overflow::Forget));
     for user in 0..1_000u64 {
         let _ = forgetting.check(user);
     }

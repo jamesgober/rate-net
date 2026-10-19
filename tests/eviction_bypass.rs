@@ -8,10 +8,10 @@
 //!
 //! Every test here fails against `1.1.0` and passes now. They drive the public
 //! API only, with a frozen `ManualClock`, so nothing refills by itself. Floods
-//! far past the cap run under `Overflow::FailClosed`, which never resets a
-//! limit however large the flood; `Overflow::Forget` (the default) keeps the
-//! same guarantee while the evicted, still-limited keys fit the exact table
-//! (about twice the cap), which the `forget_` tests check.
+//! far past the cap run under the default `Overflow::FailClosed`, which never
+//! resets a limit however large the flood; the opt-in `Overflow::Forget` keeps
+//! the same guarantee while the evicted, still-limited keys fit the exact
+//! table (about twice the cap), which the `forget_` tests check.
 
 #![cfg(feature = "std")]
 
@@ -22,10 +22,7 @@ use clock_lib::ManualClock;
 use rate_net::{Algorithm, Eviction, Overflow, Quota, RateLimiter};
 
 fn limiter(algorithm: Algorithm, cap: usize) -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
-    limiter_with(
-        algorithm,
-        Eviction::capacity(cap).with_overflow(Overflow::FailClosed),
-    )
+    limiter_with(algorithm, Eviction::capacity(cap))
 }
 
 fn limiter_with(
@@ -189,10 +186,13 @@ fn test_idle_expiry_of_a_key_that_spent_again_never_resets_its_limit() {
 
 #[test]
 fn test_forget_never_resets_a_key_while_the_exact_table_holds_the_flood() {
-    // The default policy keeps every debt while the evicted, still-limited
+    // The opt-in policy keeps every debt while the evicted, still-limited
     // keys fit the exact table: a flood of 1.5x the cap resets nobody.
     for algorithm in algorithms() {
-        let (_clock, limiter) = limiter_with(algorithm, Eviction::capacity(1_000));
+        let (_clock, limiter) = limiter_with(
+            algorithm,
+            Eviction::capacity(1_000).with_overflow(Overflow::Forget),
+        );
         assert!(limiter.check_n("victim", 5).is_allow());
         for key in 0..1_500u64 {
             let _ = limiter.check(key);
@@ -203,10 +203,13 @@ fn test_forget_never_resets_a_key_while_the_exact_table_holds_the_flood() {
 
 #[test]
 fn test_forget_never_denies_a_newcomer_however_large_the_flood() {
-    // Past the bound the default drops debts instead of charging or refusing
+    // Past the bound `Forget` drops debts instead of charging or refusing
     // others: after a flood of 20x the cap, every never-seen key is admitted.
     for algorithm in algorithms() {
-        let (_clock, limiter) = limiter_with(algorithm, Eviction::capacity(64));
+        let (_clock, limiter) = limiter_with(
+            algorithm,
+            Eviction::capacity(64).with_overflow(Overflow::Forget),
+        );
         for key in 0..1_280u64 {
             let _ = limiter.check_n(key, 5);
         }

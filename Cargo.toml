@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "1.2.0"
+version = "2.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -101,19 +101,23 @@ default = ["std"]
 
 # Standard library. The keyed limiter — the sharded per-key store, the
 # token-bucket state (better-bucket's clock-free `BucketCore`), the injectable
-# clock, `DirectLimiter`, `CoarseClock`, and the error-forge integration —
-# requires std, so std gates `better-bucket`, `clock-lib`, `error-forge`,
-# `ahash`, and `hashbrown`. With std off the crate is no_std and exposes the
+# clock, `DirectLimiter`, and `CoarseClock` — requires std, so std gates
+# `better-bucket`, `clock-lib`, `ahash`, and `hashbrown`. With std off the crate is no_std and exposes the
 # clock-free single-key core: `Gcra` (on targets with 64-bit atomics), `Quota`,
 # `Decision`, `Snapshot`, the error types, and the header names and values.
 std = [
     "dep:better-bucket",
     "dep:clock-lib",
     "clock-lib/std",
-    "dep:error-forge",
     "dep:ahash",
     "dep:hashbrown",
 ]
+
+# `error_forge::ForgeError` implementations (kind and caption) on the error
+# types, for applications that report errors through the portfolio's
+# error-forge. Off by default: nothing in the limiter needs it, and it brings
+# seven crates of its own (parking_lot and a proc-macro among them).
+forge = ["std", "dep:error-forge"]
 
 # The full algorithm suite beyond the default token bucket: leaky bucket,
 # fixed window, sliding-window log, sliding-window counter.
@@ -136,6 +140,13 @@ metrics = ["std"]
 # trait crates — not `tower` itself.
 tower = ["std", "dep:http", "dep:tower-layer", "dep:tower-service", "dep:pin-project-lite"]
 
+# Rate-limited `tracing` warnings (target `rate_net::eviction`) when the
+# store runs out of room for evicted keys' debts: newcomers refused because a
+# shard is saturated, debts spilling into the overflow sketch, or debts
+# dropped. Each kind warns on its first occurrence and then at most once a
+# minute; nothing runs on the check path.
+tracing = ["std", "dep:tracing"]
+
 
 
 # DEPENDENCIES
@@ -150,8 +161,9 @@ tower = ["std", "dep:http", "dep:tower-layer", "dep:tower-service", "dep:pin-pro
 better-bucket = { version = "1.1", default-features = false, optional = true }
 # Monotonic, mockable time for deterministic tests and the clock-injection seam.
 clock-lib     = { version = "1.0", default-features = false, optional = true }
-# Domain error type metadata (kind/caption), shared across the portfolio stack.
-# 1.0.2 dropped its unused `thiserror` dependency (and `syn` with it).
+# Domain error type metadata (kind/caption), shared across the portfolio stack;
+# only behind the `forge` feature. 1.0.2 dropped its unused `thiserror`
+# dependency (and `syn` with it).
 error-forge   = { version = "1.0.2", optional = true }
 # Fast, DoS-resistant hashing for the shard map and shard selection. A random
 # per-store seed (runtime-rng) keeps it collision-attack resistant on hostile
@@ -172,6 +184,9 @@ http             = { version = "1", optional = true }
 tower-layer      = { version = "0.3.3", optional = true }
 tower-service    = { version = "0.3.3", optional = true }
 pin-project-lite = { version = "0.2", optional = true }
+# The `tracing` feature: operator warnings on eviction saturation. Only the
+# `std` feature of tracing (no proc-macro attributes).
+tracing          = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 # `loom` replaces the limiter's own atomics and locks (`src/sync.rs`) under
 # `cfg(loom)` model-checking builds, so the loom suite drives the production

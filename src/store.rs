@@ -56,10 +56,10 @@
 //!   before anything spills; after a walk fails, the next [`WALK_BACKOFF`]
 //!   debts spill without one, so a sustained flood stays cheap. A key reads
 //!   back only its own record.
-//! - **Past the table: [`Overflow`].** Under [`Overflow::Forget`] (the
-//!   default) a debt the table cannot place is dropped — its key may return
+//! - **Past the table: [`Overflow`].** Under the opt-in [`Overflow::Forget`]
+//!   a debt the table cannot place is dropped — its key may return
 //!   with a fresh allowance — and nothing below applies: the sketch is never
-//!   written. Under [`Overflow::FailClosed`]:
+//!   written. Under [`Overflow::FailClosed`] (the default):
 //! - **Overflow sketch.** A debt the table cannot place goes into two cells of
 //!   a shared sketch ([`CELLS_PER_KEY`] cells per key), each keeping the larger
 //!   deadline and spend. A key being stored is charged the *smaller* of its two
@@ -111,7 +111,7 @@ use crate::eviction::{Eviction, Overflow};
 use crate::gcra::Gcra;
 use crate::key::{Key, KeyRef};
 #[cfg(feature = "metrics")]
-use crate::metrics::{Counters, Metrics};
+use crate::metrics::{Counters, Metrics, RecoveryLoad};
 use crate::quota::Quota;
 use crate::snapshot::Snapshot;
 use crate::sync::{self, AtomicBool, AtomicU64, Ordering, RwLock};
@@ -784,6 +784,23 @@ impl Recovery {
         true
     }
 
+    /// Live exact records, and live sketch cells, at `now_ms`.
+    #[cfg(feature = "metrics")]
+    fn live(&self, now_ms: u64) -> (u64, u64) {
+        let records = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| bucket.0.iter())
+            .filter(|record| record.is_live(now_ms))
+            .count();
+        let cells = self
+            .cells
+            .iter()
+            .filter(|&&cell| unpack(cell).0 > now_ms)
+            .count();
+        (records as u64, cells as u64)
+    }
+
     /// Whether every record and cell has expired, so the table can be released.
     fn is_spent(&self, now_ms: u64) -> bool {
         self.buckets
@@ -1183,6 +1200,9 @@ pub(crate) struct Store<S> {
     idle_ttl_ms: Option<u64>,
     /// A shard's recovery table size once it is allocated.
     table: TableSize,
+    /// Rate-limited operator warnings (feature `tracing`).
+    #[cfg(feature = "tracing")]
+    warnings: Warnings,
 }
 
 impl<S: KeyState> Store<S> {
@@ -1223,6 +1243,8 @@ impl<S: KeyState> Store<S> {
             per_shard_cap,
             idle_ttl_ms,
             table,
+            #[cfg(feature = "tracing")]
+            warnings: Warnings::new(),
         }
     }
 
@@ -1288,6 +1310,8 @@ impl<S: KeyState> Store<S> {
             // cannot be recorded. Refuse the newcomer (fail closed) rather than
             // forget a debt or grow past the cap; retry once one recovers.
             shard.on_refused();
+            #[cfg(feature = "tracing")]
+            self.warnings.refused(now_ms);
             let wait_ms = recovers_at_ms.saturating_sub(now_ms).max(1);
             return shard.on_decision(Decision::Deny {
                 retry_after: Duration::from_millis(wait_ms),
@@ -1327,6 +1351,8 @@ impl<S: KeyState> Store<S> {
             Ok(())
         };
         shard.on_reclaimed(&reclaimed);
+        #[cfg(feature = "tracing")]
+        self.warnings.reclaimed(&reclaimed, now_ms);
         room
     }
 
@@ -1454,6 +1480,38 @@ impl<S: KeyState> Store<S> {
             .iter()
             .map(|shard| sync::read(&shard.map).recovery.heap_bytes())
             .sum()
+    }
+
+    /// How full the recovery tables are at `now` (walks every table).
+    #[cfg(feature = "metrics")]
+    pub(crate) fn recovery_load(&self, now: Duration) -> RecoveryLoad {
+        let now_ms = millis(now);
+        let capped = self.per_shard_cap < MAX_SLOTS;
+        let per_shard = if capped {
+            (self.table.buckets * BUCKET_RECORDS) as u64
+        } else {
+            0
+        };
+        let mut load = RecoveryLoad::default();
+        for shard in &self.shards {
+            let map = sync::read(&shard.map);
+            let (records, cells) = map.recovery.live(now_ms);
+            load.debts_held += records;
+            load.debt_capacity += per_shard;
+            load.overflow_cells_live += cells;
+            if per_shard > 0 {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a ratio of counts far below 2^52"
+                )]
+                let fill = records as f64 / per_shard as f64;
+                load.fullest_shard = load.fullest_shard.max(fill);
+            }
+        }
+        if capped && !self.table.forget {
+            load.overflow_cells = (self.table.cells * self.shards.len()) as u64;
+        }
+        load
     }
 
     /// The counters summed across every shard.
@@ -1622,6 +1680,115 @@ impl Keyed {
     pub(crate) fn shard_count(&self) -> usize {
         keyed!(self, store: State => store.shard_count())
     }
+
+    /// See [`Store::recovery_load`].
+    #[cfg(feature = "metrics")]
+    pub(crate) fn recovery_load(&self, now: Duration) -> RecoveryLoad {
+        keyed!(self, store: State => store.recovery_load(now))
+    }
+}
+
+/// Rate-limited `tracing` warnings for the events an operator must act on:
+/// newcomers refused because a shard is saturated, debts spilling past the
+/// exact table, and debts dropped. Each kind warns at its first occurrence
+/// and then at most once per [`WARN_INTERVAL_MS`], with the count since the
+/// last warning. Touched only on those slow paths, never on a check.
+#[cfg(feature = "tracing")]
+struct Warnings {
+    refused: WarnEvery,
+    overflowed: WarnEvery,
+    forgotten: WarnEvery,
+}
+
+/// The least time between two warnings of one kind.
+#[cfg(feature = "tracing")]
+const WARN_INTERVAL_MS: u64 = 60_000;
+
+#[cfg(feature = "tracing")]
+impl Warnings {
+    fn new() -> Self {
+        Self {
+            refused: WarnEvery::new(),
+            overflowed: WarnEvery::new(),
+            forgotten: WarnEvery::new(),
+        }
+    }
+
+    fn refused(&self, now_ms: u64) {
+        if let Some(count) = self.refused.note(1, now_ms) {
+            tracing::warn!(
+                target: "rate_net::eviction",
+                refused = count,
+                "rate-net: a shard is saturated with still-limited keys whose debts \
+                 cannot be kept, so {count} new key(s) were refused with a retry \
+                 time (Overflow::FailClosed); raise the eviction cap"
+            );
+        }
+    }
+
+    fn reclaimed(&self, reclaimed: &Reclaimed, now_ms: u64) {
+        if reclaimed.overflowed > 0 {
+            if let Some(count) = self.overflowed.note(reclaimed.overflowed as u64, now_ms) {
+                tracing::warn!(
+                    target: "rate_net::eviction",
+                    overflowed = count,
+                    "rate-net: {count} evicted debt(s) did not fit the exact recovery \
+                     table and spilled into the shared sketch, which can charge keys \
+                     that never owed anything (Overflow::FailClosed); raise the \
+                     eviction cap"
+                );
+            }
+        }
+        if reclaimed.forgotten > 0 {
+            if let Some(count) = self.forgotten.note(reclaimed.forgotten as u64, now_ms) {
+                tracing::warn!(
+                    target: "rate_net::eviction",
+                    forgotten = count,
+                    "rate-net: {count} evicted debt(s) did not fit the exact recovery \
+                     table and were dropped, so those keys may return with a fresh \
+                     allowance (Overflow::Forget); raise the eviction cap"
+                );
+            }
+        }
+    }
+}
+
+/// One kind of rate-limited warning: events since the last warning, and when
+/// it was.
+#[cfg(feature = "tracing")]
+struct WarnEvery {
+    pending: AtomicU64,
+    /// Milliseconds since the epoch of the last warning; `u64::MAX` for none.
+    last_ms: AtomicU64,
+}
+
+#[cfg(feature = "tracing")]
+impl WarnEvery {
+    fn new() -> Self {
+        Self {
+            pending: AtomicU64::new(0),
+            last_ms: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Counts `count` events at `now_ms`; returns the total to report if a
+    /// warning is due (the first event, or the interval has passed).
+    fn note(&self, count: u64, now_ms: u64) -> Option<u64> {
+        let pending = self.pending.fetch_add(count, Ordering::Relaxed) + count;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        let due = last == u64::MAX || now_ms.saturating_sub(last) >= WARN_INTERVAL_MS;
+        if due
+            && self
+                .last_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let _taken = self.pending.fetch_sub(pending, Ordering::Relaxed);
+            Some(pending)
+        } else {
+            None
+        }
+    }
 }
 
 /// Whole milliseconds in `now`, saturating.
@@ -1650,18 +1817,18 @@ mod tests {
     use crate::key::Key;
     use crate::quota::Quota;
 
-    /// A store under [`Overflow::FailClosed`], whose sketch most of these
-    /// tests exercise; [`Overflow::Forget`] tests ask for it explicitly.
+    /// A store under the default [`Overflow::FailClosed`];
+    /// [`Overflow::Forget`] tests ask for it explicitly.
     fn make_store(shards: usize, eviction: Eviction) -> Store<BucketCore> {
-        Store::new(
-            shards,
-            eviction.with_overflow(Overflow::FailClosed),
-            Duration::ZERO,
-        )
+        Store::new(shards, eviction, Duration::ZERO)
     }
 
     fn make_forgetting_store(shards: usize, max_keys: usize) -> Store<BucketCore> {
-        Store::new(shards, Eviction::capacity(max_keys), Duration::ZERO)
+        Store::new(
+            shards,
+            Eviction::capacity(max_keys).with_overflow(Overflow::Forget),
+            Duration::ZERO,
+        )
     }
 
     fn at(ms: u64) -> Duration {

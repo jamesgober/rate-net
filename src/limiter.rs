@@ -135,9 +135,12 @@ pub trait Limiter {
 /// `Limiter`'s methods are generic over `impl Into<Key>`, which keeps call
 /// sites short but means `dyn Limiter` cannot exist. `DynLimiter` has one
 /// non-generic method, so `&dyn DynLimiter`, `Box<dyn DynLimiter>`, and
-/// `Arc<dyn DynLimiter + Send + Sync>` all work — the shape middleware wants
-/// when the limiter is chosen at runtime. Every [`Limiter`] implements it
-/// automatically, and the trait objects implement `Limiter` again, so the
+/// `Arc<dyn DynLimiter>` all work — the shape middleware wants when the
+/// limiter is chosen at runtime. It requires `Send + Sync`, so every
+/// `dyn DynLimiter` can be shared across threads without spelling the bounds
+/// out (`dyn DynLimiter + Send + Sync` remains the same thing). Every
+/// `Send + Sync` [`Limiter`] implements it automatically, and the trait
+/// objects implement `Limiter` again, so the
 /// ergonomic `check` / `check_n` stay available on them.
 ///
 /// # Examples
@@ -147,19 +150,19 @@ pub trait Limiter {
 /// use std::sync::Arc;
 ///
 /// // Pick an implementation at runtime and hold it as a trait object.
-/// let limiter: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(1));
+/// let limiter: Arc<dyn DynLimiter> = Arc::new(RateLimiter::per_second(1));
 ///
 /// assert!(limiter.check_key("user:42".into(), 1).is_allow());
 /// // The trait object is itself a `Limiter`, so the generic helpers work too.
 /// assert!(limiter.check("user:42").is_deny());
 /// ```
-pub trait DynLimiter {
+pub trait DynLimiter: Send + Sync {
     /// Checks `n` units against `key`. The non-generic core of
     /// [`Limiter::check_n`].
     fn check_key(&self, key: Key, n: u32) -> Decision;
 }
 
-impl<L: Limiter> DynLimiter for L {
+impl<L: Limiter + Send + Sync> DynLimiter for L {
     #[inline]
     fn check_key(&self, key: Key, n: u32) -> Decision {
         self.check_n(key, n)
@@ -908,6 +911,35 @@ impl<C: Clock + Clone> RateLimiter<C> {
         let mut metrics = self.store.metrics();
         self.counters.add_to(&mut metrics);
         metrics
+    }
+
+    /// How full the recovery tables are — the gauge to alert on before the
+    /// store runs out of room to keep evicted keys' debts (see
+    /// [`RecoveryLoad`](crate::RecoveryLoad) and [`Eviction`]).
+    ///
+    /// Walks every shard's recovery table under its read lock (up to 32 bytes
+    /// per key of capacity), so call it from a periodic exporter — every few
+    /// seconds — never per request. Requires the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Eviction, RateLimiter};
+    ///
+    /// let limiter = RateLimiter::per_minute(1)
+    ///     .with_shards(1)
+    ///     .with_eviction(Eviction::capacity(64));
+    /// for user in 0..100u64 {
+    ///     let _ = limiter.check(user); // each one drained, then evicted
+    /// }
+    /// let load = limiter.recovery_load();
+    /// assert_eq!(load.debts_held, 36);
+    /// assert!(load.utilization() < 0.7, "plenty of room");
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn recovery_load(&self) -> crate::RecoveryLoad {
+        self.store.recovery_load(self.now())
     }
 
     /// The shared check path: read the clock once, apply the key-length

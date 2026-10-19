@@ -10,9 +10,9 @@
 //! Four scenarios: no flood; a flood of keys that recover at once (each
 //! eviction is lossless); and a flood of keys that each drain a slow quota, so
 //! every eviction must record the key's debt in the recovery table — which the
-//! flood overloads — under the default `Overflow::Forget` (the overflow is
-//! dropped) and under `Overflow::FailClosed` (it spills into the shared
-//! sketch). The legitimate keys run on a quota they never exhaust (a per-key
+//! flood overloads — under the default `Overflow::FailClosed` (the overflow
+//! spills into the shared sketch) and under `Overflow::Forget` (it is
+//! dropped). The legitimate keys run on a quota they never exhaust (a per-key
 //! override), so every timed check is admitted.
 //!
 //! In `1.0.0` each flood insert scanned its whole shard under the shard's write
@@ -66,7 +66,7 @@ fn main() {
             Flood::None,
             Flood::Recovering,
             Flood::Draining,
-            Flood::DrainingFailClosed,
+            Flood::DrainingForget,
         ] {
             let report = run(flood, duration);
             println!(
@@ -92,10 +92,10 @@ enum Flood {
     /// is evicted.
     Recovering,
     /// Unique keys that each spend a 1-per-minute quota: every eviction
-    /// records a debt (`Overflow::Forget`).
+    /// records a debt (the default `Overflow::FailClosed`).
     Draining,
-    /// The same under `Overflow::FailClosed`.
-    DrainingFailClosed,
+    /// The same under `Overflow::Forget`.
+    DrainingForget,
 }
 
 impl Flood {
@@ -104,7 +104,7 @@ impl Flood {
             Self::None => "no flood",
             Self::Recovering => "flood, recovered keys",
             Self::Draining => "flood, drained keys",
-            Self::DrainingFailClosed => "same, FailClosed",
+            Self::DrainingForget => "same, Forget",
         }
     }
 }
@@ -122,11 +122,11 @@ fn run(flood: Flood, duration: Duration) -> Report {
     // A rate no legitimate key will exhaust, so every timed check is admitted;
     // in the draining scenario, flood keys (below LEGIT_BASE) get one unit a
     // minute instead.
-    let draining = matches!(flood, Flood::Draining | Flood::DrainingFailClosed);
-    let overflow = if flood == Flood::DrainingFailClosed {
-        Overflow::FailClosed
-    } else {
+    let draining = matches!(flood, Flood::Draining | Flood::DrainingForget);
+    let overflow = if flood == Flood::DrainingForget {
         Overflow::Forget
+    } else {
+        Overflow::FailClosed
     };
     let limiter = Arc::new(
         RateLimiter::builder()

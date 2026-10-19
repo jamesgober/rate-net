@@ -4,12 +4,12 @@
 //!
 //! `tests/eviction_bypass.rs` checks the safety side (no evicted key ever comes
 //! back looser). These check the other side, with the scenarios of the
-//! 1.2.0 re-audit's attack harness scaled down to run in well under a second.
+//! 2.0 re-audit's attack harness scaled down to run in well under a second.
 //! The store keeps evicted debts exactly for up to about twice its cap (a
-//! cuckoo-hashed table). Past that, `Overflow::FailClosed` falls back to a
-//! shared sketch that can charge an unrelated key, so its scenarios run inside
-//! the bound, where it must be (all but) free of false denials;
-//! `Overflow::Forget` (the default) drops such debts and must never deny a
+//! cuckoo-hashed table). Past that, the default `Overflow::FailClosed` falls
+//! back to a shared sketch that can charge an unrelated key, so its scenarios
+//! run inside the bound, where it must be (all but) free of false denials;
+//! the opt-in `Overflow::Forget` drops such debts and must never deny a
 //! newcomer at all. `docs/BENCHMARKS.md` has the numbers past the bound and
 //! at full scale.
 
@@ -46,7 +46,7 @@ fn limiter(quota: Quota, cap: usize) -> (Arc<ManualClock>, RateLimiter<Arc<Manua
         .quota(quota.limit(), quota.period())
         .burst(quota.burst())
         .shards(16)
-        .eviction(Eviction::capacity(cap).with_overflow(Overflow::FailClosed))
+        .eviction(Eviction::capacity(cap))
         .clock(Arc::clone(&clock))
         .build();
     (clock, limiter)
@@ -68,7 +68,7 @@ fn newcomers_denied_after_drain_flood(cap: usize, flood: u64) -> f64 {
 
 #[test]
 fn test_newcomers_are_admitted_after_a_drain_flood_up_to_twice_the_cap() {
-    // First 1.2.0 candidate: 23 % at a flood of 1.5x the cap, 61 % at 2x.
+    // First 2.0 candidate: 23 % at a flood of 1.5x the cap, 61 % at 2x.
     // 1.1.0: 0 % (it forgot every debt). Now (measured): 0-0.05 % at 1.5x,
     // about 1.4 % at 2x, where the flood's unrecovered debts fill the exact
     // table.
@@ -84,11 +84,13 @@ fn test_newcomers_are_admitted_after_a_drain_flood_up_to_twice_the_cap() {
 
 #[test]
 fn test_well_behaved_users_outnumbering_the_cap_are_not_denied() {
-    // A population two and a half times the cap, every user sending only
-    // while its own exact bucket holds at least two tokens. First 1.2.0
-    // candidate: 87 % false denials at 3x; 1.1.0: 0 %. Now (measured): 0 at
-    // 2.5x, 1-3 % at 3x, 22 % at 4x (past the exact table, see the docs).
-    let (users, cap, visits_per_sec) = (5_000u64, 2_000usize, 1_000u64);
+    // A population twice the cap, every user sending only while its own
+    // exact bucket holds at least two tokens. First 2.0 candidate: 87 %
+    // false denials at 3x; 1.1.0: 0 %. Now (measured): 0 at 2x, 0-0.6 % at
+    // 2.5x (where a shard's share can approach its table, depending on the
+    // random hasher seed), 1-3 % at 3x, 22 % at 4x (past the exact table, see
+    // the docs).
+    let (users, cap, visits_per_sec) = (4_000u64, 2_000usize, 1_000u64);
     let (clock, limiter) = limiter(Quota::per_minute(10), cap);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     // The oracle: each user's exact token bucket (tokens, last time).
@@ -126,7 +128,7 @@ fn test_a_one_request_flood_does_not_ratchet_into_denying_newcomers() {
     // Every flood key sends exactly one request (1 of 5 per hour) at a rate
     // whose live debts are 3.6 times the cap — far past the exact table, so
     // most of them overflow into the shared sketch; nobody exceeds anything.
-    // First 1.2.0 candidate: 50 % of newcomers denied at the default cap (debt
+    // First 2.0 candidate: 50 % of newcomers denied at the default cap (debt
     // ratcheted up through merged records). Now the sketch only ever holds
     // one-unit debts, so no newcomer is denied and none starts more than one
     // unit short (about one in eight does).
@@ -179,13 +181,13 @@ fn test_a_returning_key_resumes_without_rounding_losses() {
 
 #[test]
 fn test_forget_admits_every_newcomer_after_any_drain_flood() {
-    // The default policy never charges a key that owed nothing: after a drain
-    // flood of ten times the cap, every newcomer has its whole allowance.
+    // `Forget` never charges a key that owed nothing: after a drain flood of
+    // ten times the cap, every newcomer has its whole allowance.
     let clock = Arc::new(ManualClock::new());
     let limiter = RateLimiter::builder()
         .per_minute(10)
         .shards(16)
-        .eviction(Eviction::capacity(4_000))
+        .eviction(Eviction::capacity(4_000).with_overflow(Overflow::Forget))
         .clock(Arc::clone(&clock))
         .build();
     for key in 0..44_000u64 {

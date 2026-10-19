@@ -7,7 +7,7 @@
 //! rather than producing a limiter that silently misbehaves.
 //!
 //! [`RateLimiterError`] and [`InsufficientCapacity`] implement
-//! `error_forge::ForgeError` under the `std` feature, so they slot into the
+//! `error_forge::ForgeError` under the `forge` feature, so they slot into the
 //! portfolio error stack (kinds, captions, the central error hook) the same way
 //! every other domain error does. Both implement [`core::error::Error`] in every
 //! build, `no_std` included.
@@ -74,7 +74,7 @@ pub enum RateLimiterError {
 
 impl RateLimiterError {
     /// A stable, machine-readable name for the variant.
-    #[cfg(feature = "std")]
+    #[cfg(feature = "forge")]
     const fn name(self) -> &'static str {
         match self {
             Self::ZeroQuota => "ZeroQuota",
@@ -105,7 +105,7 @@ impl fmt::Display for RateLimiterError {
 
 impl core::error::Error for RateLimiterError {}
 
-#[cfg(feature = "std")]
+#[cfg(feature = "forge")]
 impl error_forge::ForgeError for RateLimiterError {
     fn kind(&self) -> &'static str {
         self.name()
@@ -180,7 +180,7 @@ impl fmt::Display for InsufficientCapacity {
 
 impl core::error::Error for InsufficientCapacity {}
 
-#[cfg(feature = "std")]
+#[cfg(feature = "forge")]
 impl error_forge::ForgeError for InsufficientCapacity {
     fn kind(&self) -> &'static str {
         "InsufficientCapacity"
@@ -196,8 +196,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::{InsufficientCapacity, RateLimiterError};
+    #[cfg(feature = "forge")]
     use error_forge::ForgeError;
 
+    #[cfg(feature = "forge")]
     const ALL: [RateLimiterError; 7] = [
         RateLimiterError::ZeroQuota,
         RateLimiterError::ZeroPeriod,
@@ -231,6 +233,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "forge")]
     #[test]
     fn test_forge_kind_matches_variant() {
         for err in ALL {
@@ -239,6 +242,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "forge")]
     #[test]
     fn test_config_errors_are_not_retryable() {
         // A bad configuration will not fix itself on retry.
@@ -252,9 +256,12 @@ mod tests {
         let err = InsufficientCapacity::new(42);
         assert_eq!(err.requested(), 42);
         assert!(err.to_string().contains("42"));
-        assert_eq!(err.kind(), "InsufficientCapacity");
-        assert_ne!(err.caption(), "");
-        assert!(!err.is_retryable());
+        #[cfg(feature = "forge")]
+        {
+            assert_eq!(err.kind(), "InsufficientCapacity");
+            assert_ne!(err.caption(), "");
+            assert!(!err.is_retryable());
+        }
         let boxed: Box<dyn std::error::Error> = Box::new(err);
         assert!(boxed.to_string().contains("exceeds"));
     }

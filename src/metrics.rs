@@ -74,17 +74,23 @@ pub struct Metrics {
     /// the limiter is under a flood. See [`Eviction`](crate::Eviction).
     pub debts_overflowed: u64,
     /// Debts of still-limited evicted keys that were dropped because the exact
-    /// recovery table was full, under [`Overflow::Forget`](crate::Overflow)
-    /// (the default): such a key may come back with a fresh allowance. Not
+    /// recovery table was full, under the opt-in
+    /// [`Overflow::Forget`](crate::Overflow): such a key may come back with a
+    /// fresh allowance. Not
     /// counted within `keys_remembered`. A steady rate means more keys are
     /// being limited at once than about twice the cap — raise the cap, or
     /// choose [`Overflow::FailClosed`](crate::Overflow) if no key may ever be
     /// reset.
     pub debts_forgotten: u64,
-    /// New keys refused because their shard was saturated: full, and every
-    /// examined key still limited with nowhere to record its debt. The store
-    /// failing closed; any non-zero rate means the cap is far too small for
-    /// the traffic, or a flood is in progress.
+    /// **The saturation counter.** New keys refused (with a retry time)
+    /// because their shard was saturated under
+    /// [`Overflow::FailClosed`](crate::Overflow): full, and every examined
+    /// key still limited with nowhere to record its debt. These may be
+    /// legitimate users. Alert on any non-zero rate; the
+    /// [`RecoveryLoad`] gauge rises well before it starts, and the `tracing`
+    /// feature logs a warning on the first refusal and once a minute while
+    /// they continue. Any refusal means the cap is too small for the traffic,
+    /// or a flood is in progress.
     pub keys_refused: u64,
     /// Checks refused because the key exceeded the limiter's maximum key
     /// length (`Builder::max_key_len`). Counted within `denied`; such keys are
@@ -247,5 +253,51 @@ mod tests {
                 keys_rejected: 2,
             }
         );
+    }
+}
+
+/// How full the store's recovery tables are: the gauge to alert on **before**
+/// eviction starts to fail — before [`Overflow::FailClosed`](crate::Overflow)
+/// charges or refuses keys that owed nothing, or
+/// [`Overflow::Forget`](crate::Overflow) starts dropping debts. From
+/// [`RateLimiter::recovery_load`](crate::RateLimiter::recovery_load).
+///
+/// Each shard keeps the debts of its evicted, still-limited keys exactly, up
+/// to `debt_capacity / shards` of them; past that, the overflow policy takes
+/// over. Shards fill independently, so watch [`fullest_shard`](Self::fullest_shard)
+/// as well as the aggregate [`utilization`](Self::utilization): alert well
+/// before either reaches `1.0` (say at `0.7`), and size the cap up.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
+pub struct RecoveryLoad {
+    /// Live exact debt records: evicted keys still owed, across all shards.
+    pub debts_held: u64,
+    /// The exact records the tables hold when full (whether or not a shard has
+    /// allocated its table yet).
+    pub debt_capacity: u64,
+    /// The largest per-shard fraction of exact records in use, `0.0..=1.0`.
+    pub fullest_shard: f64,
+    /// Live cells of the shared overflow sketch ([`Overflow::FailClosed`](crate::Overflow)
+    /// only): debts that did not fit the exact table, which may charge keys
+    /// that never owed anything.
+    pub overflow_cells_live: u64,
+    /// The sketch's cells (zero under `Overflow::Forget`).
+    pub overflow_cells: u64,
+}
+
+impl RecoveryLoad {
+    /// The fraction of exact debt records in use, across all shards
+    /// (`debts_held / debt_capacity`; `0.0` for an uncapped store).
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "a ratio of counts far below 2^52"
+    )]
+    pub fn utilization(&self) -> f64 {
+        if self.debt_capacity == 0 {
+            0.0
+        } else {
+            self.debts_held as f64 / self.debt_capacity as f64
+        }
     }
 }
