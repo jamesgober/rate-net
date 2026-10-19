@@ -14,7 +14,7 @@
 </div>
 <br>
 
-> Numbers recorded for `v1.2.0`. Treat absolute numbers as machine-specific;
+> Numbers recorded for `v2.0.0`. Treat absolute numbers as machine-specific;
 > the relative shape between paths, the before/after, and the head-to-head are
 > the signal.
 
@@ -69,13 +69,13 @@ hence the round numbers.
 `bench` profile (`opt-level = 3`, fat LTO, one codegen unit), against
 `better-bucket` 1.1.0. The machine was **shared with several other build and
 test jobs** (40–90 % CPU load) throughout. To keep the comparison fair, `v1.1.0`
-(from crates.io, the identical benchmark code in a scratch crate) and `v1.2.0`
+(from crates.io, the identical benchmark code in a scratch crate) and `v2.0.0`
 were run back to back, alternately, several times; the table gives the best run
 of each, and anything within ~10 % is noise at this load.
 
 ## Results
 
-| Benchmark | v1.1.0 | v1.2.0 |
+| Benchmark | v1.1.0 | v2.0.0 |
 |-----------|-------:|-------:|
 | `check/single_key` | 60.6 ns | 59.1 ns |
 | `check/single_key_coarse_clock` | 36.3 ns | 37.5 ns |
@@ -88,6 +88,7 @@ of each, and anything within ~10 % is noise at this load.
 | `check/direct` | 38.1 ns | 37.2 ns |
 | `check/direct_coarse_clock` | 12.2 ns | 11.1 ns |
 | `peek/existing_key` | 80.4 ns | 54.1 ns |
+| `check/blocked_key` (a key whose quota admits nothing) | — | 53 ns |
 
 Legitimate-key check latency, default limiter at its cap:
 
@@ -95,12 +96,12 @@ Legitimate-key check latency, default limiter at its cap:
 |----------|----:|----:|------:|
 | no flood | 100 ns | 100 ns | 300 ns |
 | flood of recovered keys | 100 ns | 300 ns | 500–600 ns |
-| flood of drained keys (every eviction records a debt), `Overflow::Forget` | 100 ns | 400 ns | 1.3 µs |
-| the same, `Overflow::FailClosed` | 100 ns | 600 ns | 1.2 µs |
+| flood of drained keys (every eviction records a debt), default `Overflow::FailClosed` | 100 ns | 600 ns | 1.2 µs |
+| the same, `Overflow::Forget` | 100 ns | 400 ns | 1.3 µs |
 | `v1.1.0`, flood | 100 ns | 300–500 ns | 0.5–1.0 µs |
 | `v1.0.0`, flood (audit, 2026-10-13) | — | — | 128 µs |
 
-(Flood rows re-run on the final 1.2.0 build, 2026-10-14, same host at about
+(Flood rows re-run on the final 2.0.0 build, 2026-10-14, same host at about
 40 % load.)
 
 The maximum is not in the table: on this loaded host it was set by the OS
@@ -137,7 +138,7 @@ What changed:
 ## Known issue: new key at capacity (+58 ns)
 
 When the key table is full, inserting a never-seen key costs about +58 ns:
-`check/insert_at_default_cap` is **293 ns in 1.1.0 and 351 ns in 1.2.0**
+`check/insert_at_default_cap` is **293 ns in 1.1.0 and 351 ns in 2.0.0**
 (criterion medians, best of several alternating runs on the loaded host above,
 so approximate). Eviction checks that each candidate has fully recovered
 before evicting it — the price of never resetting a still-limited key — and
@@ -147,25 +148,28 @@ are unaffected, and below the cap nothing changes.
 A second measurement, with less scheduler noise: each variant built as its own
 binary, one fresh process per measurement, pinned to one core, the variants
 alternated round by round (6 rounds), median per variant — `1.1.0` ~242 ns,
-`1.2.0` ~250 ns. The 1.2.0 build already includes one small, cheap,
+`2.0.0` ~250 ns. The 2.0.0 build already includes one small, cheap,
 guarantee-preserving improvement: each slot keeps a "recovers at" hint beside
 its CLOCK reference bit, so a candidate already seen to have recovered is not
 re-read. The deeper fixes (a dense coarse recovery tick derived from the
 bucket state when it is written anyway, storing the state inline in the slot,
 prefetching the next candidate) have **not yet been attempted**. The cost is
-shipped as a known issue, to be revisited and optimised in a future release.
+shipped as a known issue, to be optimised in a future release; it is a
+blocker for the next minor release, 2.1.0.
 
 ## Liveness under eviction pressure
 
 A still-limited key that is evicted keeps its debt, exactly and without
 affecting any other key, while the store's still-limited evicted keys fit
 about twice the cap (`tests/eviction_bypass.rs`, `tests/eviction_liveness.rs`).
-Past that, `Overflow::Forget` (the default) drops the debts that do not fit and
-`Overflow::FailClosed` keeps them in a shared sketch that can charge or refuse
-keys that never owed anything. Measured with the 1.2.0 re-audit's harness
-(ManualClock, 128 shards; re-run on the final build, 2026-10-14):
+Past that, the default `Overflow::FailClosed` keeps them in a shared sketch
+that can charge or refuse keys that never owed anything, and the opt-in
+`Overflow::Forget` drops the debts that do not fit. Measured with the 2.0
+re-audit's harness (ManualClock, 128 shards; re-run on the final build,
+2026-10-14; "first candidate" is the first 2.0 candidate, then numbered
+1.2.0):
 
-| Scenario | First 1.2.0 candidate | 1.2.0 `Forget` | 1.2.0 `FailClosed` | 1.1.0 |
+| Scenario | First candidate | 2.0.0 `Forget` | 2.0.0 `FailClosed` (default) | 1.1.0 |
 |----------|---------------------:|------:|------:|------:|
 | Newcomers denied after a drain flood of 1.5x the cap (cap 100,000) | 23 % | 0 % | 0 % | 0 % |
 | … 2x the cap | 61 % | 0 % | 0 % | 0 % |
@@ -178,23 +182,35 @@ keys that never owed anything. Measured with the 1.2.0 re-audit's harness
 | … 10x the cap, 5,000 visits/s | 89 % | 0 % | 4.2 % | 0 % |
 | … 10x the cap, 20,000 visits/s | — | 0 % | 72 % | 0 % |
 | … 2x the cap (cap 50,000) | 0.6 % | 0 % | 0 % | 0 % |
-| Configurations with over-admission, of 60 capacity-eviction bypass runs (500 drained victims; caps 64 and 10,000; floods 2–100x) | 0 | 48 | 0 | — |
-| Real-clock race, 4 drained victims vs drain-flood threads (cap 32): max units a victim got (bound 141–160) | 140 | up to 548,000 | 140 | — |
+| Configurations with over-admission, of 60 capacity-eviction bypass runs (500 drained victims; caps 64 and 10,000; floods 2–100x) | 0 | 48 | 0 | every one in which a victim is evicted (1.1.0 forgot every debt) |
+| Real-clock race, 4 drained victims vs drain-flood threads (cap 32): max units a victim got (bound 141–160) | 140 | up to 548,000 | 140 | unbounded: every eviction reset the victim |
 
 The population rows depend on churn, not on the population: the binding
 quantity is how many still-limited keys are evicted within one recovery period
 (the eviction rate times the recovery time), against about twice the cap.
 
+The 1.1.0 column's bypass and race cells are stated, not re-measured: 1.1.0
+evicted without recording anything, so every eviction of a still-limited key
+reset it — the 2026-10-13 audit's RN-005, which `tests/eviction_bypass.rs`
+reproduces against 1.1.0 for every algorithm. It behaves like `Forget` with no
+exact table at all, which is also why it never denied a newcomer.
+
 `Forget` never denies a key that owed nothing, and resets evicted keys only
 once more of them are owed at once than the table holds — then, under a
 sustained flood, over and over (the last two rows). `FailClosed` never resets a
-key, and denies keys that owed nothing once the same bound is passed. Choose
-`FailClosed` for limiters keyed by identities an attacker can target; see the
-README's "Choosing an overflow policy".
+key, and denies keys that owed nothing once the same bound is passed. `FailClosed`
+is the default; opt into `Forget` only where availability beats strictness.
+See the README's "Choosing an overflow policy" and "Sizing the cap".
 
 Memory at the default cap after twice the cap of drained churn (counting
-allocator): 138 MiB of per-key state, plus 32 MiB of recovery tables under
-`Forget` (170 MiB) or 64 MiB under `FailClosed` (202 MiB).
+allocator): 138 MiB of per-key state, plus 64 MiB of recovery tables under
+`FailClosed` (202 MiB) or 32 MiB under `Forget` (170 MiB).
+
+The guardrails cost nothing on the check path: `check/single_key` with the
+`metrics` feature measured 57.5 / 58.9 ns without `tracing` and 57.4 / 61.2 ns
+with it (two alternating runs; within noise). `recovery_load()` walks the
+recovery tables (up to 64 bytes per key of capacity) and is meant for a
+periodic exporter, not the request path.
 
 ### A blocked key
 
@@ -207,7 +223,7 @@ shard sees p50 400 ns and p99.9 1.5 µs (before: 2.2 µs and 30.9 µs).
 
 `governor` (0.10.4) is a benchmark-only dependency gated behind
 `cfg(comparison)` so it never enters the default tree or CI. The table below
-was measured at `v1.1.0`; an attempt to re-run it for `v1.2.0` coincided with
+was measured at `v1.1.0`; an attempt to re-run it during the 2.0 cycle coincided with
 the host's heaviest load and produced numbers 3–10x off for *both* crates, so it
 is not reported. rate-net's own paths measured within noise of `v1.1.0` above
 (the keyed check slightly faster), so the comparison is expected to stand. Run:
@@ -255,8 +271,8 @@ with no automatic eviction. The many-key gap is the same cost.
 
 ## What's next
 
-- The ~58 ns an at-capacity insert gained in `1.2.0` is a known issue to be
-  resolved in a future release (see above): keeping a coarse recovery tick or
+- The ~58 ns an at-capacity insert gained in `2.0.0` is a known issue to be
+  resolved by the next minor release, 2.1.0 (see above): keeping a coarse recovery tick or
   the state itself beside the CLOCK reference bit would avoid the extra cache
   line per candidate.
 - A lock-free read path for existing keys (an epoch- or seqlock-protected index)
