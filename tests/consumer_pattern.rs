@@ -101,7 +101,8 @@ fn test_shared_gatekeeper_across_threads_holds_per_client_limits() {
             for _ in 0..PASSES {
                 for client in 0..CLIENTS {
                     if admit(&*limiter, client) == Verdict::Serve {
-                        let _ = served[client as usize].fetch_add(1, Ordering::Relaxed);
+                        let _ = served[usize::try_from(client).unwrap()]
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -113,7 +114,7 @@ fn test_shared_gatekeeper_across_threads_holds_per_client_limits() {
 
     for client in 0..CLIENTS {
         assert_eq!(
-            served[client as usize].load(Ordering::Relaxed),
+            served[usize::try_from(client).unwrap()].load(Ordering::Relaxed),
             LIMIT,
             "client {client} served the wrong count under concurrency"
         );

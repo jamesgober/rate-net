@@ -19,12 +19,15 @@
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 > Every Rust example on this page is compiled and run as a doctest.
 >
-> **Stable (`v1.1.0`).** The public surface is frozen until `2.0`; `1.1` adds
-> to it without changing anything `1.0` offered (one method is deprecated). Every
-> public type is asserted `Send + Sync + 'static` at compile time. The leaky
-> bucket and window algorithms require the `algorithms` feature, `AsyncLimiter`
-> and the `try_until_ready` methods require `async`, and `metrics()` requires
-> `metrics`. With `std` off, only the [`no_std` core](#the-no_std-core) remains.
+> **Stable (`v2.0.0`).** The public surface is frozen until `3.0`; each `2.x`
+> adds to it without changing anything earlier `2.x` releases offered (two
+> methods are deprecated since `1.1`). What changed from `1.x` is listed in
+> [`MIGRATION_1_TO_2.md`](./MIGRATION_1_TO_2.md). Every public type is asserted `Send + Sync + 'static`
+> at compile time. The leaky bucket and window algorithms require the
+> `algorithms` feature, `AsyncLimiter` and the awaiting methods require `async`,
+> `metrics()` requires `metrics`, and the [`tower`](#tower-middleware) module
+> requires `tower`. With `std` off, only the [`no_std` core](#the-no_std-core)
+> remains.
 
 ## Table of Contents
 
@@ -33,6 +36,7 @@
   - [`RateLimiter`](#ratelimiter)
     - [Constructors and adjusters](#constructors-and-adjusters)
     - [`check` / `check_n`](#check--check_n)
+    - [Borrowed keys: `check_bytes` / `check_n_bytes` / `peek_bytes`](#borrowed-keys)
     - [`peek`](#peek)
     - [Key management: `reset` / `remove` / `clear` / `retain_recent` / `shrink_to_fit`](#key-management)
     - [Introspection](#introspection)
@@ -54,8 +58,10 @@
   - [`RateLimiterError`](#ratelimitererror)
   - [`InsufficientCapacity`](#insufficientcapacity)
   - [Constants](#constants)
+- [`tower` middleware](#tower-middleware) _(feature: `tower`)_
 - [The `no_std` core](#the-no_std-core)
 - [Sharding and eviction](#sharding-and-eviction)
+  - [Sizing the cap](#sizing-the-cap)
 - [Algorithms](#algorithms)
 - [Limits and ceilings](#limits-and-ceilings)
 - [Feature flags](#feature-flags)
@@ -163,9 +169,15 @@ The key is anything convertible into a [`Key`](#key).
 
 An existing-key check takes the shard read lock and runs the algorithm's
 accounting (one compare-and-swap for the token bucket, leaky bucket, and fixed
-window; a short per-key mutex for the sliding-window algorithms). It never
-allocates. The first check of a new key takes the shard write lock and may
-evict one other key ([Sharding and eviction](#sharding-and-eviction)).
+window; a short per-key mutex for the sliding-window algorithms). It allocates
+nothing beyond building the `Key` itself, which copies a key longer than 22
+bytes to the heap — use [`check_bytes`](#borrowed-keys) for long keys — except
+that a sliding-window-log key's run-length log grows amortized (a few
+allocations per thousand checks of a high-limit key, until it reaches its
+working size). The first
+check of a new key takes the shard write lock and may evict one other key,
+recording its debt if it still owes ([Sharding and eviction](#sharding-and-eviction)).
+A key whose quota admits nothing is denied without taking the write lock.
 
 ```rust
 use rate_net::{Decision, RateLimiter};
@@ -180,6 +192,31 @@ assert!(limiter.check("tenant:acme").is_deny()); // 10 spent
 assert_eq!(limiter.check_n("other", 11).retry_after(), Some(Duration::MAX));
 ```
 
+#### Borrowed keys
+
+```rust ignore
+pub fn check_bytes(&self, key: impl AsRef<[u8]>) -> Decision
+pub fn check_n_bytes(&self, key: impl AsRef<[u8]>, n: u32) -> Decision
+pub fn peek_bytes(&self, key: impl AsRef<[u8]>) -> Snapshot
+```
+
+The same as `check` / `check_n` / `peek` for a raw key (`&str`, `String`,
+`&[u8]`, `Vec<u8>`, `[u8; N]` — the same identity as `Key::from` of it), but
+the key is only borrowed: the check of an existing key allocates nothing
+whatever its length, and an owned `Key` is built only when the key is first
+stored. Use them on hot paths with long keys — UUIDs, API tokens, JWT subjects.
+
+```rust
+use rate_net::RateLimiter;
+
+let limiter = RateLimiter::per_second(3);
+let token = "9f6c1d2e-8b7a-4c3d-9e1f-0a2b3c4d5e6f";
+assert!(limiter.check_bytes(token).is_allow());
+assert!(limiter.check_n_bytes(token.as_bytes(), 2).is_allow());
+assert!(limiter.check(token).is_deny()); // the same key
+assert_eq!(limiter.peek_bytes(token).remaining(), 0);
+```
+
 #### `peek`
 
 ```rust ignore
@@ -189,8 +226,9 @@ pub fn peek(&self, key: impl Into<Key>) -> Snapshot
 Reads `key`'s allowance without consuming any, returning a
 [`Snapshot`](#snapshot) (capacity, remaining, time until whole). It takes only
 the shard read lock, never creates state (an unseen key reports its full
-allowance), and does not refresh the key's eviction recency. Advisory under
-concurrency.
+allowance under its own quota, and a key evicted while still limited reports
+the debt it will resume with), and does not refresh the key's eviction recency.
+Advisory under concurrency.
 
 ```rust
 use rate_net::RateLimiter;
@@ -213,7 +251,10 @@ pub fn retain_recent(&self) -> usize               // forget fully-recovered key
 pub fn shrink_to_fit(&self)                        // release spare capacity
 ```
 
-`reset` and `remove` return whether the key had state. `retain_recent` removes
+`reset` and `remove` also forget any debt recorded for the key when it was
+evicted ([Sharding and eviction](#sharding-and-eviction)), and return whether
+the key had state or such a debt. `clear` forgets every key and debt.
+`retain_recent` removes
 every key whose allowance has fully recovered — such a key behaves exactly like
 one never seen, so no decision changes — and returns how many it removed; it
 walks each shard in short chunks with the lock released between them.
@@ -243,6 +284,7 @@ limiter.shrink_to_fit();
 
 ```rust ignore
 pub fn quota(&self) -> Quota
+pub fn quota_of(&self, key: impl Into<Key>) -> Quota
 pub const fn algorithm(&self) -> Algorithm
 pub fn shards(&self) -> usize
 pub const fn eviction(&self) -> Eviction
@@ -250,7 +292,10 @@ pub fn tracked_keys(&self) -> usize
 ```
 
 `quota` and `eviction` report the configuration as given (an idle TTL raised
-to the recovery time is reported unraised). `tracked_keys` is a momentary,
+to the recovery time is reported unraised). `quota_of(key)` is the quota a key
+is under: its valid `quota_for` override, a quota with limit `0` if the
+override is invalid (the key fails closed), otherwise `quota()`; it calls the
+resolver each time. `tracked_keys` is a momentary,
 advisory count, bounded by the eviction policy.
 
 ```rust
@@ -300,6 +345,10 @@ pub fn per_minute(self, limit: u32) -> Self
 pub fn burst(self, burst: u32) -> Self       // token / leaky bucket capacity
 pub fn shards(self, shards: usize) -> Self
 pub fn eviction(self, Eviction) -> Self
+pub fn max_key_len(self, len: usize) -> Self                 // refuse longer keys
+pub fn digest_keys_longer_than(self, len: usize) -> Self     // store longer keys as a 16-byte digest
+pub fn quota_for<F>(self, resolve: F) -> Self                // per-key quota overrides
+    where F: Fn(&Key) -> Option<Quota> + Send + Sync + 'static
 pub fn clock<C2: Clock + Clone>(self, C2) -> Builder<C2>
 
 pub fn try_build(self) -> Result<RateLimiter<C>, RateLimiterError>
@@ -325,8 +374,50 @@ sharding, bounded eviction, `SystemClock`); the quota defaults to a limit of
   to one unit per nanosecond; a short idle TTL is raised to the recovery time;
   a shard count is clamped to `1..=MAX_SHARDS`.
 - **`try_build_direct` / `build_direct`** build a [`DirectLimiter`](#directlimiter)
-  from the same algorithm, quota, burst, and clock (shards and eviction are
-  ignored).
+  from the same algorithm, quota, burst, and clock (shards, eviction, and the
+  key options are ignored).
+
+Three key options shape per-key behaviour:
+
+- **`quota_for(resolve)`** — tiered limits from one limiter. `resolve` is called
+  with a key when it is about to be stored (and when an untracked key is
+  peeked or passed to `quota_of`); `Some(quota)` gives the key that quota,
+  `None` the default. It is never called for a tracked key. It runs on the
+  caller's thread **before the limiter takes any lock**, so it never blocks
+  other keys and may call into the limiter for *other* keys — but it must not
+  check the key it is resolving (that recurses), should be fast (it delays the
+  first request of every new key), and must be deterministic for a key (an
+  evicted key that returns is resolved again). A panic propagates to the
+  caller; nothing is stored. An override is validated like `try_build`
+  validates the default quota (zero limit, period, or bucket burst; a leaky
+  bucket above one unit per nanosecond; a sliding-window-log limit above
+  `MAX_SLIDING_LOG_LIMIT`): an invalid one makes that key **fail closed** (a
+  blocked tenant). The idle TTL is raised to the *default* quota's recovery
+  time; a key with a longer override that expires while still limited has its
+  debt recorded like any eviction.
+- **`max_key_len(len)`** — a check of a key longer than `len` bytes is denied as
+  impossible and the key is never stored, so the store's memory is bounded in
+  bytes, not just keys.
+- **`digest_keys_longer_than(len)`** — keys longer than `len` bytes are stored as
+  a 16-byte digest from two independently, randomly seeded `ahash` hashers
+  (fresh per limiter): constant memory per key, and no caller can aim a key at
+  another's digest. Not a cryptographic hash. A `quota_for` resolver still sees
+  the original key.
+
+```rust
+use rate_net::{Quota, RateLimiter};
+
+let limiter = RateLimiter::builder()
+    .per_second(10)
+    .quota_for(|key| key.as_bytes().starts_with(b"pro:").then(|| Quota::per_second(1_000)))
+    .max_key_len(512)
+    .digest_keys_longer_than(32)
+    .build();
+assert!(limiter.check_n("pro:acme", 1_000).is_allow());
+assert!(limiter.check_n("free:bob", 11).is_impossible());
+assert!(limiter.check("x".repeat(513).as_str()).is_impossible());
+assert!(limiter.check_bytes("y".repeat(100)).is_allow()); // digested
+```
 
 ```rust
 use rate_net::{Eviction, RateLimiter, RateLimiterError};
@@ -374,6 +465,10 @@ pub const fn quota(&self) -> Quota
 pub const fn algorithm(&self) -> Algorithm
 pub async fn try_until_ready(&self) -> Result<(), InsufficientCapacity>          // feature `async`
 pub async fn try_until_ready_n(&self, n: u32) -> Result<(), InsufficientCapacity> // feature `async`
+pub async fn until_ready_within(&self, max_wait: Duration) -> Decision            // feature `async`
+pub async fn until_ready_n_within(&self, n: u32, max_wait: Duration) -> Decision  // feature `async`
+pub const fn with_jitter(self, max: Duration) -> Self                            // feature `async`
+pub const fn jitter(&self) -> Duration                                           // feature `async`
 pub fn metrics(&self) -> Metrics                                                 // feature `metrics`
 ```
 
@@ -411,6 +506,10 @@ pub fn check(&self, key: impl Into<Key>) -> Decision
 pub fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision
 pub async fn try_until_ready(&self, key: impl Into<Key>) -> Result<(), InsufficientCapacity>
 pub async fn try_until_ready_n(&self, key: impl Into<Key>, n: u32) -> Result<(), InsufficientCapacity>
+pub async fn until_ready_within(&self, key: impl Into<Key>, max_wait: Duration) -> Decision
+pub async fn until_ready_n_within(&self, key: impl Into<Key>, n: u32, max_wait: Duration) -> Decision
+pub const fn with_jitter(self, max: Duration) -> Self
+pub const fn jitter(&self) -> Duration
 #[deprecated] pub async fn until_ready(&self, key: impl Into<Key>)
 #[deprecated] pub async fn until_ready_n(&self, key: impl Into<Key>, n: u32)
 ```
@@ -421,10 +520,21 @@ returning `Ok(())` only once the units have been counted. A request that can
 never fit returns [`InsufficientCapacity`](#insufficientcapacity) at once. It is
 cancel-safe: dropping the future consumes nothing.
 
+`until_ready_n_within(key, n, max_wait)` is the bounded form: it sleeps only
+while the next admission the limiter reports falls within the remaining
+budget, and returns `Decision::Allow` once admitted or the last `Deny` — at
+once, not after sleeping out the budget — whose `retry_after` is the wait still
+needed (`Duration::MAX` if the request can never fit). `with_jitter(max)` adds
+a uniformly random delay in `[0, max]` to every sleep (never past a deadline),
+so tasks denied together do not retry together. `DirectLimiter` has the same
+bounded waits and jitter.
+
 The deprecated `until_ready` / `until_ready_n` return *without admitting* when
 the request can never fit, which callers cannot tell from an admission; they
 remain until `2.0`. Waiting needs a clock that advances; under a frozen
-`ManualClock` the wait never ends.
+`ManualClock` the wait never ends. The awaiting methods sleep with
+`tokio::time::sleep`, so they panic if polled outside a Tokio runtime with the
+time driver enabled.
 
 ```rust
 use rate_net::{AsyncLimiter, InsufficientCapacity, RateLimiter};
@@ -450,7 +560,7 @@ pub trait Limiter {
     fn check(&self, key: impl Into<Key>) -> Decision { /* check_n(key, 1) */ }
 }
 
-pub trait DynLimiter {
+pub trait DynLimiter: Send + Sync {
     fn check_key(&self, key: Key, n: u32) -> Decision;
 }
 ```
@@ -459,9 +569,11 @@ pub trait DynLimiter {
 `check_n`. It is implemented for `RateLimiter` and for `Arc<L>` of any limiter
 (not for `&L` or `Box<L>`: code written against 1.0 may implement `Limiter`
 for references and boxes of its own types, and blanket impls would conflict). Its methods are generic, so `dyn Limiter` is not
-possible; `DynLimiter` is the object-safe face: every `Limiter` implements it,
-and `dyn DynLimiter` (with or without `+ Send + Sync`) implements `Limiter`
-again, so the generic helpers stay available on trait objects.
+possible; `DynLimiter` is the object-safe face: every `Send + Sync` `Limiter`
+implements it, and `dyn DynLimiter` implements `Limiter` again, so the generic
+helpers stay available on trait objects. Since 2.0 `DynLimiter` requires
+`Send + Sync`, so `Arc<dyn DynLimiter>` can be shared across threads as it is
+(`dyn DynLimiter + Send + Sync` still works and means the same).
 
 ```rust
 use rate_net::{DynLimiter, Limiter, RateLimiter};
@@ -471,7 +583,7 @@ fn admit_one<L: Limiter>(limiter: &L, key: &str) -> bool {
     limiter.check(key).is_allow()
 }
 
-let limiter: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(2));
+let limiter: Arc<dyn DynLimiter> = Arc::new(RateLimiter::per_second(2));
 assert!(limiter.check_key("user:1".into(), 1).is_allow());
 assert!(admit_one(&limiter, "user:1"));
 assert!(!admit_one(&limiter, "user:1"));
@@ -528,18 +640,24 @@ pub const fn reset_after(&self) -> Duration   // until remaining == limit
 pub const fn reset_after_secs(&self) -> u64   // rounded up
 pub const fn is_exhausted(&self) -> bool      // remaining == 0
 pub const fn headers(&self) -> [(&'static str, u64); 3]
+pub const fn ratelimit<'a>(&self, policy: &'a str) -> headers::RateLimitValue<'a>
 ```
 
 A read-only view of one key's allowance, from `RateLimiter::peek`,
 `DirectLimiter::peek`, or `Gcra::peek_at`. A limiter that admits nothing reports
 `limit() == 0` and `reset_after() == Duration::MAX`. `headers` returns
 `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` (`0` for a
-limiter that admits nothing, rather than a 20-digit "never").
+limiter that admits nothing, rather than a 20-digit "never"). `ratelimit(policy)`
+is the value of the current draft's structured `RateLimit` field:
+`"policy";r=<remaining>;t=<reset>`.
 
 ```rust
+use clock_lib::ManualClock;
 use rate_net::RateLimiter;
+use std::sync::Arc;
 
-let limiter = RateLimiter::per_second(10);
+// A frozen clock keeps the numbers exact however slow the host.
+let limiter = RateLimiter::per_second(10).with_clock(Arc::new(ManualClock::new()));
 let _ = limiter.check_n("k", 3);
 let snapshot = limiter.peek("k");
 assert!(!snapshot.is_exhausted());
@@ -559,21 +677,42 @@ pub mod headers {
     pub const RATELIMIT_LIMIT: &str = "RateLimit-Limit";
     pub const RATELIMIT_REMAINING: &str = "RateLimit-Remaining";
     pub const RATELIMIT_RESET: &str = "RateLimit-Reset";
+    pub const RATELIMIT: &str = "RateLimit";
+    pub const RATELIMIT_POLICY: &str = "RateLimit-Policy";
+
+    pub struct RateLimitValue<'a> { /* private */ }        // Display, Copy, Eq, Debug
+    pub struct RateLimitPolicyValue<'a> { /* private */ }  // Display, Copy, Eq, Debug
 }
 ```
 
-Header names for rate-limit responses: `Retry-After` (RFC 9110) and the three
-`RateLimit-*` fields of the IETF rate-limit headers draft. rate-net hands back
-names and numbers; the caller writes them into its framework's response type.
+Header names for rate-limit responses: `Retry-After` (RFC 9110), the three
+`RateLimit-*` fields of the earlier revisions of the IETF rate-limit headers
+draft (still the most widely deployed), and the current revision's two
+structured fields. The value types format through `Display` without
+allocating: `RateLimitValue` (from [`Snapshot::ratelimit`](#snapshot)) as
+`"name";r=<remaining>;t=<reset>`, `RateLimitPolicyValue` (from
+[`Quota::ratelimit_policy`](#quota)) as `"name";q=<quota>;w=<window>`. The
+policy name is written as a quoted Structured Field string — `"` and `\`
+escaped, characters outside printable ASCII dropped — and the integers clamp to
+fifteen digits, so the value is always a valid header value. rate-net hands back
+names and values; the caller writes them into its framework's response type
+(or uses the [`tower` middleware](#tower-middleware)).
 
 ```rust
+use clock_lib::ManualClock;
 use rate_net::{RateLimiter, headers};
+use std::sync::Arc;
 
-let limiter = RateLimiter::per_minute(1);
+let limiter = RateLimiter::per_minute(1).with_clock(Arc::new(ManualClock::new()));
 let _ = limiter.check("client");
 let decision = limiter.check("client");
 let retry = decision.retry_after_secs().map(|secs| (headers::RETRY_AFTER, secs));
 assert_eq!(retry, Some(("Retry-After", 60)));
+
+let policy = limiter.quota().ratelimit_policy("default");
+assert_eq!(policy.to_string(), r#""default";q=1;w=60"#);
+let current = limiter.peek("client").ratelimit("default");
+assert_eq!(current.to_string(), r#""default";r=0;t=60"#);
 ```
 
 ---
@@ -590,14 +729,17 @@ pub const fn with_burst(self, burst: u32) -> Quota
 pub const fn limit(&self) -> u32
 pub const fn period(&self) -> Duration
 pub const fn burst(&self) -> u32
+pub const fn ratelimit_policy<'a>(&self, name: &'a str) -> headers::RateLimitPolicyValue<'a>
 ```
 
 A rate limit: `limit` units per `period`, per key, with a `burst` ceiling
 (defaulting to `limit`). Under the buckets a key starts with `burst` units and
 regains `limit` per `period`; the window algorithms admit at most `limit` per
 `period` and ignore `burst`. `per_second` / `per_minute` are infallible (a `0`
-limit admits nothing); `rate` rejects `ZeroQuota` and `ZeroPeriod`. Available
-without `std`.
+limit admits nothing); `rate` rejects `ZeroQuota` and `ZeroPeriod`.
+`ratelimit_policy(name)` describes the quota as a `RateLimit-Policy` field
+(`q` = limit, `w` = period in whole seconds, rounded up; the field has no burst
+parameter). Available without `std`.
 
 ```rust
 use rate_net::{Quota, RateLimiterError};
@@ -625,15 +767,31 @@ pub const fn with_idle(self, ttl: Duration) -> Eviction
 pub const fn without_capacity(self) -> Eviction
 pub const fn max_keys(&self) -> Option<usize>
 pub const fn idle_ttl(&self) -> Option<Duration>
+pub const fn with_overflow(self, overflow: Overflow) -> Eviction
+pub const fn overflow(&self) -> Overflow
+
+#[non_exhaustive]
+pub enum Overflow { Forget, FailClosed /* default */ }  // Copy, Eq, Hash, Debug, Default
 ```
 
 How the store bounds its memory — the defense against a unique-key flood. A
-**capacity** cap evicts by CLOCK when a new key would exceed it (spread evenly
-over the shards, at least one key per shard, so `capacity(0)` behaves as one per
-shard); an **idle TTL** reclaims keys not seen for that long, raised to the
-quota's recovery time so it never resets a key early. The `Default` is a
-[`DEFAULT_MAX_KEYS`](#constants) cap and no TTL. `unbounded` is only safe when
-the key space is intrinsically small.
+**capacity** cap evicts by CLOCK when a new key would exceed it, preferring a
+key whose allowance has recovered (spread evenly over the shards, at least one
+key per shard, so `capacity(0)` behaves as one per shard); an **idle TTL**
+reclaims keys not seen for that long, raised to the quota's recovery time. Either
+way a key evicted before it recovered has its debt recorded and resumes no more
+permissive than it left — unconditionally while the still-limited evicted keys
+fit about twice the cap. Past that, the **`Overflow`** policy decides:
+`FailClosed` (the default) keeps them all, so no evicted key ever comes back
+looser, at the cost of charging or refusing some keys that owed nothing;
+`Forget` (an opt-out for availability-first limiters such as anonymous per-IP
+load shedding) drops the debts that do not fit, so those keys may come back
+with a fresh allowance (1.x behaviour) and no other key is affected. See
+[Sharding and eviction](#sharding-and-eviction) for the exact guarantee, the
+measured trade-off, and [how to size the cap](#sizing-the-cap) so neither
+happens. The `Default` is a [`DEFAULT_MAX_KEYS`](#constants) cap, no TTL, and
+`Overflow::FailClosed`. `unbounded` is only safe when the key space is
+intrinsically small.
 
 ```rust
 use rate_net::{Eviction, DEFAULT_MAX_KEYS};
@@ -644,6 +802,11 @@ assert_eq!(policy.max_keys(), Some(100_000));
 assert_eq!(policy.idle_ttl(), Some(Duration::from_secs(300)));
 assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
 assert_eq!(Eviction::unbounded().without_capacity().max_keys(), None);
+
+use rate_net::Overflow;
+let shedding = Eviction::capacity(100_000).with_overflow(Overflow::Forget);
+assert_eq!(shedding.overflow(), Overflow::Forget);
+assert_eq!(Eviction::default().overflow(), Overflow::FailClosed);
 ```
 
 ---
@@ -685,8 +848,11 @@ pub fn ipv4_prefix(addr: Ipv4Addr, prefix_len: u8) -> Key
 pub fn ipv6_prefix(addr: Ipv6Addr, prefix_len: u8) -> Key
 pub fn ip_prefix(addr: IpAddr, v4_prefix_len: u8, v6_prefix_len: u8) -> Key
 pub fn as_bytes(&self) -> &[u8]
+pub fn len(&self) -> usize
+pub fn is_empty(&self) -> bool
 
 impl From<&str> | From<String> | From<&String> | From<&[u8]> | From<Vec<u8>>
+   | From<[u8; N]> | From<&[u8; N]>
    | From<u64> | From<IpAddr> | From<Ipv4Addr> | From<Ipv6Addr>
    | From<SocketAddr> | From<&Key> for Key
 ```
@@ -701,7 +867,9 @@ address equals the IPv4 address), and the `*_prefix` constructors for networks
 (lengths clamp to the address width and are part of the key). `ipv6_prefix`
 keys an embedded IPv4 address by that address (as `ipv4_prefix(v4, 32)`), so
 IPv4 clients on a dual-stack socket do not all share one `/64`. `From<SocketAddr>` drops the port. `Debug`
-shows the kind and length only.
+shows the kind and length only. There are deliberately no `From` conversions
+for integer types other than `u64`: a second one would make an unsuffixed
+literal (`limiter.check(42)`) ambiguous and break code that compiles today.
 
 ```rust
 use rate_net::Key;
@@ -812,15 +980,59 @@ pub struct Metrics {
     pub keys_evicted: u64,   // keys evicted by the capacity cap
     pub keys_expired: u64,   // keys reclaimed by the idle sweep
     pub keys_removed: u64,   // remove / clear / retain_recent
+    pub keys_remembered: u64, // evicted before recovering: debt recorded
+    pub keys_restored: u64,   // new keys charged a recorded debt
+    pub debts_forgotten: u64, // debts dropped past the exact table (Overflow::Forget)
+    pub debts_overflowed: u64, // debts spilled into the shared sketch (Overflow::FailClosed)
+    pub keys_refused: u64,    // the saturation counter: newcomers refused (FailClosed)
+    pub keys_rejected: u64,   // refused by max_key_len
 }
+
+impl RateLimiter<C> {
+    pub fn metrics(&self) -> Metrics
+    pub fn recovery_load(&self) -> RecoveryLoad   // walks the recovery tables
+}
+
+#[non_exhaustive]
+pub struct RecoveryLoad {
+    pub debts_held: u64,          // live exact debt records (evicted keys still owed)
+    pub debt_capacity: u64,       // exact records the tables hold when full
+    pub fullest_shard: f64,       // the largest per-shard fill, 0.0..=1.0
+    pub overflow_cells_live: u64, // live overflow-sketch cells (FailClosed)
+    pub overflow_cells: u64,      // the sketch's cells (0 under Forget)
+}
+impl RecoveryLoad { pub fn utilization(&self) -> f64 }  // debts_held / debt_capacity
 ```
 
 Cumulative counters since construction, kept per shard beside the shard lock
 (one relaxed increment per check) and summed on read. Export them as monotonic
 counters. `keys_evicted` should normally be zero: a steady rate means the cap is
 below the live key population or the limiter is under a unique-key flood (a
-`keys_inserted` spike is the other signature). Without the feature the counters
-do not exist.
+`keys_inserted` spike is the other signature). `keys_remembered` counts the
+evictions that had to record a debt and `keys_restored` the keys that came back
+to one (including keys charged from the shared overflow sketch).
+`debts_forgotten`, `debts_overflowed`, and `keys_refused` should be zero: a
+sustained `debts_forgotten` (under `Overflow::Forget`) means more still-limited
+keys are being evicted than the exact recovery table holds, so some of them come
+back with a fresh allowance; a sustained `debts_overflowed` (under
+`Overflow::FailClosed`) means the same, and keys that never owed anything can
+start drained;
+`keys_refused` counts newcomers denied with a retry time because a full shard
+held only still-limited keys whose debts could not be kept (both are the store
+failing closed). Either means the cap is too small for the traffic. Without
+the feature the counters do not exist.
+
+`recovery_load()` is the gauge to alert on **before** any of that: how many
+evicted keys' debts the store holds against the exact capacity it has for
+them, overall and in the fullest shard. Past `1.0` the overflow policy takes
+over, so alert at about `0.7`. It walks every shard's recovery table under its
+read lock — up to 64 bytes per key of capacity under the default
+`Overflow::FailClosed` (32 of exact records, 32 of overflow sketch), 32 under
+`Overflow::Forget` (exact records only): export it every few seconds,
+never per request. With the `tracing` feature the limiter also logs a
+`warn!` (target `rate_net::eviction`) on the first spill, drop, or refusal,
+and at most once a minute while they continue, with the count since the last
+warning; nothing on the check path changes.
 
 ---
 
@@ -836,7 +1048,7 @@ pub enum RateLimiterError {
 
 A configuration rejected by `Quota::rate`, `Builder::try_build`,
 `Builder::try_build_direct`, or `Gcra::try_new`. Implements `Display`,
-`core::error::Error`, and (with `std`)
+`core::error::Error`, and (with the `forge` feature)
 [`error_forge::ForgeError`](https://crates.io/crates/error-forge) — `kind()` is
 the variant name, `is_retryable()` is `false`. `#[non_exhaustive]`.
 
@@ -903,6 +1115,112 @@ assert_eq!(rate_net::MIN_COARSE_RESOLUTION, std::time::Duration::from_micros(100
 
 ---
 
+## `tower` middleware
+
+_Requires the `tower` feature._
+
+```rust ignore
+pub mod tower {
+    pub struct RateLimitLayer<K, C = SystemClock> { /* private */ }   // Layer, Clone, Debug
+    pub fn new(limiter: RateLimiter, extractor: K) -> RateLimitLayer<K>
+    pub fn shared(limiter: Arc<RateLimiter<C>>, extractor: K) -> RateLimitLayer<K, C>
+    pub fn with_cost(self, cost: u32) -> Self
+    pub fn with_policy(self, name: impl Into<String>) -> Self
+    pub fn with_headers_on_success(self, enabled: bool) -> Self
+    pub fn with_impossible_status(self, status: http::StatusCode) -> Self
+    pub fn with_anonymous(self, anonymous: Anonymous) -> Self
+    pub const fn limiter(&self) -> &Arc<RateLimiter<C>>
+
+    #[non_exhaustive]
+    pub enum Anonymous { Shared, Key(Key), Reject(http::StatusCode) }
+
+    pub struct RateLimited<S, K, C = SystemClock>   // the Service
+    pub struct ResponseFuture<F, B>                 // its future
+
+    pub trait KeyExtractor: Clone + Send + Sync + 'static {
+        fn extract(&self, request: &RequestInfo<'_>) -> Option<Key>;
+    }   // also implemented for Fn(&RequestInfo<'_>) -> Option<Key>
+    pub struct RequestInfo<'a>   // method(), uri(), headers(), extensions()
+    pub struct PeerIp            // the peer address from the request extensions
+    pub struct ForwardedFor      // X-Forwarded-For, trusting a fixed number of proxies
+        // trusting(n), only_from(network: IpAddr, prefix_len: u8), with_prefixes(v4, v6)
+    pub struct HeaderKey         // the value of one header
+        // new(name), with_digest_over(len)
+}
+```
+
+A `tower::Layer` for inbound HTTP (`http::Request` → `http::Response<B>` with
+`B: Default`): an axum `Router`, a hyper service, a tonic server. Each request
+is charged `cost` units (default 1; a cost of `0` counts as `1`, so it never
+disables limiting) to the key its extractor picks. A request with no
+extractable identity is handled by the layer's `Anonymous` policy: `Shared`
+(the default) charges one shared anonymous key, which never equals an
+extracted key; `Key(key)` charges the given key, which can have its own
+`quota_for` tier; `Reject(status)` answers with that status and charges
+nothing. The decision is made synchronously in `call`:
+
+- **Admitted** — the inner service's own future runs (no boxing); with
+  `with_headers_on_success(true)` its response also gets the rate-limit headers.
+- **Denied** — the inner service is not called. The response is `429` with the
+  body type's `Default`, `Retry-After` (whole seconds, rounded up), and
+  `RateLimit-Limit` / `-Remaining` / `-Reset`; with `with_policy(name)` also the
+  structured `RateLimit` and `RateLimit-Policy` fields, which describe the
+  quota the key is actually under (its `quota_for` override, if it has one). A
+  request that can never
+  be admitted ([`Decision::is_impossible`](#decision)) gets
+  `with_impossible_status` (default `429`) and no `Retry-After`.
+
+Extractors: `PeerIp` keys by the connection's address (an `IpAddr` or
+`SocketAddr` the server put in the request extensions), IPv4 exactly and IPv6
+by `/64` (`with_prefixes` to change). `ForwardedFor::trusting(n)` takes the
+`X-Forwarded-For` entry `n` places from the right — the address your `n`th
+proxy saw; a header with fewer entries yields no key. That entry was written by
+your proxy only if the request came through your proxies: a client that can
+reach the service directly writes the whole header itself. Add
+`.only_from(network, prefix_len)` (repeatable) to use the header only when the
+connection's peer address is inside one of the proxies' networks — otherwise
+the peer address itself is the key. IPv6 entries may be bracketed and carry a
+zone (`[fe80::1%eth0]`), and IPv4-mapped peers match IPv4 networks.
+`HeaderKey` keys by a header's value, stored verbatim up to 64 bytes and as a
+16-byte keyed digest beyond (`with_digest_over` to change), so a client cannot
+fill memory with huge values. With axum, read `ConnectInfo<SocketAddr>` in a
+closure extractor.
+
+```rust
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr};
+use http::{Request, Response, StatusCode};
+use rate_net::RateLimiter;
+use rate_net::tower::{PeerIp, RateLimitLayer};
+use tower::{Layer, Service, ServiceExt, service_fn};
+
+async fn demo() {
+    let layer = RateLimitLayer::new(RateLimiter::per_minute(1), PeerIp::default())
+        .with_policy("default");
+    let mut service = layer.layer(service_fn(|_: Request<String>| async {
+        Ok::<_, Infallible>(Response::new(String::new()))
+    }));
+    let request = || {
+        let mut request = Request::new(String::new());
+        request.extensions_mut().insert(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        request
+    };
+    let first = service.ready().await.unwrap().call(request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = service.ready().await.unwrap().call(request()).await.unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(second.headers()["ratelimit-policy"], r#""default";q=1;w=60"#);
+}
+
+tokio::runtime::Builder::new_current_thread()
+    .enable_time()
+    .build()
+    .unwrap()
+    .block_on(demo());
+```
+
+---
+
 ## The `no_std` core
 
 With `default-features = false` the crate is `no_std` and exposes
@@ -915,7 +1233,7 @@ allocates. On a target without 64-bit atomics (for example
 
 ```toml
 [dependencies]
-rate-net = { version = "1.1", default-features = false }
+rate-net = { version = "2.0", default-features = false }
 ```
 
 ---
@@ -930,11 +1248,12 @@ key takes the write lock.
 
 Eviction runs only while inserting a new key and does bounded work:
 
-- **Capacity — CLOCK.** Every check sets the key's referenced bit (only if it
-  was clear). At capacity a hand sweeps the shard's slots, clearing bits, and
-  evicts the first key whose bit was already clear; it examines at most 32 slots
-  and evicts under the hand if all were recently used. A key seen once (a flood)
-  goes first; a key checked at least once per revolution stays.
+- **Capacity — CLOCK, recovered keys first.** Every check sets the key's
+  referenced bit (only if it was clear). At capacity a hand sweeps the shard's
+  slots, clearing bits, and evicts the first unreferenced (or idle-expired) key
+  whose allowance has fully recovered; failing that, the first unreferenced key;
+  failing that, the key under the hand. It examines at most 32 slots. A key seen
+  once (a flood) goes first; a key checked at least once per revolution stays.
 - **Idle TTL — incremental.** Each insert examines the next 8 slots from a
   second cursor and reclaims idle ones.
 
@@ -947,9 +1266,97 @@ worst, against ~200 ms for one 1M-key shard). An unbounded store keeps the
 requested shard count; give it enough shards.
 
 The cap is enforced per shard (`max_keys / shards`, rounded up), so the
-live count stays within one key per shard of the configured maximum. An
-evicted key that returns starts fresh; the idle TTL never causes that, because
-it is raised to the quota's recovery time.
+live count stays within one key per shard of the configured maximum.
+
+**Eviction does not reset a limit.** When an evicted key still owes part of its
+allowance, its shard records the debt — units spent, and when they would all
+be back. A key inserted before its debt is repaid resumes **no more permissive
+than it left**: the token and leaky buckets resume exactly where they were (the
+deadline rounded up to the millisecond, against the key); the window
+algorithms resume with the spent units charged at the return, so they may be
+held back for up to one window longer.
+
+The debts live in a per-shard recovery table, allocated the first time the
+shard evicts an unrecovered key and released by `retain_recent` once every
+debt has expired. The **exact records** are 16 bytes each, two per key of
+capacity, in a cuckoo-hashed table: each key has two candidate buckets of four
+records, and a full pair is made room in by moving records to their other
+bucket (at most 16 moves), which fills the table past 90 % before anything is
+left over. A key reads back only its own record. While a shard's still-limited
+evicted keys fit — about twice its share of the cap at once; the binding
+quantity is the rate at which still-limited keys are evicted times their
+recovery time, not the size of the population — no evicted key is reset, no
+other key is charged, and nothing is refused.
+
+Past that bound, [`Overflow`](#eviction) decides:
+
+- **`Overflow::FailClosed`** (the default) spills it into a shared **overflow sketch** of four
+  8-byte cells per key of capacity; each cell keeps the larger deadline and
+  spend (a spend beyond the cell's 24 bits is charged as everything). A key
+  being stored is charged the smaller of its two cells while both are live:
+  never less than its own spilled debt, but a key that never owed anything is
+  charged when both its cells hold others' debts — it starts partly or wholly
+  drained. A key charged from the sketch is never written back into it (its
+  debt goes only into the exact table, marked so it is never moved out), so
+  sketch charges cannot spread or ratchet; if its candidate records all hold
+  such marked debts it is not evicted, and a full shard with nothing else to
+  evict **refuses the newcomer** with a retry time (`Metrics::keys_refused`).
+- **`Overflow::Forget`** (opt-out) drops the debt that is left over. That
+  key may come back with a fresh allowance, as every evicted key did in 1.x;
+  nothing else changes, and `Metrics::debts_forgotten` counts the drops. Under
+  a sustained flood that evicts far more still-limited keys than the table
+  holds, a targeted key can be reset again and again.
+
+Measured with the re-audit's harness (`docs/BENCHMARKS.md`; ManualClock,
+128 shards; cap 100,000 for floods, 10,000 for populations):
+
+| | `FailClosed` (default) | `Forget` |
+|---|---:|---:|
+| Newcomers denied after a drain flood of 3x / 4x / 6x / 9x the cap | 0 / 3 / 38 / 86 % | 0 / 0 / 0 / 0 % |
+| False denials, well-behaved population of 10x the cap at 5,000 / 20,000 visits/s | 4 / 72 % | 0 / 0 % |
+| Evicted, still-limited keys reset past the bound | never | yes |
+| Recovery tables at the default cap | 64 MiB | 32 MiB |
+
+The recovery tables cost 32 bytes per key of capacity, plus 32 more for
+`FailClosed`'s sketch (up to twice that when a shard's share of the cap is
+just past a power of two).
+
+The idle TTL is raised to the quota's recovery time, so idle expiry normally
+removes only recovered keys; a key with a longer per-key quota that expires
+while still limited has its debt recorded like any other eviction — the eviction judges such a key by its current
+state, not by a recovery time cached before it last spent. `remove`, `reset`,
+and `clear` forget a key's own record — they are explicit resets — but a
+sketch charge is shared and cannot be cleared for one key (it expires within
+one recovery period; `clear` drops the whole table). A sketch charge carries
+the debt's own deadline, so under per-key tiers a slow tier's long debt can
+drain a fast-tier newcomer for that long.
+
+### Sizing the cap
+
+The overflow policy only matters when more still-limited keys are evicted
+within one recovery period than about twice the cap — roughly three times the
+cap's worth of keys limited at once. Size the cap so that never happens:
+
+- **Rule:** `cap >= peak distinct keys active within the longest recovery
+  window × headroom` (1.5–2x). The recovery window is `burst / limit` periods
+  for the token and leaky buckets, one period for the fixed window and the
+  sliding-window log, and two for the sliding-window counter.
+- **Memory per key of capacity:** about 138 bytes of token-bucket state, plus
+  under eviction pressure 64 bytes of recovery tables with `FailClosed` or 32
+  with `Forget` — about 202 or 170 bytes (202 or 170 MiB at the default cap),
+  plus key bytes beyond 22.
+- **Operate it:** export `recovery_load()` and alert at about `0.7`
+  utilization (or `fullest_shard`); alert on any `keys_refused`,
+  `debts_overflowed`, or `debts_forgotten`; enable `tracing` for the
+  warnings; keep `FailClosed` for identity- or credential-keyed limiters and
+  consider `Forget` for anonymous per-IP load shedding; keep an upstream DDoS
+  layer in front.
+- **Compared with:** NGINX `limit_req` keeps state in a fixed-size zone and,
+  when it is full, removes the least recently used state (even a client still
+  being limited, which then starts fresh — like `Forget`), rejecting the
+  request only if no state can be created. `governor`'s keyed limiters grow
+  their state map without bound until you call `retain_recent()` (which
+  drops only recovered keys): no resets, but no memory bound either.
 
 ---
 
@@ -979,9 +1386,14 @@ races.
 - **Fixed window:** any `u32` limit.
 - **Sliding-window log:** `try_build` caps the limit at `MAX_SLIDING_LOG_LIMIT`
   (65,536) for memory; `build` does not.
-- **Keys:** per-key heap is about 200–300 bytes for the token bucket (~202 B
-  measured at the default cap), so the default cap bounds the store at roughly
-  200 MiB. `tests/memory.rs` asserts a 512 B/key budget.
+- **Keys:** a token-bucket key is 128 bytes in its shard — about 138 bytes of
+  heap per key at the default cap, up to ~210 just after a shard's tables have
+  doubled — so the default cap bounds the store at roughly 140 MiB, plus the
+  recovery tables under eviction pressure (64 MiB with the default
+  `Overflow::FailClosed`, 32 MiB with `Forget`: about 202 or 170 MiB in all),
+  plus the bytes of any key
+  longer than 22 (bounded with `max_key_len`, or fixed at 16 with
+  `digest_keys_longer_than`). `tests/memory.rs` asserts a 256 B/key budget.
 
 ---
 
@@ -989,10 +1401,13 @@ races.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`        | yes | The keyed limiter, `DirectLimiter`, `CoarseClock`, and the `error-forge` integration. Off, the crate is `no_std` ([the `no_std` core](#the-no_std-core)). |
+| `std`        | yes | The keyed limiter, `DirectLimiter`, and `CoarseClock`. Off, the crate is `no_std` ([the `no_std` core](#the-no_std-core)). |
 | `algorithms` | no  | The leaky bucket and the window algorithms, and their [`Algorithm`](#algorithm) variants. |
-| `async`      | no  | [`AsyncLimiter`](#asynclimiter) and `DirectLimiter::try_until_ready`. Implies `std`; only this layer touches a runtime (`tokio`'s timer). |
-| `metrics`    | no  | `metrics()` on `RateLimiter` and `DirectLimiter` ([`Metrics`](#metrics-1)). Implies `std`; compiled out when off. |
+| `async`      | no  | [`AsyncLimiter`](#asynclimiter) and `DirectLimiter`'s awaiting methods. Implies `std`; only this layer touches a runtime (`tokio`'s timer). |
+| `metrics`    | no  | `metrics()` on `RateLimiter` and `DirectLimiter` ([`Metrics`](#metrics-1)) and `RateLimiter::recovery_load()`. Implies `std`; compiled out when off. |
+| `tracing`    | no  | Rate-limited `tracing` warnings (target `rate_net::eviction`) on spills, drops, and saturation refusals. Implies `std`; adds `tracing` without its proc-macros; nothing on the check path. |
+| `forge`      | no  | `error_forge::ForgeError` on [`RateLimiterError`](#ratelimitererror) and `InsufficientCapacity`. Implies `std`; adds `error-forge`. |
+| `tower`      | no  | The [`tower` middleware](#tower-middleware). Implies `std`; adds `http`, `tower-layer`, `tower-service`, and `pin-project-lite` (not `tower` itself). |
 
 ---
 

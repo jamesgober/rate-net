@@ -105,3 +105,95 @@ fn test_existing_key_check_does_not_allocate() {
     );
     assert!(admitted > 0); // the loop did real work, so the assertion is meaningful
 }
+
+/// Allocations made by `body` on this thread, after `warm` has run once.
+fn allocations_of(warm: impl Fn(), body: impl Fn()) -> u64 {
+    for _ in 0..1_000 {
+        warm();
+    }
+    let before = alloc_count();
+    for _ in 0..10_000 {
+        body();
+    }
+    alloc_count() - before
+}
+
+#[test]
+fn test_long_borrowed_key_check_does_not_allocate() {
+    // A 36-byte UUID: too long to inline, so `check(&str)` copies it into a
+    // new key on every call; `check_bytes` only borrows it.
+    let limiter = RateLimiter::per_second(u32::MAX);
+    let key = "9f6c1d2e-8b7a-4c3d-9e1f-0a2b3c4d5e6f";
+    let allocations = allocations_of(
+        || {
+            let _ = limiter.check_bytes(key);
+        },
+        || {
+            let _ = limiter.check_bytes(key);
+            let _ = limiter.check_n_bytes(key.as_bytes(), 1);
+            let _ = limiter.peek_bytes(key);
+        },
+    );
+    assert_eq!(allocations, 0, "a long borrowed key allocated");
+    // And the owned path does allocate, which is why the borrowed one exists.
+    let owned = allocations_of(
+        || {},
+        || {
+            let _ = limiter.check(key);
+        },
+    );
+    assert!(owned > 0);
+}
+
+#[cfg(feature = "algorithms")]
+#[test]
+fn test_existing_key_check_does_not_allocate_for_any_algorithm() {
+    use rate_net::Algorithm;
+
+    for algorithm in [
+        Algorithm::TokenBucket,
+        Algorithm::LeakyBucket,
+        Algorithm::FixedWindow,
+        Algorithm::SlidingWindowLog,
+        Algorithm::SlidingWindowCounter,
+    ] {
+        // A frozen clock and a limit high enough that the sliding log's
+        // record vector never grows inside the window.
+        let clock = Arc::new(ManualClock::new());
+        let limiter = RateLimiter::builder()
+            .algorithm(algorithm)
+            .per_second(1_000_000)
+            .clock(Arc::clone(&clock))
+            .build();
+        let allocations = allocations_of(
+            || {
+                let _ = limiter.check("k");
+            },
+            || {
+                let _ = limiter.check("k");
+            },
+        );
+        assert_eq!(allocations, 0, "{algorithm:?} allocated on an existing key");
+    }
+}
+
+#[test]
+fn test_digest_and_length_policies_do_not_allocate_on_existing_keys() {
+    let limiter = RateLimiter::builder()
+        .per_second(u32::MAX)
+        .digest_keys_longer_than(16)
+        .max_key_len(4_096)
+        .build();
+    let long = "x".repeat(1_000);
+    let too_long = "y".repeat(5_000);
+    let allocations = allocations_of(
+        || {
+            let _ = limiter.check_bytes(&long);
+        },
+        || {
+            let _ = limiter.check_bytes(&long);
+            let _ = limiter.check_bytes(&too_long);
+        },
+    );
+    assert_eq!(allocations, 0);
+}

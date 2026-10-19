@@ -4,10 +4,11 @@
 # `rustfmt.toml` pins `newline_style = "Unix"`.
 * text=auto eol=lf
 
-# Keep development-only paths out of `git archive` source tarballs.
+# Keep development-only paths out of `git archive` source tarballs. `docs/`
+# and `tests/` stay in: the crate embeds `docs/API.md` (`include_str!` in
+# `src/lib.rs`), so a tarball without it would not build, and a source
+# release should carry its tests.
 /.dev             export-ignore
 /.github          export-ignore
-/docs             export-ignore
-/tests            export-ignore
 /.gitignore       export-ignore
 /.editorconfig    export-ignore

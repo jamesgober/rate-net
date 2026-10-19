@@ -16,7 +16,9 @@
 use core::fmt;
 use core::time::Duration;
 
+use ahash::RandomState;
 use clock_lib::{Clock, SystemClock};
+use tokio::time::Instant;
 
 use crate::decision::Decision;
 use crate::error::InsufficientCapacity;
@@ -35,6 +37,22 @@ use crate::limiter::RateLimiter;
 /// Every wait is cancel-safe: the future only sleeps between checks, and a unit
 /// is counted only by the check that admits it, so dropping the future (a
 /// `select!` branch losing, a timeout firing) consumes nothing.
+///
+/// # Deadlines and jitter
+///
+/// [`until_ready_within`](Self::until_ready_within) bounds the wait: it sleeps
+/// only while the next possible admission falls inside the budget, and
+/// otherwise returns the denial at once, so a caller never sleeps for nothing.
+/// [`with_jitter`](Self::with_jitter) adds a random delay to every sleep, so
+/// many tasks denied at the same instant do not all retry at the same instant
+/// (a thundering herd that would mostly be denied again).
+///
+/// # Panics
+///
+/// The awaiting methods sleep with [`tokio::time::sleep`], so — like it — they
+/// panic if polled outside a Tokio runtime with the time driver enabled. The
+/// synchronous [`check`](Self::check) / [`check_n`](Self::check_n) work
+/// anywhere.
 ///
 /// # Examples
 ///
@@ -55,6 +73,7 @@ use crate::limiter::RateLimiter;
 /// ```
 pub struct AsyncLimiter<C: Clock + Clone = SystemClock> {
     inner: RateLimiter<C>,
+    jitter: Duration,
 }
 
 impl<C: Clock + Clone> AsyncLimiter<C> {
@@ -70,7 +89,51 @@ impl<C: Clock + Clone> AsyncLimiter<C> {
     /// ```
     #[must_use]
     pub fn new(inner: RateLimiter<C>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            jitter: Duration::ZERO,
+        }
+    }
+
+    /// Adds a random delay of up to `max` to every sleep between attempts.
+    ///
+    /// When many tasks are denied together (a burst against one key, a shared
+    /// downstream quota), each would otherwise wake exactly at its
+    /// `retry_after` and contend for the same refill. Uniform jitter in
+    /// `[0, max]` spreads the retries out. It never makes a wait shorter, and a
+    /// bounded wait ([`until_ready_within`](Self::until_ready_within)) still
+    /// never sleeps past its deadline. The default is no jitter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{AsyncLimiter, RateLimiter};
+    /// use std::time::Duration;
+    ///
+    /// let limiter = AsyncLimiter::new(RateLimiter::per_second(10))
+    ///     .with_jitter(Duration::from_millis(20));
+    /// assert_eq!(limiter.jitter(), Duration::from_millis(20));
+    /// ```
+    #[must_use]
+    pub const fn with_jitter(mut self, max: Duration) -> Self {
+        self.jitter = max;
+        self
+    }
+
+    /// The most jitter added to each sleep (zero unless set with
+    /// [`with_jitter`](Self::with_jitter)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{AsyncLimiter, RateLimiter};
+    /// use std::time::Duration;
+    ///
+    /// assert_eq!(AsyncLimiter::new(RateLimiter::per_second(1)).jitter(), Duration::ZERO);
+    /// ```
+    #[must_use]
+    pub const fn jitter(&self) -> Duration {
+        self.jitter
     }
 
     /// Borrows the wrapped limiter — for `peek`, `remove`, and the rest of the
@@ -198,17 +261,89 @@ impl<C: Clock + Clone> AsyncLimiter<C> {
         n: u32,
     ) -> Result<(), InsufficientCapacity> {
         let key = key.into();
-        loop {
-            match self.inner.check_n(key.clone(), n) {
-                Decision::Allow => return Ok(()),
-                Decision::Deny { retry_after } => {
-                    if retry_after == Duration::MAX {
-                        return Err(InsufficientCapacity::new(n));
-                    }
-                    tokio::time::sleep(retry_after).await;
-                }
-            }
+        let decision = wait(
+            || self.inner.check_ref(key.as_key_ref(), n),
+            None,
+            self.jitter,
+        )
+        .await;
+        if decision.is_allow() {
+            Ok(())
+        } else {
+            Err(InsufficientCapacity::new(n))
         }
+    }
+
+    /// Awaits until a single unit is admitted for `key`, but never past
+    /// `max_wait`. Equivalent to `until_ready_n_within(key, 1, max_wait)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{AsyncLimiter, RateLimiter};
+    /// use std::time::Duration;
+    ///
+    /// # async fn demo() {
+    /// let limiter = AsyncLimiter::new(RateLimiter::per_minute(1));
+    /// assert!(limiter.until_ready_within("k", Duration::ZERO).await.is_allow());
+    ///
+    /// // The next unit is a minute away: a 50ms budget is denied at once,
+    /// // without sleeping, with the real wait in `retry_after`.
+    /// let denied = limiter.until_ready_within("k", Duration::from_millis(50)).await;
+    /// assert!(denied.retry_after().unwrap() > Duration::from_secs(50));
+    /// # }
+    /// ```
+    pub async fn until_ready_within(&self, key: impl Into<Key>, max_wait: Duration) -> Decision {
+        self.until_ready_n_within(key, 1, max_wait).await
+    }
+
+    /// Awaits until `n` units are admitted for `key`, but never past
+    /// `max_wait`: the bounded form of
+    /// [`try_until_ready_n`](Self::try_until_ready_n), for a caller with a
+    /// latency budget (a request deadline, a job's time slot).
+    ///
+    /// It sleeps only while the next admission the limiter reports falls
+    /// within the remaining budget. Returns [`Decision::Allow`] once the units
+    /// are counted; otherwise the last [`Decision::Deny`] — returned as soon as
+    /// the wait is known not to fit, not after sleeping out the budget — whose
+    /// `retry_after` is the wait the caller would still need
+    /// ([`Duration::MAX`] if the request can never fit). Cancel-safe.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{AsyncLimiter, RateLimiter};
+    /// use std::time::Duration;
+    ///
+    /// # async fn demo() {
+    /// let limiter = AsyncLimiter::new(RateLimiter::per_second(100));
+    /// assert!(limiter.check_n("k", 100).is_allow());
+    /// // One unit refills in 10ms, well within the budget.
+    /// let admitted = limiter
+    ///     .until_ready_n_within("k", 1, Duration::from_secs(1))
+    ///     .await;
+    /// assert!(admitted.is_allow());
+    ///
+    /// // More than the burst can never fit, budget or not.
+    /// let never = limiter
+    ///     .until_ready_n_within("k", 101, Duration::from_secs(60))
+    ///     .await;
+    /// assert!(never.is_impossible());
+    /// # }
+    /// ```
+    pub async fn until_ready_n_within(
+        &self,
+        key: impl Into<Key>,
+        n: u32,
+        max_wait: Duration,
+    ) -> Decision {
+        let key = key.into();
+        wait(
+            || self.inner.check_ref(key.as_key_ref(), n),
+            Some(max_wait),
+            self.jitter,
+        )
+        .await
     }
 
     /// Awaits until a single unit is admitted for `key`.
@@ -249,13 +384,144 @@ impl<C: Clock + Clone> fmt::Debug for AsyncLimiter<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncLimiter")
             .field("inner", &self.inner)
+            .field("jitter", &self.jitter)
             .finish()
     }
+}
+
+/// The shared wait loop: check, and on a denial sleep for the reported
+/// `retry_after` (plus up to `jitter`) and check again, until admitted, until
+/// the request is reported impossible, or — with a `max_wait` — until the next
+/// admission would fall past the deadline. Returns the last decision.
+pub(crate) async fn wait(
+    mut check: impl FnMut() -> Decision,
+    max_wait: Option<Duration>,
+    jitter: Duration,
+) -> Decision {
+    // An unrepresentably distant deadline is no deadline.
+    let deadline = max_wait.and_then(|budget| Instant::now().checked_add(budget));
+    let bounded = max_wait.is_some();
+    loop {
+        let decision = check();
+        let Decision::Deny { retry_after } = decision else {
+            return decision;
+        };
+        if retry_after == Duration::MAX {
+            return decision;
+        }
+        let mut sleep_for = retry_after.saturating_add(random_jitter(jitter));
+        if bounded {
+            let left = deadline.map_or(Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if retry_after > left {
+                return decision;
+            }
+            sleep_for = sleep_for.min(left);
+        }
+        tokio::time::sleep(sleep_for).await;
+    }
+}
+
+/// A uniformly random delay in `[0, max]`. Seeded from a fresh randomly keyed
+/// hasher per call; not cryptographic, and needs not be.
+fn random_jitter(max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let span = u64::try_from(max.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let draw = RandomState::new().hash_one(0u8);
+    // `span == 0` only if `max` saturated to `u64::MAX` nanoseconds and wrapped
+    // to zero above, which `saturating_add` rules out.
+    Duration::from_nanos(draw.checked_rem(span).unwrap_or(draw))
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+
+    #[test]
+    fn test_random_jitter_stays_within_its_bound() {
+        assert_eq!(super::random_jitter(Duration::ZERO), Duration::ZERO);
+        let max = Duration::from_micros(50);
+        let draws: Vec<Duration> = (0..1_000).map(|_| super::random_jitter(max)).collect();
+        assert!(draws.iter().all(|d| *d <= max));
+        // Not constant: a thousand draws from 50,001 values are not all equal.
+        assert!(draws.iter().any(|d| *d != draws[0]));
+        assert!(super::random_jitter(Duration::MAX) <= Duration::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_until_ready_within_denies_at_once_when_the_wait_does_not_fit() {
+        let limiter = AsyncLimiter::new(RateLimiter::per_minute(1));
+        assert!(limiter.check("k").is_allow());
+        let start = Instant::now();
+        let decision = limiter
+            .until_ready_within("k", Duration::from_millis(200))
+            .await;
+        assert!(start.elapsed() < Duration::from_millis(150), "it slept");
+        assert!(decision.retry_after().unwrap() > Duration::from_secs(50));
+        // Nothing was counted by the attempt.
+        assert_eq!(limiter.inner().peek("k").remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_until_ready_within_admits_inside_the_budget_even_with_jitter() {
+        let limiter =
+            AsyncLimiter::new(RateLimiter::per_second(200)).with_jitter(Duration::from_millis(2));
+        assert!(limiter.check_n("k", 200).is_allow());
+        let decision = limiter
+            .until_ready_n_within("k", 1, Duration::from_secs(2))
+            .await;
+        assert!(decision.is_allow());
+        assert!(
+            limiter
+                .until_ready_n_within("k", 201, Duration::from_secs(2))
+                .await
+                .is_impossible()
+        );
+        assert!(
+            limiter
+                .until_ready_within("k", Duration::MAX)
+                .await
+                .is_allow()
+        );
+        assert!(format!("{limiter:?}").contains("jitter"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_limiter_bounded_waits_and_jitter() {
+        let limiter = crate::DirectLimiter::per_second(100).with_jitter(Duration::from_millis(1));
+        assert_eq!(limiter.jitter(), Duration::from_millis(1));
+        assert!(limiter.check_n(100).is_allow());
+        assert!(
+            limiter
+                .until_ready_within(Duration::from_secs(1))
+                .await
+                .is_allow()
+        );
+        assert!(limiter.check_n(100).is_deny());
+        assert!(
+            limiter
+                .until_ready_n_within(101, Duration::from_secs(1))
+                .await
+                .is_impossible()
+        );
+        let slow = crate::DirectLimiter::per_minute(1).with_jitter(Duration::from_millis(1));
+        assert!(slow.check().is_allow());
+        assert!(
+            slow.until_ready_within(Duration::from_millis(5))
+                .await
+                .is_deny()
+        );
+        // The jitter survives a rebuild.
+        let rebuilt = slow.with_algorithm(crate::Algorithm::TokenBucket);
+        assert_eq!(rebuilt.jitter(), Duration::from_millis(1));
+        let reclocked = rebuilt.with_clock(clock_lib::SystemClock::new());
+        assert_eq!(reclocked.jitter(), Duration::from_millis(1));
+    }
 
     use std::sync::Arc;
     use std::time::{Duration, Instant};

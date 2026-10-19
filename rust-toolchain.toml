@@ -1,0 +1,6 @@
+# The development toolchain for this repository (README "Development").
+# CI jobs that test other toolchains (the 1.85 MSRV, nightly) select them
+# explicitly. Not part of the published package.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

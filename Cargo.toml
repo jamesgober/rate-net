@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "1.1.0"
+version = "2.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -20,6 +20,23 @@ license = "Apache-2.0 OR MIT"
 
 # Readme
 readme = "README.md"
+
+# Repository tooling that is not part of the library: the development
+# toolchain pin, CI, editor and lint configuration, fuzzing, proptest seeds,
+# and the engineering standard.
+exclude = [
+    ".editorconfig",
+    ".gitattributes",
+    ".github/",
+    ".gitignore",
+    "clippy.toml",
+    "deny.toml",
+    "fuzz/",
+    "proptest-regressions/",
+    "REPS.md",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+]
 
 # Description
 description = "A rate limiter for Rust: five algorithms behind one trait, sharded per-key state with O(1) bounded-memory eviction, retry-after and RateLimit headers, a no_std single-key core, and a one-line Tier-1 API. Built against hostile traffic."
@@ -63,14 +80,15 @@ path = "src/lib.rs"
 # LINTS
 # #################################
 # `loom` and `comparison` are build-time cfgs toggled via `RUSTFLAGS="--cfg ..."`
-# (the concurrency model check and the `governor` comparison bench); `docsrs` is
-# set by docs.rs. Registering them keeps `unexpected_cfgs` quiet under
-# `-D warnings`.
+# (the concurrency model check and the `governor` comparison bench); `docsrs`
+# is set by docs.rs and `fuzzing` by cargo-fuzz. Registering them keeps
+# `unexpected_cfgs` quiet under `-D warnings`.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(loom)',
     'cfg(comparison)',
     'cfg(docsrs)',
+    'cfg(fuzzing)',
 ] }
 
 
@@ -82,22 +100,24 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 default = ["std"]
 
 # Standard library. The keyed limiter — the sharded per-key store, the
-# token-bucket core (better-bucket's clock-driven surface), the injectable
-# clock, `DirectLimiter`, `CoarseClock`, and the error-forge integration —
-# requires std, so std gates `better-bucket`'s `clock` feature, `clock-lib`,
-# `error-forge`, `ahash`, and `hashbrown`. With std off the crate is no_std and
-# exposes the clock-free single-key core: `Gcra` (on targets with 64-bit
-# atomics), `Quota`, `Decision`, `Snapshot`, the error types, and the header
-# names.
+# token-bucket state (better-bucket's clock-free `BucketCore`), the injectable
+# clock, `DirectLimiter`, and `CoarseClock` — requires std, so std gates
+# `better-bucket`, `clock-lib`, `ahash`, and `hashbrown`. With std off the crate is no_std and exposes the
+# clock-free single-key core: `Gcra` (on targets with 64-bit atomics), `Quota`,
+# `Decision`, `Snapshot`, the error types, and the header names and values.
 std = [
     "dep:better-bucket",
-    "better-bucket/clock",
     "dep:clock-lib",
     "clock-lib/std",
-    "dep:error-forge",
     "dep:ahash",
     "dep:hashbrown",
 ]
+
+# `error_forge::ForgeError` implementations (kind and caption) on the error
+# types, for applications that report errors through the portfolio's
+# error-forge. Off by default: nothing in the limiter needs it, and it brings
+# seven crates of its own (parking_lot and a proc-macro among them).
+forge = ["std", "dep:error-forge"]
 
 # The full algorithm suite beyond the default token bucket: leaky bucket,
 # fixed window, sliding-window log, sliding-window counter.
@@ -109,9 +129,23 @@ algorithms = []
 async = ["std", "dep:tokio"]
 
 # Operational counters (allowed, denied, keys inserted / evicted / expired /
-# removed) read with `metrics()`. Off by default: without it the counters do
-# not exist, so they cost nothing.
+# removed / remembered / restored, overflowed debts, refused and rejected keys) read with
+# `metrics()`. Off by default: without it the counters do not exist, so they
+# cost nothing.
 metrics = ["std"]
+
+# `tower` middleware for inbound HTTP: `RateLimitLayer` with key extractors
+# (peer IP, X-Forwarded-For, header, closure) and 429 responses carrying
+# Retry-After and RateLimit headers. Adds the `http` types and the two tower
+# trait crates — not `tower` itself.
+tower = ["std", "dep:http", "dep:tower-layer", "dep:tower-service", "dep:pin-project-lite"]
+
+# Rate-limited `tracing` warnings (target `rate_net::eviction`) when the
+# store runs out of room for evicted keys' debts: newcomers refused because a
+# shard is saturated, debts spilling into the overflow sketch, or debts
+# dropped. Each kind warns on its first occurrence and then at most once a
+# minute; nothing runs on the check path.
+tracing = ["std", "dep:tracing"]
 
 
 
@@ -119,15 +153,17 @@ metrics = ["std"]
 # #################################
 [dependencies]
 # Token-bucket accounting (the single source of truth; we never re-implement it).
-# Pulled in by `std` with its `clock` feature, which exposes the `Bucket` surface.
-# 1.1 is the floor: 1.0 over-granted under multi-threaded contention on a real
-# clock (a stale timestamp read as a ~49.7-day refill), capped capacity at ~4.29M
-# tokens, and lacked `with_config_and_clock` / `time_until`.
+# Only the clock-free `BucketCore` is used — the limiter reads the clock once per
+# check and passes the time in — so no better-bucket feature is enabled and it
+# brings no dependencies of its own. 1.1 is the floor: 1.0 over-granted under
+# multi-threaded contention on a real clock (a stale timestamp read as a
+# ~49.7-day refill), capped capacity at ~4.29M tokens, and had no `BucketCore`.
 better-bucket = { version = "1.1", default-features = false, optional = true }
 # Monotonic, mockable time for deterministic tests and the clock-injection seam.
 clock-lib     = { version = "1.0", default-features = false, optional = true }
-# Domain error type metadata (kind/caption), shared across the portfolio stack.
-# 1.0.2 dropped its unused `thiserror` dependency (and `syn` with it).
+# Domain error type metadata (kind/caption), shared across the portfolio stack;
+# only behind the `forge` feature. 1.0.2 dropped its unused `thiserror`
+# dependency (and `syn` with it).
 error-forge   = { version = "1.0.2", optional = true }
 # Fast, DoS-resistant hashing for the shard map and shard selection. A random
 # per-store seed (runtime-rng) keeps it collision-attack resistant on hostile
@@ -141,6 +177,16 @@ ahash         = { version = "0.8", optional = true }
 hashbrown     = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
 # Optional async-friendly wrapper layer; additive only. Only the timer is used.
 tokio         = { version = "1", default-features = false, features = ["time"], optional = true }
+# The `tower` feature: the HTTP request/response types and the two tower trait
+# crates (not `tower` itself), plus the pin projection for the response future
+# so admitted requests pass through without boxing.
+http             = { version = "1", optional = true }
+tower-layer      = { version = "0.3.3", optional = true }
+tower-service    = { version = "0.3.3", optional = true }
+pin-project-lite = { version = "0.2", optional = true }
+# The `tracing` feature: operator warnings on eviction saturation. Only the
+# `std` feature of tracing (no proc-macro attributes).
+tracing          = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 # `loom` replaces the limiter's own atomics and locks (`src/sync.rs`) under
 # `cfg(loom)` model-checking builds, so the loom suite drives the production
@@ -156,6 +202,8 @@ loom = "0.7"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
+# `ServiceExt` / `service_fn` for exercising the `tower` middleware.
+tower     = { version = "0.5", default-features = false, features = ["util"] }
 
 # A minimal runtime to drive the `async` wrapper's tests and example. Excluded
 # under `cfg(loom)`: a global `--cfg loom` switches tokio's internals to its own
@@ -208,6 +256,10 @@ required-features = ["std", "algorithms"]
 name              = "async_wait"
 required-features = ["async"]
 
+[[example]]
+name              = "tower_layer"
+required-features = ["tower"]
+
 
 
 # BENCHMARKS
@@ -220,6 +272,11 @@ required-features = ["std"]
 [[bench]]
 name    = "comparison"
 harness = false
+
+[[bench]]
+name              = "flood"
+harness           = false
+required-features = ["std"]
 
 
 

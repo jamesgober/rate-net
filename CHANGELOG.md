@@ -14,6 +14,332 @@
 
 ---
 
+## [2.0.0] — 2026-10-19
+
+**Eviction never resets a limit by default, and the HTTP surface is
+complete.** A major release. Its headline change is a security default: a
+key evicted while still limited keeps its debt instead of coming back with a
+fresh allowance (in `1.x` it was reset) — exactly, and without affecting any
+other key, while such keys fit about twice the cap, and beyond that under the
+new default `Overflow::FailClosed`, which never resets a key but can charge or
+refuse keys that owed nothing once the store is far past its cap. The opt-out
+`Overflow::Forget` restores 1.x behaviour past that bound. Two long-deferred
+breaking cleanups come with it: `error-forge` is now an optional `forge`
+feature, and `DynLimiter` requires `Send + Sync`. It also stores per-key state
+a third smaller, checks long keys without allocating, and adds per-key
+quotas, key-length limits, bounded async waits, the current IETF structured
+headers, `tower` middleware, and saturation guardrails (a recovery-load
+gauge, a saturation counter, rate-limited `tracing` warnings, and a sizing
+guide). This release was prepared as `1.2.0` and never published under that
+number. Upgrading: [`docs/MIGRATION_1_TO_2.md`](./docs/MIGRATION_1_TO_2.md).
+Finding IDs below are the 2026-10-13 audit's (`RN-001`…`RN-023`) and the 2.0
+re-audits' (`RN2-001`…`RN2-017`, `RN3-001`…`RN3-007`, `RN4-001`…`RN4-005`);
+the [1.1.0](#110--2026-10-13) entry used an earlier numbering,
+cross-referenced at the end of this entry.
+
+### Breaking changes
+
+- **Evicted, still-limited keys keep their debt; past the exact table the
+  default is `Overflow::FailClosed`.** In 1.x every evicted key came back with
+  a fresh allowance. Now its debt is recorded. While a store's still-limited
+  evicted keys fit about twice the cap, nothing else changes. Beyond that, the
+  default keeps every debt in a shared sketch, so some keys that never owed
+  anything may start partly or wholly drained, and a saturated shard refuses a
+  newcomer with a retry time (`Metrics::keys_refused`). Measured: no newcomer
+  denied after drain floods up to 3x the cap, about 3 % at 4x, 38 % at 6x,
+  86 % at 9x; a well-behaved population of 10x the cap sees 4 % false denials
+  at 5,000 visits a second and 72 % at 20,000. Size the cap so it never gets
+  there (README "Sizing the cap"), alert on `recovery_load()`, or opt out with
+  `Eviction::with_overflow(Overflow::Forget)`.
+- **`error-forge` is optional (feature `forge`, off by default).** The
+  `error_forge::ForgeError` impls on `RateLimiterError` and
+  `InsufficientCapacity` now need `features = ["forge"]`. The default build
+  drops 8 crates (16 → 8 normal dependencies; `parking_lot` and a proc-macro
+  among them).
+- **`DynLimiter: Send + Sync`.** The object-safe trait now requires
+  `Send + Sync`, so `Arc<dyn DynLimiter>` is shareable as written; a limiter
+  type that is not `Send + Sync` no longer implements it.
+- **`Metrics` gained fields** (`keys_remembered`, `keys_restored`,
+  `debts_forgotten`, `debts_overflowed`, `keys_refused`, `keys_rejected`); it is
+  `#[non_exhaustive]`, so only exhaustive struct literals outside the crate
+  could notice, and those were never possible.
+
+### Security
+
+- **Capacity eviction reset a still-limited key (RN-005).** In `1.1.0` the CLOCK
+  hand evicted any key not checked during one revolution, recovered or not, and
+  an evicted key that returned started with a full allowance — so flooding the
+  store with throwaway keys reset any target's limit (login attempts for one
+  username, say). The hand now prefers keys whose allowance has fully
+  recovered, and when it must evict one that has not, the shard records the
+  debt (units spent, and when they would all be back). A key that returns
+  before its debt is repaid resumes **no more permissive than it left**:
+  exactly where it was for the token and leaky buckets; with the spent units
+  charged at the return for the window algorithms (held back up to one window
+  longer). Debts go into a lazily allocated, cuckoo-hashed table of 16-byte
+  records, two per key of capacity, where a key reads back only its own record.
+  When a shard's still-limited evicted keys outgrow it (about twice the cap at
+  once), `Eviction::with_overflow` decides: `Overflow::FailClosed` (the
+  default) spills them into a shared overflow sketch (four 8-byte cells per key of
+  capacity) that charges a key the smaller of its two cells — never less than
+  its own debt, but possibly a key that never owed anything — and a full shard
+  that can neither evict nor record refuses a newcomer with a retry time;
+  `Overflow::Forget` drops the debts that do not fit, so those keys may come
+  back with a fresh allowance as in `1.x` and no other key is affected. A key
+  charged from the sketch never writes that charge back (RN2-001: the first
+  2.0 candidate's merged records spread and ratcheted debt onto innocent
+  keys). An idle-TTL eviction of a key that is still owed (a per-key quota with
+  a longer recovery) records its debt the same way, judging the key by its
+  current state (RN3-001).
+  `remove`, `reset`, and `clear` forget a key's own record. Regression tests
+  (`tests/eviction_bypass.rs`) fail against `1.1.0` for every algorithm; liveness
+  tests (`tests/eviction_liveness.rs`) bound false denials under floods; `loom`
+  models cover a drained key evicted while it is checked and concurrent
+  record-and-take; property tests check that no recorded debt is ever lost and
+  that no amount of eviction lets a key exceed its token-bucket bound; a fuzz
+  target drives a heavily evicting store against an oracle.
+- **Key bytes were unbounded (RN-006).** `Builder::max_key_len` refuses
+  over-long keys (denied as impossible, never stored), and
+  `Builder::digest_keys_longer_than` stores long keys as a 16-byte digest of two
+  independently, randomly seeded hashes, so a store's memory is bounded in bytes,
+  not just keys. `tower::HeaderKey` stores values over 64 bytes as a digest
+  by default (RN2-006).
+- **An idle-expired key with a slow per-key quota could be forgotten with its
+  debt (RN3-001, found in review of this release).** The eviction trusted a
+  "recovers at" hint computed when the key was stored, even after the key had
+  spent again; a key whose `quota_for` override recovers more slowly than the
+  idle TTL came back with a fresh allowance. The hint is now ignored whenever
+  the key's reference bit says it was checked since; covered by a unit test, an
+  integration test for every algorithm, a `loom` model of the sweep racing a
+  re-check, and the fuzz target (now with slow overrides and idle TTLs).
+- **The overflow sketch under-charged window keys with a limit above
+  16,777,215 (RN3-002, found in review).** It keeps 24 bits of a spent count;
+  a full field now reads back as everything (clamped to the key's limit).
+- **`X-Forwarded-For` could be forged by a client reaching the service
+  directly (RN2-005).** `ForwardedFor::only_from(network, prefix_len)` uses the
+  header only when the connection's peer is inside the proxies' network and
+  keys by the peer otherwise; the docs no longer claim the header is never
+  client-written. Bracketed and zoned IPv6 entries now parse.
+
+### Fixed
+
+- **Long keys allocated on every check (RN-011).** `check_bytes`,
+  `check_n_bytes`, and `peek_bytes` look a key up by a borrowed view; the check
+  of an existing key allocates nothing whatever its length (36-byte UUID:
+  ~52 ns, against ~81 ns through `check`). The allocation audit now covers long
+  keys, every algorithm, and the key-length policies.
+- **Tautological hardening assertions** (`tests/hardening.rs`) replaced with
+  real ones, and every integration test renamed to the REPS
+  `test_<subject>_<condition>_<expected>` convention.
+- **Clock-sensitive examples.** Doc examples that assert a reset time now run on
+  a frozen `ManualClock`, so a stalled host cannot fail them.
+- The benchmark suite's contended figure was aggregate throughput (wall time
+  over all four threads' checks), which read about four times faster than any
+  caller sees; it is now per-check latency, measured per thread after a
+  barrier.
+- **The `quota_for` resolver ran under the shard write lock (RN2-003)**, so a
+  resolver that called back into the limiter deadlocked and a slow one stalled
+  its shard. It now runs before any lock is taken; the rules (may call other
+  keys, must not check the key being resolved, should be fast, panics
+  propagate) are documented.
+- **Per-key overrides bypassed `try_build`'s checks (RN2-010).** An override is
+  validated like the default quota; an invalid one makes its key fail closed.
+- **`tower`: `with_cost(0)` disabled limiting (RN2-008)** — a cost of `0` now
+  counts as `1`; **`RateLimit-Policy` described the default quota for keys
+  with an override (RN2-009)** — it now describes the key's own quota.
+- **The CI fuzz job could not start (RN2-002)**: it now creates the corpus
+  directories first, as do the README's commands.
+- **`deny(warnings)` broke the nightly miri and fuzz builds (RN2-012)**: it is
+  now off under `miri` and `fuzzing` as well as `docsrs`.
+- **A key whose quota admits nothing took the shard write lock on every check
+  (RN3-003)**, so a blocked tenant hammering its key serialised its shard
+  (same-shard p99.9 30.9 µs with 8 threads). It is now denied before the lock
+  (p99.9 1.5 µs); `check/blocked_key` benchmarks it.
+- **`tower::ForwardedFor::only_from` compared IPv4-compatible peers and
+  IPv4-mapped networks as IPv6 (RN3-006).** Addresses are now canonicalised as
+  `Key::ip` does (`::ffff:10.0.0.0/104` is `10.0.0.0/8`), and a `/0` network
+  matches every peer.
+
+### Added
+
+- `RateLimiter::check_bytes`, `check_n_bytes`, `peek_bytes` — allocation-free
+  checks of raw keys of any length.
+- `Builder::quota_for` — per-key quota overrides (tiered limits) from a
+  resolver called, outside any lock, when a key is about to be stored; an
+  invalid override, or one that admits nothing, blocks the key (fail closed,
+  never stored). `RateLimiter::quota_of(key)` reports the quota a key is
+  under.
+- `Builder::max_key_len`, `Builder::digest_keys_longer_than` — the key-length
+  policies above.
+- `AsyncLimiter::until_ready_within` / `until_ready_n_within` and the same on
+  `DirectLimiter` — awaits bounded by a budget: they sleep only while the next
+  admission fits the remaining budget and otherwise return the denial at once.
+  `with_jitter` / `jitter` on both add uniform random jitter to every sleep.
+  The awaiting methods document that they panic outside a Tokio runtime.
+- `Snapshot::ratelimit` and `Quota::ratelimit_policy` — the current IETF draft's
+  structured `RateLimit` (`"name";r=..;t=..`) and `RateLimit-Policy`
+  (`"name";q=..;w=..`) field values, formatted without allocating;
+  `headers::RATELIMIT`, `headers::RATELIMIT_POLICY`, `headers::RateLimitValue`,
+  `headers::RateLimitPolicyValue`.
+- `tower` feature: `rate_net::tower::RateLimitLayer` for inbound HTTP in front
+  of any `tower::Service` (axum, hyper, tonic), with `KeyExtractor`
+  implementations `PeerIp`, `ForwardedFor` (trusting a fixed number of
+  proxies, optionally only from their network), `HeaderKey`, and closures over
+  `RequestInfo`; denied requests get `429` with `Retry-After` and the rate-limit
+  headers without reaching the inner service. `with_anonymous(Anonymous)`
+  chooses what requests with no identity are charged to — one shared key (the
+  default), a key of your choice, or nothing, rejected with a status (RN2-007).
+  Adds `http`, `tower-layer`, `tower-service`, and `pin-project-lite` (not
+  `tower` itself). `examples/tower_layer.rs`.
+- `Eviction::with_overflow` / `Eviction::overflow` and the `#[non_exhaustive]`
+  `Overflow` enum (`FailClosed`, the default; `Forget`): what happens to debts
+  of still-limited evicted keys past the exact table.
+- Saturation guardrails: `RateLimiter::recovery_load()` and `RecoveryLoad`
+  (feature `metrics`) — the debts held against the exact capacity, overall and
+  in the fullest shard, to alert on before anything spills or is refused;
+  `Metrics::keys_refused` as the saturation counter; the `tracing` feature,
+  which logs a `warn!` (target `rate_net::eviction`) on the first spill, drop,
+  or saturation refusal and at most once a minute while they continue, with
+  nothing on the check path (`check/single_key` within noise with it on).
+- The `forge` feature (see Breaking changes).
+- A capacity sizing guide and operations checklist (README, API reference,
+  `Eviction` docs), with how NGINX `limit_req` and `governor` behave for
+  comparison.
+- `Metrics`: `keys_remembered`, `keys_restored`, `debts_forgotten`,
+  `debts_overflowed`, `keys_refused`, `keys_rejected`.
+- `Key::len`, `Key::is_empty`, `From<[u8; N]>`, `From<&[u8; N]>` for `Key`.
+- Tests: `tests/eviction_bypass.rs`, `tests/eviction_liveness.rs`,
+  `tests/key_options.rs`, the eviction and recovery-table property tests,
+  allocation audits for long keys and every algorithm, `loom` models of the
+  evict-and-return race and of concurrent record-and-take, unwind-safety
+  assertions.
+- Fuzzing: `fuzz/` with `limiter_ops` (arbitrary checks, clock advances, resets,
+  removals, and sweeps on a heavily evicting store, against a token-bucket
+  oracle) and `http_keys` (key extraction from hostile headers, and structured
+  field values from arbitrary policy names). Smoke-run in CI.
+- Benchmarks: `check/long_key`, `check/long_key_bytes`, and `benches/flood.rs`
+  (a legitimate key's p50/p99/p99.9 while three threads flood the default
+  limiter at its cap, with recovering and with draining flood keys).
+
+### Changed
+
+- **Typed per-key state.** The store is generic over the algorithm's state, so
+  a key holds exactly that state with no enum tag, and the token bucket keeps
+  `better-bucket`'s clock-free `BucketCore` (the limiter reads the clock once,
+  just before the key's accounting). A token-bucket key is 128 bytes in its
+  shard; heap per key at the default cap fell from ~202 B to ~138 B (~140 MiB
+  at the 1,048,576-key default cap). A quota that admits nothing is never
+  stored.
+- `better-bucket` is used without features (only `BucketCore`), so it no longer
+  pulls `clock-lib` and `error-forge` in a second time.
+- An insert at capacity costs ~58 ns more at the default cap (293 → 351 ns)
+  because eviction now reads each candidate's state to prefer recovered keys —
+  a known issue (below); a small, cache-resident shard's insert got slightly
+  faster. Many-key checks and `peek` are faster (fewer cache lines per key).
+  See `docs/BENCHMARKS.md`.
+- The recovery tables cost 32 bytes per key of capacity once a shard first
+  evicts a still-limited key, 64 under `Overflow::FailClosed` (32 or 64 MiB at
+  the default cap: about 170 or 202 MiB in all under eviction pressure).
+- `Cargo.lock` is committed and `rust-toolchain.toml` pins Rust 1.99.0 for
+  development (excluded from the package); every CI job selects its toolchain
+  explicitly and prints `rustc -V`; a weekly and per-PR *latest dependencies*
+  job runs `cargo update` (true latest on 1.99.0, MSRV-compatible latest on
+  1.85) before building, testing, linting, and auditing; the
+  package no longer ships `REPS.md`, `.github/`, or editor configuration
+  (RN2-016).
+- `#![deny(warnings)]` stays in the crate root as REPS requires, but not on
+  docs.rs (`cfg(docsrs)`), whose nightly rustdoc can add lints after a release
+  and fail the published docs; downstream builds were never affected (Cargo caps
+  dependency lints), and CI enforces `-D warnings` on stable and the MSRV.
+- Clippy pedantic is clean on every target (a CI job enforces it); each allowed
+  lint is narrowly scoped with a reason.
+- CI: `actions/checkout@v7`; an each-feature matrix via `cargo-hack` (clippy,
+  tests, and docs for every feature alone, on stable and the MSRV); pedantic,
+  release-mode stress, coverage, and fuzz-smoke jobs; `semver-checks` on all
+  features; miri over the recovery-table and eviction tests.
+- `tests/memory.rs` budget tightened from 512 to 256 B per key.
+
+### Not changed, with reasons
+
+- **No `From` impls for other integer types (RN-011).** A second integer
+  conversion would make an unsuffixed literal (`limiter.check(42)`) ambiguous —
+  verified to stop compiling — so `u32` / `i64` / `u128` keys use `Key::id` or
+  an explicit `u64`.
+- **The default capacity stays at 1,048,576 keys (RN-006).** The bound (about
+  140 MiB idle, 202 MiB under eviction pressure) is documented precisely, with
+  a sizing guide, instead.
+- **No blanket `Limiter` impls for `&L` and `Box<L>`.** They would conflict
+  with impls downstream code may have written; not worth a break on their own.
+- **Idle keys are reclaimed only by inserts or `retain_recent` (RN-021).**
+  Automatic background reclamation needs a thread, which the runtime-free
+  design avoids; `retain_recent` is the maintenance hook (and now also releases
+  an expired recovery table).
+- **`CHANGELOG` dates for 0.9.0–1.0.0 (RN-023).** The entries are a historical
+  record and are not rewritten; the "soak" wording there describes intent, not a
+  measured period.
+
+### Known issues
+
+- **Inserting a new key into a full store costs ~58 ns more than in `1.1.0`**
+  (≈293 → 351 ns at the default 1,048,576-key cap; measured on a loaded Windows
+  host, best of runs, so approximate), because eviction checks that each
+  candidate has fully recovered before evicting it — the price of never
+  resetting a still-limited key. Checks of tracked keys are unaffected, and
+  below the cap nothing changes. To be optimised in a future release; a
+  blocker for the next minor release, 2.1.0.
+- **Past about twice the cap of still-limited evictions, one side gives.**
+  Under the default `Overflow::FailClosed`, keys that owed nothing may be
+  charged or refused. Under `Overflow::Forget`, the debts that do not fit are
+  dropped and those keys may come back with a fresh allowance — a sustained
+  unique-key flood can reset a targeted key repeatedly. Measured (ManualClock, 128
+  shards): `FailClosed` denies no newcomer after drain floods up to 3x the
+  cap, about 3 % at 4x, 38 % at 6x, 86 % at 9x; a well-behaved population of
+  10x the cap sees 4 % false denials at 5,000 visits a second and 72 % at
+  20,000. `Forget` denies none of them. Under `FailClosed`, `reset` and
+  `remove` cannot clear a shared charge for one key (it expires within one
+  recovery period), and a slow tier's charge can drain a fast-tier newcomer
+  for the slow tier's recovery time.
+- **`clock-lib` 1.1.0 does not build under `--cfg loom` (RN2-015)**; the `loom`
+  job pins 1.0.0 until it is fixed upstream.
+
+### Audit cross-reference (2026-10-13, `RN-0xx`)
+
+| ID | Status |
+|----|--------|
+| RN-001 token-bucket over-admission | Fixed in 1.1.0 (`better-bucket` 1.1); 2.0 drives `BucketCore` directly |
+| RN-002 fixed-window lost update | Fixed in 1.1.0 |
+| RN-003 O(n) eviction scan | Fixed in 1.1.0; 2.0 adds the flood tail-latency benchmark |
+| RN-004 O(n) idle sweep | Fixed in 1.1.0 |
+| RN-005 eviction resets limited keys | Idle TTL fixed in 1.1.0; capacity eviction fixed in **2.0.0** |
+| RN-006 memory bound, unbounded key bytes | **2.0.0**: ~138 B/key, documented; `max_key_len`, `digest_keys_longer_than` |
+| RN-007 sliding-counter retry_after | Fixed in 1.1.0 |
+| RN-008 GCRA fail-open, degenerate configs | Fixed in 1.1.0 (`try_build`) |
+| RN-009 sliding-log memory per unit | Fixed in 1.1.0 (run-length records) |
+| RN-010 token-bucket capacity cap | Fixed in 1.1.0 (`better-bucket` 1.1) |
+| RN-011 long keys allocate | **2.0.0**: `check_bytes` & co., array `From` impls; integer impls declined (above) |
+| RN-012 hot-path write traffic | Fixed in 1.1.0; 2.0 typed slots and a late clock read |
+| RN-013 stale `now` in sliding algorithms | Fixed in 1.1.0 |
+| RN-014 validation gaps, `check_n` doc | Fixed in 1.1.0 (`try_build` covers `with_burst(0)`) |
+| RN-015 `--no-default-features` tests | Fixed in 1.1.0; 2.0 tests every feature alone in CI |
+| RN-016 Retry-After rounding | Fixed in 1.1.0 |
+| RN-017 `Limiter` not dyn-compatible | Fixed in 1.1.0 (`DynLimiter`); **2.0.0** adds the `Send + Sync` supertrait |
+| RN-018 cross-type key collisions | Fixed in 1.1.0 (tagged keys, redacted `Debug`) |
+| RN-019 pedantic lints, `deny(warnings)` | **2.0.0**: pedantic clean and enforced; docs.rs exempted |
+| RN-020 broken link, README compile | Fixed in 1.1.0 |
+| RN-021 no reclamation / shrink | Fixed in 1.1.0 (key management); background sweep declined (above) |
+| RN-022 `error-forge` weight | 1.0.2 in 1.1.0; **2.0.0**: optional `forge` feature, off by default |
+| RN-023 CI / process | **2.0.0**: checkout v7, feature matrix, coverage, fuzz; toolchain pinned, lock committed |
+
+The `1.1.0` entry's identifiers come from an earlier pass and map as:
+RN-COR-01 = RN-001; RN-SEC-01 = RN-003 and RN-004; RN-COR-03 = RN-002;
+RN-COR-04 = RN-008; RN-COR-05 = RN-008 and RN-010; RN-COR-07 = RN-005 (idle
+TTL); RN-COR-08 = RN-001 and RN-010 (the 49.7-day wrap); RN-SEC-03 = RN-009;
+RN-SEC-04 and RN-SEC-05 = RN-018. RN-COR-02 (a fixed-window `u32` overflow) and
+RN-COR-06 (`until_ready` returning as if admitted) had no counterpart in this
+audit.
+
+---
+
 ## [1.1.0] — 2026-10-13
 
 **Correctness, hardening, and the HTTP surface.** A minor release: every change
@@ -582,7 +908,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/rate-net/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/jamesgober/rate-net/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/rate-net/compare/v0.9.5...v1.0.0
 [0.9.5]: https://github.com/jamesgober/rate-net/compare/v0.9.0...v0.9.5

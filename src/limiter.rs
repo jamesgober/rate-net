@@ -2,27 +2,94 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clock_lib::{Clock, Monotonic, SystemClock};
 
-use crate::algo::{AlgoState, fresh_snapshot};
+use crate::algo::fresh_snapshot;
 use crate::algorithm::Algorithm;
 use crate::decision::Decision;
 use crate::eviction::Eviction;
-use crate::key::Key;
+use crate::key::{Digester, Key, KeyRef};
 use crate::quota::Quota;
 use crate::snapshot::Snapshot;
-use crate::store::Store;
+use crate::store::{Keyed, Known};
+
+/// A per-key quota resolver: see [`Builder::quota_for`](crate::Builder::quota_for).
+#[derive(Clone)]
+pub(crate) struct QuotaFn(Arc<Resolver>);
+
+/// The resolver closure behind a [`QuotaFn`].
+type Resolver = dyn Fn(&Key) -> Option<Quota> + Send + Sync + 'static;
+
+impl QuotaFn {
+    pub(crate) fn new(resolve: impl Fn(&Key) -> Option<Quota> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(resolve))
+    }
+
+    fn resolve(&self, key: &Key) -> Option<Quota> {
+        (self.0)(key)
+    }
+}
+
+// The limiter stays unwind-safe with a resolver, as it was without one. The
+// resolver runs only while a new key's state is being created, before the
+// store is modified, so a panic in it unwinds out of the check with every
+// shard consistent (and a poisoned shard lock is recovered on next use); the
+// limiter never observes the resolver's own state afterwards.
+impl UnwindSafe for QuotaFn {}
+impl RefUnwindSafe for QuotaFn {}
+
+/// The optional per-key behaviour a limiter carries beyond its quota: the
+/// key-length policy and the per-key quota resolver. Set through the
+/// [`Builder`](crate::Builder); kept across the `with_*` rebuilds.
+#[derive(Clone, Default)]
+pub(crate) struct KeyOptions {
+    /// Keys longer than this many bytes are denied and never stored.
+    pub(crate) max_key_len: Option<usize>,
+    /// Keys longer than this many bytes are stored as a keyed 128-bit digest.
+    pub(crate) digest_over: Option<usize>,
+    /// Overrides the default quota for chosen keys, consulted when a key's
+    /// state is created.
+    pub(crate) quota_for: Option<QuotaFn>,
+}
+
+impl KeyOptions {
+    /// Whether any key-length policy applies, so the common check path can
+    /// skip the policy entirely with one branch.
+    const fn limits_length(&self) -> bool {
+        self.max_key_len.is_some() || self.digest_over.is_some()
+    }
+}
+
+impl fmt::Debug for KeyOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyOptions")
+            .field("max_key_len", &self.max_key_len)
+            .field("digest_over", &self.digest_over)
+            .field("quota_for", &self.quota_for.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
+}
+
+/// How the key-length policy treats one key.
+enum Admitted<'a> {
+    /// Look the key up as it is.
+    AsIs(KeyRef<'a>),
+    /// Look the key up by this digest of it.
+    Digest([u8; 16]),
+    /// Refuse it: longer than the maximum key length.
+    TooLong,
+}
 
 /// Default shard count when the caller does not choose one: four shards per
 /// available core, rounded to a power of two and clamped to a sane range. More
 /// shards means less contention between unrelated keys, at the cost of a little
 /// more memory.
 pub(crate) fn default_shard_count() -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(1);
+    let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
     (parallelism.saturating_mul(4))
         .next_power_of_two()
         .clamp(1, 4096)
@@ -68,9 +135,12 @@ pub trait Limiter {
 /// `Limiter`'s methods are generic over `impl Into<Key>`, which keeps call
 /// sites short but means `dyn Limiter` cannot exist. `DynLimiter` has one
 /// non-generic method, so `&dyn DynLimiter`, `Box<dyn DynLimiter>`, and
-/// `Arc<dyn DynLimiter + Send + Sync>` all work — the shape middleware wants
-/// when the limiter is chosen at runtime. Every [`Limiter`] implements it
-/// automatically, and the trait objects implement `Limiter` again, so the
+/// `Arc<dyn DynLimiter>` all work — the shape middleware wants when the
+/// limiter is chosen at runtime. It requires `Send + Sync`, so every
+/// `dyn DynLimiter` can be shared across threads without spelling the bounds
+/// out (`dyn DynLimiter + Send + Sync` remains the same thing). Every
+/// `Send + Sync` [`Limiter`] implements it automatically, and the trait
+/// objects implement `Limiter` again, so the
 /// ergonomic `check` / `check_n` stay available on them.
 ///
 /// # Examples
@@ -80,19 +150,19 @@ pub trait Limiter {
 /// use std::sync::Arc;
 ///
 /// // Pick an implementation at runtime and hold it as a trait object.
-/// let limiter: Arc<dyn DynLimiter + Send + Sync> = Arc::new(RateLimiter::per_second(1));
+/// let limiter: Arc<dyn DynLimiter> = Arc::new(RateLimiter::per_second(1));
 ///
 /// assert!(limiter.check_key("user:42".into(), 1).is_allow());
 /// // The trait object is itself a `Limiter`, so the generic helpers work too.
 /// assert!(limiter.check("user:42").is_deny());
 /// ```
-pub trait DynLimiter {
+pub trait DynLimiter: Send + Sync {
     /// Checks `n` units against `key`. The non-generic core of
     /// [`Limiter::check_n`].
     fn check_key(&self, key: Key, n: u32) -> Decision;
 }
 
-impl<L: Limiter> DynLimiter for L {
+impl<L: Limiter + Send + Sync> DynLimiter for L {
     #[inline]
     fn check_key(&self, key: Key, n: u32) -> Decision {
         self.check_n(key, n)
@@ -135,7 +205,8 @@ impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
 /// atomic compare-and-swap for the token bucket, leaky bucket, and fixed
 /// window; a short per-key mutex for the sliding windows), and memory is
 /// bounded by O(1) [eviction](Self::with_eviction) so a flood of unique keys
-/// hits a cap instead of growing without limit. The
+/// hits a cap instead of growing without limit — without ever resetting an
+/// evicted key's limit. The
 /// limiter is `Send + Sync` and is meant to be shared — behind an
 /// [`Arc`](std::sync::Arc), or as a `static` — across all the threads serving
 /// requests.
@@ -170,12 +241,14 @@ pub struct RateLimiter<C: Clock + Clone = SystemClock> {
     epoch: Monotonic,
     shards: usize,
     eviction: Eviction,
-    store: Store<C>,
-    /// Whether the check path must read the clock: the token bucket reads its
-    /// own clock and capacity-only eviction needs no real time, so the common
-    /// case skips the read entirely. Window algorithms (which need `now`) and an
-    /// idle TTL (which measures real elapsed time) turn it on.
-    reads_clock: bool,
+    store: Keyed,
+    options: KeyOptions,
+    /// Seeds for long-key digests; present only when digesting is enabled.
+    digester: Option<Digester>,
+    /// Limiter-level counters (over-long keys refused before any shard is
+    /// touched). Absent without the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    counters: crate::metrics::Counters,
 }
 
 impl RateLimiter<SystemClock> {
@@ -239,6 +312,7 @@ impl RateLimiter<SystemClock> {
             SystemClock::new(),
             default_shard_count(),
             Eviction::default(),
+            KeyOptions::default(),
         )
     }
 
@@ -275,14 +349,15 @@ impl<C: Clock + Clone> RateLimiter<C> {
         clock: C,
         shards: usize,
         eviction: Eviction,
+        options: KeyOptions,
     ) -> Self {
         let epoch = clock.now();
         // An idle TTL never evicts a key before it could have recovered its
         // full allowance; evicting sooner would hand out a fresh quota early.
-        let store = Store::new(shards, eviction, algorithm.recovery_time(&quota));
-        // The token bucket reads its own clock and capacity-only eviction orders
-        // by a logical counter, so that combination needs no clock read here.
-        let reads_clock = algorithm != Algorithm::TokenBucket || eviction.idle_ttl().is_some();
+        // (A key with an overridden quota that is still owed when it expires
+        // has its debt recorded instead, like any other eviction.)
+        let store = Keyed::new(algorithm, shards, eviction, algorithm.recovery_time(&quota));
+        let digester = options.digest_over.map(|_| Digester::new());
         Self {
             algorithm,
             quota,
@@ -291,7 +366,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
             shards,
             eviction,
             store,
-            reads_clock,
+            options,
+            digester,
+            #[cfg(feature = "metrics")]
+            counters: crate::metrics::Counters::new(),
         }
     }
 
@@ -331,6 +409,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
             clock,
             self.shards,
             self.eviction,
+            self.options,
         )
     }
 
@@ -358,6 +437,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
             self.clock,
             self.shards,
             self.eviction,
+            self.options,
         )
     }
 
@@ -383,6 +463,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
             self.clock,
             shards,
             self.eviction,
+            self.options,
         )
     }
 
@@ -410,6 +491,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
             self.clock,
             self.shards,
             eviction,
+            self.options,
         )
     }
 
@@ -418,7 +500,9 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// Returns [`Decision::Allow`] if the key is within its limit (the unit is
     /// counted), or [`Decision::Deny`] with the wait until it would be admitted.
     /// The key can be anything that converts into a [`Key`] — a string, an IP
-    /// address, a user id.
+    /// address, a user id. A key longer than 22 bytes is copied into a new
+    /// allocation on every call; [`check_bytes`](Self::check_bytes) borrows it
+    /// instead.
     ///
     /// # Examples
     ///
@@ -431,7 +515,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[inline]
     pub fn check(&self, key: impl Into<Key>) -> Decision {
-        self.check_inner(key.into(), 1)
+        self.check_ref(key.into().as_key_ref(), 1)
     }
 
     /// Checks `n` units against `key` in one operation.
@@ -457,7 +541,53 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[inline]
     pub fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
-        self.check_inner(key.into(), n)
+        self.check_ref(key.into().as_key_ref(), n)
+    }
+
+    /// Checks a single unit against the raw key `key`, without building an
+    /// owned [`Key`].
+    ///
+    /// Equivalent to `check(key)` for a `&str`, `&[u8]`, `String`, or
+    /// `Vec<u8>` key — the same identity, the same state — but the key is only
+    /// borrowed for the lookup: an existing key's check never allocates, however
+    /// long the key. `check` copies a key longer than 22 bytes (a UUID string,
+    /// an API token, a JWT subject) into a new allocation on every call; this
+    /// does so only the first time the key is stored. Use it on hot paths with
+    /// long keys.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(2);
+    /// let token = "9f6c1d2e-8b7a-4c3d-9e1f-0a2b3c4d5e6f";
+    /// assert!(limiter.check_bytes(token).is_allow());
+    /// // The same key as `check(token)`.
+    /// assert!(limiter.check(token).is_allow());
+    /// assert!(limiter.check_bytes(token.as_bytes()).is_deny());
+    /// ```
+    #[inline]
+    pub fn check_bytes(&self, key: impl AsRef<[u8]>) -> Decision {
+        self.check_ref(KeyRef::raw(key.as_ref()), 1)
+    }
+
+    /// Checks `n` units against the raw key `key`, without building an owned
+    /// [`Key`]. See [`check_bytes`](Self::check_bytes) and
+    /// [`check_n`](Self::check_n).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(10);
+    /// assert!(limiter.check_n_bytes(b"tenant:acme", 10).is_allow());
+    /// assert!(limiter.check_n("tenant:acme", 1).is_deny());
+    /// ```
+    #[inline]
+    pub fn check_n_bytes(&self, key: impl AsRef<[u8]>, n: u32) -> Decision {
+        self.check_ref(KeyRef::raw(key.as_ref()), n)
     }
 
     /// The quota every key is limited to.
@@ -575,18 +705,44 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// ```
     #[must_use]
     pub fn peek(&self, key: impl Into<Key>) -> Snapshot {
-        let key = key.into();
-        self.store
-            .peek(&key, self.now())
-            .unwrap_or_else(|| fresh_snapshot(self.algorithm, &self.quota))
+        self.peek_ref(key.into().as_key_ref())
+    }
+
+    /// Reads the raw key `key`'s remaining allowance without building an owned
+    /// [`Key`]. See [`peek`](Self::peek) and
+    /// [`check_bytes`](Self::check_bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::RateLimiter;
+    ///
+    /// let limiter = RateLimiter::per_second(10);
+    /// let token = "a-long-api-token-0123456789abcdef";
+    /// assert!(limiter.check_n_bytes(token, 3).is_allow());
+    /// assert_eq!(limiter.peek_bytes(token).remaining(), 7);
+    /// ```
+    #[must_use]
+    pub fn peek_bytes(&self, key: impl AsRef<[u8]>) -> Snapshot {
+        self.peek_ref(KeyRef::raw(key.as_ref()))
     }
 
     /// Restores `key`'s full allowance, as if it had been idle long enough to
     /// refill completely. The key stays tracked.
     ///
     /// For administrative unblocks ("this customer was throttled by mistake")
-    /// and tests. Returns `true` if the key had state, `false` if it was not
-    /// tracked (an untracked key already has its full allowance).
+    /// and tests. A debt recorded for the key itself when it was evicted (see
+    /// [`Eviction`]) is forgotten too. Returns `true` if the key had state or a
+    /// recorded debt of its own, `false` if neither.
+    ///
+    /// A tracked key's allowance is whole afterwards. An untracked key's own
+    /// record is cleared, but if the store has been evicting unrecovered keys
+    /// faster than its exact recovery table holds them (see [`Eviction`]), its
+    /// next check can still be charged from the shared overflow, which no
+    /// single key can clear; that charge expires within one recovery period,
+    /// and [`clear`](Self::clear) drops it at once.
+    /// A key the limiter refuses outright ([`Builder::max_key_len`](crate::Builder::max_key_len))
+    /// has neither.
     ///
     /// # Examples
     ///
@@ -602,13 +758,21 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// assert!(!limiter.reset("never-seen"));
     /// ```
     pub fn reset(&self, key: impl Into<Key>) -> bool {
-        self.store.reset(&key.into())
+        let key = key.into();
+        match self.admit(key.as_key_ref()) {
+            Admitted::AsIs(key) => self.store.reset(key, self.now()),
+            Admitted::Digest(digest) => self.store.reset(KeyRef::digest(&digest), self.now()),
+            Admitted::TooLong => false,
+        }
     }
 
-    /// Forgets `key` entirely, releasing its state. Its next check starts from
-    /// a fresh allowance.
+    /// Forgets `key` entirely, releasing its state and any debt recorded for it
+    /// when it was evicted. Its next check starts from a fresh allowance —
+    /// unless, as for [`reset`](Self::reset), the shared overflow of an
+    /// overloaded recovery table charges it, which expires within one recovery
+    /// period.
     ///
-    /// Returns `true` if the key had state.
+    /// Returns `true` if the key had state or a recorded debt of its own.
     ///
     /// # Examples
     ///
@@ -624,11 +788,16 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// assert!(!limiter.remove("user:42"));
     /// ```
     pub fn remove(&self, key: impl Into<Key>) -> bool {
-        self.store.remove(&key.into())
+        let key = key.into();
+        match self.admit(key.as_key_ref()) {
+            Admitted::AsIs(key) => self.store.remove(key, self.now()),
+            Admitted::Digest(digest) => self.store.remove(KeyRef::digest(&digest), self.now()),
+            Admitted::TooLong => false,
+        }
     }
 
-    /// Forgets every key and releases the store's memory. Every key's next
-    /// check starts from a fresh allowance.
+    /// Forgets every key and every recorded debt, and releases the store's
+    /// memory. Every key's next check starts from a fresh allowance.
     ///
     /// # Examples
     ///
@@ -697,6 +866,30 @@ impl<C: Clock + Clone> RateLimiter<C> {
         self.store.shrink_to_fit();
     }
 
+    /// The quota `key` is limited by: its [`quota_for`](crate::Builder::quota_for)
+    /// override if it has a valid one, a quota that admits nothing (`limit`
+    /// `0`) if the override is invalid, otherwise [`quota`](Self::quota).
+    ///
+    /// Calls the resolver (it is not cached). For a `RateLimit-Policy` header
+    /// that describes the quota a key is actually under.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Quota, RateLimiter};
+    ///
+    /// let limiter = RateLimiter::builder()
+    ///     .per_second(10)
+    ///     .quota_for(|key| (key.as_bytes() == b"vip").then(|| Quota::per_second(100)))
+    ///     .build();
+    /// assert_eq!(limiter.quota_of("vip").limit(), 100);
+    /// assert_eq!(limiter.quota_of("anyone").limit(), 10);
+    /// ```
+    #[must_use]
+    pub fn quota_of(&self, key: impl Into<Key>) -> Quota {
+        self.quota_of_ref(key.into().as_key_ref())
+    }
+
     /// The limiter's cumulative counters: checks allowed and denied, and keys
     /// inserted, evicted, expired, and removed. Requires the `metrics` feature;
     /// see [`Metrics`](crate::Metrics) for what each counter means.
@@ -715,30 +908,129 @@ impl<C: Clock + Clone> RateLimiter<C> {
     #[cfg(feature = "metrics")]
     #[must_use]
     pub fn metrics(&self) -> crate::Metrics {
-        self.store.metrics()
+        let mut metrics = self.store.metrics();
+        self.counters.add_to(&mut metrics);
+        metrics
     }
 
-    /// The shared check path: hand the key to the store as of the elapsed time,
-    /// seeding fresh per-key state if this is the first time the key is seen.
+    /// How full the recovery tables are — the gauge to alert on before the
+    /// store runs out of room to keep evicted keys' debts (see
+    /// [`RecoveryLoad`](crate::RecoveryLoad) and [`Eviction`]).
+    ///
+    /// Walks every shard's recovery table under its read lock — up to 64 bytes
+    /// per key of capacity under the default
+    /// [`Overflow::FailClosed`](crate::Overflow) (32 of exact records, 32 of
+    /// overflow sketch), 32 under [`Overflow::Forget`](crate::Overflow) (exact
+    /// records only) — so call it from a periodic exporter, every few seconds,
+    /// never per request. Requires the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Eviction, RateLimiter};
+    ///
+    /// let limiter = RateLimiter::per_minute(1)
+    ///     .with_shards(1)
+    ///     .with_eviction(Eviction::capacity(64));
+    /// for user in 0..100u64 {
+    ///     let _ = limiter.check(user); // each one drained, then evicted
+    /// }
+    /// let load = limiter.recovery_load();
+    /// assert_eq!(load.debts_held, 36);
+    /// assert!(load.utilization() < 0.7, "plenty of room");
+    /// ```
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub fn recovery_load(&self) -> crate::RecoveryLoad {
+        self.store.recovery_load(self.now())
+    }
+
+    /// The shared check path: read the clock once, apply the key-length
+    /// policy, and hand the borrowed key to the store, which seeds fresh
+    /// per-key state if this is the first time the key is seen.
     #[inline]
-    fn check_inner(&self, key: Key, n: u32) -> Decision {
-        let now = if self.reads_clock {
-            self.now()
-        } else {
-            Duration::ZERO
+    pub(crate) fn check_ref(&self, key: KeyRef<'_>, n: u32) -> Decision {
+        if !self.options.limits_length() {
+            return self
+                .store
+                .check(key, n, || self.now(), || self.quota_of_ref(key));
+        }
+        self.check_with_policy(key, n)
+    }
+
+    /// The check path under a key-length policy: refuse an over-long key, or
+    /// look a long one up by its digest.
+    fn check_with_policy(&self, key: KeyRef<'_>, n: u32) -> Decision {
+        match self.admit(key) {
+            Admitted::AsIs(key) => {
+                self.store
+                    .check(key, n, || self.now(), || self.quota_of_ref(key))
+            }
+            Admitted::Digest(digest) => self.store.check(
+                KeyRef::digest(&digest),
+                n,
+                || self.now(),
+                || self.quota_of_ref(key),
+            ),
+            Admitted::TooLong => {
+                #[cfg(feature = "metrics")]
+                {
+                    self.counters.rejected();
+                    self.counters.decision(false);
+                }
+                Decision::Deny {
+                    retry_after: Duration::MAX,
+                }
+            }
+        }
+    }
+
+    /// How the key-length policy treats `key`.
+    fn admit<'a>(&self, key: KeyRef<'a>) -> Admitted<'a> {
+        let len = key.bytes().len();
+        if self.options.max_key_len.is_some_and(|max| len > max) {
+            return Admitted::TooLong;
+        }
+        match (&self.digester, self.options.digest_over) {
+            (Some(digester), Some(over)) if len > over => Admitted::Digest(digester.digest(key)),
+            _ => Admitted::AsIs(key),
+        }
+    }
+
+    /// The shared peek path: a tracked key's snapshot, an evicted key's
+    /// outstanding debt applied to a fresh allowance, or a fresh allowance.
+    pub(crate) fn peek_ref(&self, key: KeyRef<'_>) -> Snapshot {
+        let now = self.now();
+        let known = match self.admit(key) {
+            Admitted::AsIs(stored) => self.store.peek(stored, now),
+            Admitted::Digest(digest) => self.store.peek(KeyRef::digest(&digest), now),
+            Admitted::TooLong => return Snapshot::closed(),
         };
-        self.store.check(key, n, now, || self.new_state(now))
+        match known {
+            Known::Tracked(snapshot) => snapshot,
+            Known::Owed(debt) => self.store.owed_snapshot(debt, &self.quota_of_ref(key), now),
+            Known::Unknown => fresh_snapshot(self.algorithm, &self.quota_of_ref(key)),
+        }
     }
 
-    /// Builds fresh per-key state for the configured algorithm and quota,
-    /// anchored at the elapsed time `now`.
-    fn new_state(&self, now: Duration) -> AlgoState<C> {
-        AlgoState::new(self.algorithm, &self.quota, self.clock.clone(), now)
+    /// The quota for `key`: the per-key override if the resolver gives a
+    /// valid one, a quota that admits nothing if it gives an invalid one (fail
+    /// closed), otherwise the limiter's quota.
+    pub(crate) fn quota_of_ref(&self, key: KeyRef<'_>) -> Quota {
+        let Some(resolve) = self.options.quota_for.as_ref() else {
+            return self.quota;
+        };
+        match resolve.resolve(&key.to_key()) {
+            None => self.quota,
+            Some(quota) if self.algorithm.validate(&quota).is_ok() => quota,
+            Some(quota) => Quota::from_parts(0, quota.period(), 0),
+        }
     }
 
-    /// Monotonic elapsed time since this limiter's epoch, for the window
-    /// algorithms and eviction timestamps. Saturating, so a multi-million-year
-    /// uptime cannot wrap it.
+    /// Monotonic elapsed time since this limiter's epoch, the time every
+    /// algorithm and the eviction stamps run on. Saturating, so a
+    /// multi-million-year uptime cannot wrap it.
+    #[inline]
     fn now(&self) -> Duration {
         self.clock.now().saturating_duration_since(self.epoch)
     }
@@ -746,7 +1038,7 @@ impl<C: Clock + Clone> RateLimiter<C> {
 
 impl<C: Clock + Clone> Limiter for RateLimiter<C> {
     fn check_n(&self, key: impl Into<Key>, n: u32) -> Decision {
-        self.check_inner(key.into(), n)
+        self.check_ref(key.into().as_key_ref(), n)
     }
 }
 
@@ -760,8 +1052,9 @@ impl<C: Clock + Clone> fmt::Debug for RateLimiter<C> {
             .field("quota", &self.quota)
             .field("shards", &self.shards())
             .field("eviction", &self.eviction)
+            .field("keys", &self.options)
             .field("tracked_keys", &self.store.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -924,8 +1217,8 @@ mod tests {
     fn test_limiter_trait_generic() {
         fn count_admitted<L: Limiter>(limiter: &L, key: &str, attempts: u32) -> u32 {
             (0..attempts)
-                .filter(|_| limiter.check(key).is_allow())
-                .count() as u32
+                .map(|_| u32::from(limiter.check(key).is_allow()))
+                .sum()
         }
         let limiter = RateLimiter::per_second(3);
         assert_eq!(count_admitted(&limiter, "k", 10), 3);
@@ -952,6 +1245,10 @@ mod tests {
 
     #[test]
     fn test_limiter_is_implemented_for_arc() {
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "the test takes the limiter by value on purpose"
+        )]
         fn admit<L: Limiter>(limiter: L) -> bool {
             limiter.check("k").is_allow()
         }
@@ -959,6 +1256,18 @@ mod tests {
         assert!(admit(Arc::clone(&limiter)));
         assert!(admit(Arc::clone(&limiter)));
         assert!(!admit(limiter));
+    }
+
+    #[cfg(feature = "algorithms")]
+    #[test]
+    fn test_with_algorithm_keeps_the_key_options() {
+        let limiter = RateLimiter::builder()
+            .per_second(10)
+            .max_key_len(3)
+            .build()
+            .with_algorithm(Algorithm::FixedWindow);
+        assert!(limiter.check("abcd").is_impossible());
+        assert!(limiter.check("abc").is_allow());
     }
 
     #[test]

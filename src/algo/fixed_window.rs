@@ -32,6 +32,16 @@ fn nanos(now: Duration) -> u64 {
 /// the window number; the full number lives in `latest`, which is what decides
 /// whether a stored count belongs to the caller's window, so a wrapped index can
 /// never be mistaken for the current window.
+/// The low 32 bits of a window number: the packed index. Truncation is the
+/// packing contract; `latest` keeps the full number.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the packed window index is deliberately the low 32 bits"
+)]
+const fn low_bits(window: u64) -> u32 {
+    window as u32
+}
+
 const fn pack(window_index: u32, count: u32) -> u64 {
     ((window_index as u64) << 32) | (count as u64)
 }
@@ -65,7 +75,7 @@ impl FixedWindow {
         Self {
             // Truncation to the low 32 bits is the packing contract; `latest`
             // keeps the full number.
-            state: AtomicU64::new(pack(window as u32, 0)),
+            state: AtomicU64::new(pack(low_bits(window), 0)),
             latest: AtomicU64::new(window),
             period_ns,
             limit: quota.limit(),
@@ -92,7 +102,7 @@ impl FixedWindow {
         // is the newest window and the state word has switched to it. A state
         // word that has not switched yet (another thread raised `latest` and is
         // about to swap) holds an older window's count, which does not apply.
-        if latest == window && stored_index == window as u32 {
+        if latest == window && stored_index == low_bits(window) {
             stored_count
         } else {
             0
@@ -148,7 +158,7 @@ impl FixedWindow {
                 opened_over = Some((current, window));
             }
             // `total <= limit <= u32::MAX`, so the narrowing is exact.
-            let next = pack(window as u32, total as u32);
+            let next = pack(low_bits(window), u32::try_from(total).unwrap_or(u32::MAX));
             if self
                 .state
                 .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
@@ -182,7 +192,8 @@ impl FixedWindow {
     /// Zeroes the newest window's count: the key has its full allowance again.
     pub(crate) fn reset(&self) {
         let latest = self.latest.load(Ordering::Acquire);
-        self.state.store(pack(latest as u32, 0), Ordering::Release);
+        self.state
+            .store(pack(low_bits(latest), 0), Ordering::Release);
     }
 }
 

@@ -14,28 +14,37 @@
 </div>
 <br>
 
-> Numbers recorded for `v1.1.0`. Treat absolute numbers as machine-specific;
+> Numbers recorded for `v2.0.0`. Treat absolute numbers as machine-specific;
 > the relative shape between paths, the before/after, and the head-to-head are
-> the signal. Single runs on a developer workstation: expect a few nanoseconds
-> of run-to-run noise.
+> the signal.
 
 ## Method
 
 ```bash
-cargo bench --bench rate_bench
+cargo bench --bench rate_bench   # per-check latency (Criterion)
+cargo bench --bench flood        # legitimate-key tail latency under a flood
 ```
 
-The suite ([`benches/rate_bench.rs`](../benches/rate_bench.rs)) uses limiters
-with no effective rate ceiling (default token bucket), so it measures the check
-machinery — key construction and hash, shard read lock, index probe, the
-per-key accounting, and the clock read — not the denial branch.
+The Criterion suite ([`benches/rate_bench.rs`](../benches/rate_bench.rs))
+uses limiters with no effective rate ceiling (default token bucket), so it
+measures the check machinery — key construction and hash, shard read lock,
+index probe, the per-key accounting, and the clock read — not the denial
+branch. Every figure is the time of **one check** as its caller sees it.
 
 - **`check/single_key`** — the steady-state hot path: one existing `&str` key.
 - **`check/single_key_coarse_clock`** — the same on a 1 ms
   [`CoarseClock`](./API.md#coarseclock).
 - **`check/many_keys`** — 10,000 distinct `u64` keys across 64 shards, cycled.
-- **`check/contended_single_key_4t`** — four threads hammering one key; wall
-  time divided by the total number of checks (an aggregate throughput figure).
+- **`check/contended_single_key_4t`** — four threads hammering one key. Each
+  thread times its own loop (after a barrier, so thread start-up is not
+  measured), and the figure is the mean time of one check under 4-way
+  contention. (`v1.1.0` and earlier reported this benchmark as aggregate
+  throughput — wall time divided by the total number of checks across all four
+  threads — which reads about four times faster than a caller ever sees; those
+  figures are withdrawn.)
+- **`check/long_key`, `check/long_key_bytes`** — a 36-byte UUID key through
+  `check` (which copies it into an owned key, an allocation) and through
+  `check_bytes` (which borrows it).
 - **`check/eviction_sweep`** — one shard capped at 64 keys, a new key every
   call, so each measurement inserts and evicts.
 - **`check/insert_at_default_cap`** — the default limiter (default shard count,
@@ -45,56 +54,179 @@ per-key accounting, and the clock read — not the denial branch.
   [`DirectLimiter`](./API.md#directlimiter): no key, no map, no shard lock.
 - **`peek/existing_key`** — reading a snapshot for `RateLimit-*` headers.
 
-Recorded on Windows 11 x86_64 (32 logical CPUs), Rust 1.95.0, Criterion `bench`
-profile (`opt-level = 3`), against `better-bucket` 1.1.0.
+The flood harness ([`benches/flood.rs`](../benches/flood.rs)) fills the default
+limiter to its cap, then times every check of 1,000 legitimate, tracked keys on
+one thread while three other threads insert unique keys as fast as they can, and
+reports the legitimate checks' p50 / p99 / p99.9 / max. Three scenarios: no
+flood; a flood of keys that have recovered by the time they are evicted
+(lossless evictions); and a flood of keys that each drain a 1-per-minute quota,
+so every eviction records a debt — millions within one recovery period, far
+past what the exact recovery table holds, so most spill into the overflow
+sketch. Timing uses `Instant::now()`, whose resolution on Windows is 100 ns —
+hence the round numbers.
+
+**Conditions.** Windows 11 x86_64 (32 logical CPUs), Rust 1.99.0, Criterion
+`bench` profile (`opt-level = 3`, fat LTO, one codegen unit), against
+`better-bucket` 1.1.0. The machine was **shared with several other build and
+test jobs** (40–90 % CPU load) throughout. To keep the comparison fair, `v1.1.0`
+(from crates.io, the identical benchmark code in a scratch crate) and `v2.0.0`
+were run back to back, alternately, several times; the table gives the best run
+of each, and anything within ~10 % is noise at this load.
 
 ## Results
 
-| Benchmark | v1.0.0 | v1.1.0 |
+| Benchmark | v1.1.0 | v2.0.0 |
 |-----------|-------:|-------:|
-| `check/single_key` | 66.3 ns | 66.2 ns |
-| `check/single_key_coarse_clock` | — | **35.0 ns** |
-| `check/many_keys` | 86.6 ns | 54.9 ns |
-| `check/contended_single_key_4t` | 151.9 ns/op | 49.5 ns/op |
-| `check/eviction_sweep` (64-key shard) | 398 ns | 100.7 ns |
-| `check/insert_at_default_cap` | ~329 µs | **0.36 µs** |
-| `check/direct` | — | 33.4 ns |
-| `check/direct_coarse_clock` | — | **8.2 ns** |
-| `peek/existing_key` | — | 74.3 ns |
+| `check/single_key` | 60.6 ns | 59.1 ns |
+| `check/single_key_coarse_clock` | 36.3 ns | 37.5 ns |
+| `check/many_keys` | 64.0 ns | 55.4 ns |
+| `check/contended_single_key_4t` (per check) | 223 ns | 229 ns |
+| `check/long_key` (36-byte key, `check`) | 87.2 ns | 80.9 ns |
+| `check/long_key_bytes` (36-byte key, `check_bytes`) | — | **52.4 ns** |
+| `check/eviction_sweep` (64-key shard) | 108 ns | 98.7 ns |
+| `check/insert_at_default_cap` | 293 ns | 351 ns |
+| `check/direct` | 38.1 ns | 37.2 ns |
+| `check/direct_coarse_clock` | 12.2 ns | 11.1 ns |
+| `peek/existing_key` | 80.4 ns | 54.1 ns |
+| `check/blocked_key` (a key whose quota admits nothing) | — | 53 ns |
 
-The `v1.0.0` column is the audit's quick-mode measurement of the `1.0.0` code
-on the same machine (the insert-at-cap figure is from its probe at the default
-cap); the numbers `1.0.0` itself published (~54 ns everywhere, ~217 ns for the
-sweep) could not be reproduced and are withdrawn.
+Legitimate-key check latency, default limiter at its cap:
+
+| Scenario | p50 | p99 | p99.9 |
+|----------|----:|----:|------:|
+| no flood | 100 ns | 100 ns | 300 ns |
+| flood of recovered keys | 100 ns | 300 ns | 500–600 ns |
+| flood of drained keys (every eviction records a debt), default `Overflow::FailClosed` | 100 ns | 600 ns | 1.2 µs |
+| the same, `Overflow::Forget` | 100 ns | 400 ns | 1.3 µs |
+| `v1.1.0`, flood | 100 ns | 300–500 ns | 0.5–1.0 µs |
+| `v1.0.0`, flood (audit, 2026-10-13) | — | — | 128 µs |
+
+(Flood rows re-run on the final 2.0.0 build, 2026-10-14, same host at about
+40 % load.)
+
+The maximum is not in the table: on this loaded host it was set by the OS
+preempting a thread (0.3–160 ms in *every* scenario, the no-flood one
+included), not by the limiter.
 
 What changed:
 
-- **Eviction is O(1).** At capacity, `1.0.0` scanned the whole shard for the
-  least-recently-seen key on every insert — ~329 µs at the default cap, roughly
-  a thousand times the cost of the insert itself, under the shard write lock.
-  CLOCK eviction examines at most 32 slots, so an insert at the default cap
-  costs ~0.36 µs, and a small capped shard ~0.1 µs.
-- **No shared counter on the check path.** `1.0.0` stamped every check with a
-  `fetch_add` on a per-shard sequence counter — a contended read-modify-write
-  that every thread touching the shard bounced. The CLOCK reference bit is
-  written only when it was clear, so a hot key's check writes nothing beyond the
-  bucket's own CAS. Four threads on one key went from 151.9 to 49.5 ns per check.
-- **One hash per check, padded shards.** The shard and the slot are found from
-  one hash (`1.0.0` hashed twice), and each shard sits on its own cache lines.
-  Many-key checks went from 86.6 to 54.9 ns.
-- **`CoarseClock`** replaces the ~26 ns OS clock read with one atomic load,
-  roughly halving the single-key check and taking the direct check to ~8 ns.
-- **`peek`** reads the clock once for both the remaining count and the reset
-  time.
+- **Typed, smaller keys.** Per-key state is stored as the algorithm's own type,
+  with no enum tag (whose alignment padded a token-bucket key to a third cache
+  line), and the token bucket keeps `better-bucket`'s clock-free `BucketCore`
+  instead of a clock-carrying `Bucket`. A token-bucket key is 128 bytes in its
+  shard; heap per key at the default cap fell from ~202 B to ~138 B
+  (`tests/memory.rs`). Fewer cache lines per key is most of the many-key and
+  `peek` gains.
+- **Borrowed long keys.** `check` still builds an owned key, which allocates
+  for anything over 22 bytes; `check_bytes` looks the key up by a borrowed view,
+  ~35 % faster for a UUID and allocation-free.
+- **One clock read, as late as possible.** The limiter reads the clock itself
+  (the bucket no longer carries one) immediately before the key's
+  compare-and-swap, so a contended CAS acts on a fresh time and retries less.
+- **Insertion at capacity costs more — a known issue.** To never reset a
+  limit, the CLOCK hand now reads each candidate's state to prefer a recovered
+  key, and an unrecovered victim's debt is recorded. At the default cap that is
+  one more cache line per eviction: ~58 ns (see below), still about a thousand
+  times cheaper than `1.0.0`'s ~329 µs scan. On a small, cache-resident shard
+  (`eviction_sweep`) it is lost in the other savings.
+- **Under a flood**, legitimate tail latency stays around a microsecond even
+  when every eviction must record a debt and most debts spill past the exact
+  recovery table. A cuckoo walk through a full table costs a cache miss per
+  move, so after a walk fails the next 32 debts spill without one; without
+  that back-off the drained-flood p99.9 was 2.1–2.8 µs.
 
-`check/single_key` is unchanged: its cost is the `&str` key, the shard read
-lock, `better-bucket`'s accounting, and above all the OS clock read (~26 ns on
-this machine), none of which this release changes on the default clock.
+## Known issue: new key at capacity (+58 ns)
+
+When the key table is full, inserting a never-seen key costs about +58 ns:
+`check/insert_at_default_cap` is **293 ns in 1.1.0 and 351 ns in 2.0.0**
+(criterion medians, best of several alternating runs on the loaded host above,
+so approximate). Eviction checks that each candidate has fully recovered
+before evicting it — the price of never resetting a still-limited key — and
+that read is an extra cache line per candidate. Checks of keys already tracked
+are unaffected, and below the cap nothing changes.
+
+A second measurement, with less scheduler noise: each variant built as its own
+binary, one fresh process per measurement, pinned to one core, the variants
+alternated round by round (6 rounds), median per variant — `1.1.0` ~242 ns,
+`2.0.0` ~250 ns. The 2.0.0 build already includes one small, cheap,
+guarantee-preserving improvement: each slot keeps a "recovers at" hint beside
+its CLOCK reference bit, so a candidate already seen to have recovered is not
+re-read. The deeper fixes (a dense coarse recovery tick derived from the
+bucket state when it is written anyway, storing the state inline in the slot,
+prefetching the next candidate) have **not yet been attempted**. The cost is
+shipped as a known issue, to be optimised in a future release; it is a
+blocker for the next minor release, 2.1.0.
+
+## Liveness under eviction pressure
+
+A still-limited key that is evicted keeps its debt, exactly and without
+affecting any other key, while the store's still-limited evicted keys fit
+about twice the cap (`tests/eviction_bypass.rs`, `tests/eviction_liveness.rs`).
+Past that, the default `Overflow::FailClosed` keeps them in a shared sketch
+that can charge or refuse keys that never owed anything, and the opt-in
+`Overflow::Forget` drops the debts that do not fit. Measured with the 2.0
+re-audit's harness (ManualClock, 128 shards; re-run on the final build,
+2026-10-14; "first candidate" is the first 2.0 candidate, then numbered
+1.2.0):
+
+| Scenario | First candidate | 2.0.0 `Forget` | 2.0.0 `FailClosed` (default) | 1.1.0 |
+|----------|---------------------:|------:|------:|------:|
+| Newcomers denied after a drain flood of 1.5x the cap (cap 100,000) | 23 % | 0 % | 0 % | 0 % |
+| … 2x the cap | 61 % | 0 % | 0 % | 0 % |
+| … 3x the cap | 88 % | 0 % | 0 % | 0 % |
+| … 4x the cap | — | 0 % | 3 % | 0 % |
+| … 6x the cap | 98 % | 0 % | 38 % | 0 % |
+| … 9x the cap | — | 0 % | 86 % | 0 % |
+| False denials, well-behaved population 3x the cap (cap 10,000) | 0.6–87 % | 0 % | 0 % | 0 % |
+| … 5x the cap, 5,000 visits/s | — | 0 % | 1.4 % | 0 % |
+| … 10x the cap, 5,000 visits/s | 89 % | 0 % | 4.2 % | 0 % |
+| … 10x the cap, 20,000 visits/s | — | 0 % | 72 % | 0 % |
+| … 2x the cap (cap 50,000) | 0.6 % | 0 % | 0 % | 0 % |
+| Configurations with over-admission, of 60 capacity-eviction bypass runs (500 drained victims; caps 64 and 10,000; floods 2–100x) | 0 | 48 | 0 | every one in which a victim is evicted (1.1.0 forgot every debt) |
+| Real-clock race, 4 drained victims vs drain-flood threads (cap 32): max units a victim got (bound 141–160) | 140 | up to 548,000 | 140 | unbounded: every eviction reset the victim |
+
+The population rows depend on churn, not on the population: the binding
+quantity is how many still-limited keys are evicted within one recovery period
+(the eviction rate times the recovery time), against about twice the cap.
+
+The 1.1.0 column's bypass and race cells are stated, not re-measured: 1.1.0
+evicted without recording anything, so every eviction of a still-limited key
+reset it — the 2026-10-13 audit's RN-005, which `tests/eviction_bypass.rs`
+reproduces against 1.1.0 for every algorithm. It behaves like `Forget` with no
+exact table at all, which is also why it never denied a newcomer.
+
+`Forget` never denies a key that owed nothing, and resets evicted keys only
+once more of them are owed at once than the table holds — then, under a
+sustained flood, over and over (the last two rows). `FailClosed` never resets a
+key, and denies keys that owed nothing once the same bound is passed. `FailClosed`
+is the default; opt into `Forget` only where availability beats strictness.
+See the README's "Choosing an overflow policy" and "Sizing the cap".
+
+Memory at the default cap after twice the cap of drained churn (counting
+allocator): 138 MiB of per-key state, plus 64 MiB of recovery tables under
+`FailClosed` (202 MiB) or 32 MiB under `Forget` (170 MiB).
+
+The guardrails cost nothing on the check path: `check/single_key` with the
+`metrics` feature measured 57.5 / 58.9 ns without `tracing` and 57.4 / 61.2 ns
+with it (two alternating runs; within noise). `recovery_load()` walks the
+recovery tables (up to 64 bytes per key of capacity) and is meant for a
+periodic exporter, not the request path.
+
+### A blocked key
+
+`check/blocked_key` — a key whose `quota_for` override admits nothing — is
+denied without taking the shard write lock: 53 ns per check (criterion median,
+same host). With 8 threads hammering such a key, a legitimate key in the same
+shard sees p50 400 ns and p99.9 1.5 µs (before: 2.2 µs and 30.9 µs).
 
 ## Head-to-head vs `governor`
 
 `governor` (0.10.4) is a benchmark-only dependency gated behind
-`cfg(comparison)` so it never enters the default tree or CI. Run:
+`cfg(comparison)` so it never enters the default tree or CI. The table below
+was measured at `v1.1.0`; an attempt to re-run it during the 2.0 cycle coincided with
+the host's heaviest load and produced numbers 3–10x off for *both* crates, so it
+is not reported. rate-net's own paths measured within noise of `v1.1.0` above
+(the keyed check slightly faster), so the comparison is expected to stand. Run:
 
 ```bash
 RUSTFLAGS="--cfg comparison" cargo bench --bench comparison
@@ -127,16 +259,22 @@ with no automatic eviction. The many-key gap is the same cost.
   `CoarseClock`, by the shard read lock and the bucket's CAS.
 - **Many-key** costs about what a single key does: unrelated keys land in
   different shards and take only a read lock.
-- **Contended single-key** scales: four threads on one key share the read lock
-  and settle on the bucket's atomic. The remaining shared writes are the read
-  lock's own reader count (an atomic increment and decrement per check) and the
-  bucket's compare-and-swap; the eviction marks are not rewritten.
-- **Eviction** is the cold path — the write lock plus a bounded CLOCK step — paid
-  only when a new key displaces an old one, and constant whatever the shard
-  size.
+- **Contended single-key** is the price of four cores writing one cache line:
+  every check bounces the read lock's reader count (an atomic increment and
+  decrement) and the bucket's compare-and-swap word between cores, so one check
+  takes ~230 ns under 4-way contention against ~60 ns alone. That is per caller;
+  the four threads together still complete a check every ~57 ns. The eviction
+  marks are not rewritten on a hot key, so they add nothing.
+- **Eviction** is the cold path — the write lock, a bounded CLOCK step, and (for
+  an unrecovered victim) one debt record — paid only when a new key displaces an
+  old one, and constant whatever the shard size.
 
 ## What's next
 
+- The ~58 ns an at-capacity insert gained in `2.0.0` is a known issue to be
+  resolved by the next minor release, 2.1.0 (see above): keeping a coarse recovery tick or
+  the state itself beside the CLOCK reference bit would avoid the extra cache
+  line per candidate.
 - A lock-free read path for existing keys (an epoch- or seqlock-protected index)
   would remove the read-lock acquire from the keyed check; it is deferred until
   it can be model-checked as thoroughly as the current store.
