@@ -118,8 +118,7 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// about 202 bytes per key of capacity under eviction pressure with
 /// `FailClosed` (138 of token-bucket state and 64 of recovery tables), 170
 /// with `Forget`. Then export
-/// [`RateLimiter::recovery_load`](crate::RateLimiter::recovery_load)
-/// (feature `metrics`) and alert at about 0.7 utilization, alert on any
+/// `RateLimiter::recovery_load` (feature `metrics`) and alert at about 0.7 utilization, alert on any
 /// `Metrics::keys_refused`, and enable the `tracing` feature for rate-limited
 /// warnings when the store does run out of room.
 ///
