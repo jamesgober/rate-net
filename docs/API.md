@@ -19,7 +19,7 @@
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 > Every Rust example on this page is compiled and run as a doctest.
 >
-> **Stable (`v2.0.0`).** The public surface is frozen until `3.0`; each `2.x`
+> **Stable (`v2.0.1`).** The public surface is frozen until `3.0`; each `2.x`
 > adds to it without changing anything earlier `2.x` releases offered (two
 > methods are deprecated since `1.1`). What changed from `1.x` is listed in
 > [`MIGRATION_1_TO_2.md`](./MIGRATION_1_TO_2.md). Every public type is asserted `Send + Sync + 'static`

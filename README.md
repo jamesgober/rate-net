@@ -33,7 +33,7 @@
 
 <br>
 
-> **Stable (`v2.0.0`).** The public API is frozen until `3.0`; each `2.x` only
+> **Stable (`v2.0.1`).** The public API is frozen until `3.0`; each `2.x` only
 > adds to it. Five algorithms (token bucket by default; leaky bucket, fixed
 > window, sliding-window log, and sliding-window counter under the `algorithms`
 > feature) behind one `Limiter` trait; a validating builder with per-key

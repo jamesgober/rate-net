@@ -14,6 +14,26 @@
 
 ---
 
+## [2.0.1] - 2026-10-19
+
+A patch release: the docs.rs build of `2.0.0` failed. No code, API, or
+behaviour changes.
+
+### Fixed
+
+- **docs.rs build** (`error[E0658]: the doc(cfg) and doc(auto_cfg) attributes
+  are experimental`, nightly 1.101.0 2026-10-18). The crate root enables
+  `feature(doc_cfg)` under `cfg(docsrs)`, which only docs.rs sets; stable and
+  MSRV builds are unaffected.
+
+### Changed
+
+- CI builds the documentation exactly as docs.rs does — nightly,
+  `--cfg docsrs`, all features, the `x86_64-unknown-linux-gnu` target, rustdoc
+  warnings denied — so a docs.rs failure is caught before a release.
+
+---
+
 ## [2.0.0] — 2026-10-19
 
 **Eviction never resets a limit by default, and the HTTP surface is
@@ -908,7 +928,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/jamesgober/rate-net/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/jamesgober/rate-net/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/jamesgober/rate-net/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/rate-net/compare/v0.9.5...v1.0.0
