@@ -106,6 +106,9 @@
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness (and dev-dependencies) have what they need.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+// docs.rs builds with `--cfg docsrs` on nightly; `doc(cfg(...))` badges on
+// feature-gated items need the `doc_cfg` feature there (and only there).
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // REPS: warnings are errors — except in the builds that run on a floating
 // nightly: docs.rs, Miri, and cargo-fuzz (`fuzzing`), where a lint added after
 // a release would otherwise fail the published docs or the CI jobs. Downstream
