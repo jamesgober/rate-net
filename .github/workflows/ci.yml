@@ -166,6 +166,29 @@ jobs:
           RUSTFLAGS: ""
           MIRIFLAGS: "-Zmiri-disable-isolation"
 
+  # Reproduces the docs.rs build: nightly, `--cfg docsrs` (as
+  # `[package.metadata.docs.rs]` passes it), every feature, and docs.rs's
+  # default target. 2.0.0's docs.rs build failed on `doc(cfg)` without
+  # `feature(doc_cfg)`, which no other job could see.
+  docsrs:
+    name: docs.rs (nightly, --cfg docsrs, all features)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V && rustdoc -V
+      - name: Doc as docs.rs builds it
+        run: cargo doc --locked --no-deps --all-features --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: ""
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+
   fuzz:
     name: Fuzz (smoke, nightly)
     runs-on: ubuntu-latest
