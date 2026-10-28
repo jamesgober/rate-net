@@ -14,7 +14,8 @@
 </div>
 <br>
 
-> Numbers recorded for `v2.0.0`. Treat absolute numbers as machine-specific;
+> Numbers recorded for `v2.0.0`, with the at-capacity insert re-measured for
+> `v2.1.0`. Treat absolute numbers as machine-specific;
 > the relative shape between paths, the before/after, and the head-to-head are
 > the signal.
 
@@ -123,39 +124,86 @@ What changed:
 - **One clock read, as late as possible.** The limiter reads the clock itself
   (the bucket no longer carries one) immediately before the key's
   compare-and-swap, so a contended CAS acts on a fresh time and retries less.
-- **Insertion at capacity costs more — a known issue.** To never reset a
-  limit, the CLOCK hand now reads each candidate's state to prefer a recovered
-  key, and an unrecovered victim's debt is recorded. At the default cap that is
-  one more cache line per eviction: ~58 ns (see below), still about a thousand
-  times cheaper than `1.0.0`'s ~329 µs scan. On a small, cache-resident shard
-  (`eviction_sweep`) it is lost in the other savings.
+- **Insertion at capacity cost more in 2.0.0.** To never reset a limit, the
+  CLOCK hand prefers a recovered key, and an unrecovered victim's debt is
+  recorded. 2.0.0 measured that at ~58 ns more per insert at the default cap;
+  2.1.0 traces it to the recovery-hint arithmetic and removes it (see
+  below).
 - **Under a flood**, legitimate tail latency stays around a microsecond even
   when every eviction must record a debt and most debts spill past the exact
   recovery table. A cuckoo walk through a full table costs a cache miss per
   move, so after a walk fails the next 32 debts spill without one; without
   that back-off the drained-flood p99.9 was 2.1–2.8 µs.
 
-## Known issue: new key at capacity (+58 ns)
+## New key at capacity: resolved in 2.1.0
 
-When the key table is full, inserting a never-seen key costs about +58 ns:
-`check/insert_at_default_cap` is **293 ns in 1.1.0 and 351 ns in 2.0.0**
-(criterion medians, best of several alternating runs on the loaded host above,
-so approximate). Eviction checks that each candidate has fully recovered
-before evicting it — the price of never resetting a still-limited key — and
-that read is an extra cache line per candidate. Checks of keys already tracked
-are unaffected, and below the cap nothing changes.
+`2.0.0` shipped with a known issue: inserting a never-seen key into a full
+store was reported ~58 ns slower than in `1.1.0` (`check/insert_at_default_cap`
+293 ns against 351 ns, criterion medians on a loaded host). `2.1.0` measures it
+again, the steadier way, and removes it.
 
-A second measurement, with less scheduler noise: each variant built as its own
-binary, one fresh process per measurement, pinned to one core, the variants
-alternated round by round (6 rounds), median per variant — `1.1.0` ~242 ns,
-`2.0.0` ~250 ns. The 2.0.0 build already includes one small, cheap,
-guarantee-preserving improvement: each slot keeps a "recovers at" hint beside
-its CLOCK reference bit, so a candidate already seen to have recovered is not
-re-read. The deeper fixes (a dense coarse recovery tick derived from the
-bucket state when it is written anyway, storing the state inline in the slot,
-prefetching the next candidate) have **not yet been attempted**. The cost is
-shipped as a known issue, to be optimised in a future release; it is a
-blocker for the next minor release, 2.1.0.
+**Method.** Each variant is its own binary (fat LTO, `opt-level = 3`) against
+one shared harness: fill the default limiter (1,048,576-key cap) to twice its
+cap, then time 2,000,000 further unique keys; one fresh process per
+measurement, pinned to one core, variants alternated round by round (8 to 14
+rounds per comparison), Windows 11 x86_64, 32 logical CPUs, host load 10–96 %
+from other builds. Reported as medians per variant and as the median of
+per-round ratios (each round's variants ran back to back under the same load).
+
+**What the regression was.** Pinned, the gap is +16 ns rather than +58 ns
+(`1.1.0` ~220 ns, `2.0.1` ~235 ns; per-round ratio 1.065, n = 34): the larger
+figure was mostly scheduler noise. Variants that each switch one piece off put
+all of it on one line of arithmetic: every inserted key's "recovers at" hint
+was computed exactly when the key was stored, and for the token bucket that is
+`better-bucket`'s `time_until_at` (two 128-bit divisions) plus a 128-bit
+millisecond rounding in rate-net. With the hint computation off and everything
+else on, an insert costs 222 ns; with the eviction's recovery check off and the
+hint computation on, 244 ns. Reading candidates during the sweep was never the
+cost: the hint sits beside the CLOCK reference bit, on a line the sweep reads
+anyway.
+
+**The fix.** The hint for a key being stored now skips the exact arithmetic in
+the common cases. A fresh key that spent nothing (or was denied) is whole, so
+its hint is `0` with no read at all. A fresh key that spent a little of its
+quota is usually whole again within the millisecond, and since a hint is in
+whole milliseconds rounded up, the next boundary is then the exact hint:
+asking the state whether it is full by then is one multiply and a compare.
+Only a key still owing past the boundary (or restored from a recorded debt)
+pays for the exact time. The millisecond rounding is now 64-bit arithmetic.
+And because hints round up, a small shard evicting keys stored microseconds
+earlier used to see every candidate as still owing; a hint due within the
+current millisecond is now confirmed with one cheap fullness read before the
+key is treated as owing. The guarantee is unchanged: a hint is never earlier
+than the truth, so the sweep never takes a still-limited key for a recovered
+one (`store::tests::test_first_hint_is_exact_or_a_valid_later_bound`).
+
+| Per insert, pinned medians | `1.1.0` | `2.0.1` | `2.1.0` | `2.1.0`, recovery check off |
+|-----------------------------|--------:|--------:|--------:|-----------------------------:|
+| New key at the default cap (keys recover at once) | 220 ns | 233 ns | 219 ns | 217 ns |
+| New key, 64-key shard (`eviction_sweep`'s setup) | 97 ns | 146 ns | 88 ns | 84 ns |
+| New key at the default cap, every key drained (`per_minute(1)`) | 220 ns (resets keys) | 424–448 ns | 434–448 ns | 221 ns (resets keys) |
+
+Per-round ratios at the default cap: `2.1.0` / `1.1.0` = 0.997, `2.1.0` /
+`2.0.1` = 0.945. The last column switches the recovery check off entirely (it
+would reset still-limited keys, so it is a bound, not an option): `2.1.0` is
+within 2 ns of it. Checks of tracked keys are unchanged (hot key ~53 ns, 10,000
+keys ~49 ns in all three versions).
+
+In the drained flood every eviction must record a debt, which `1.1.0` and
+the check-off bound do not do (they reset the evicted key); that cost is what
+2.0's guarantee buys, not the regression. `2.1.0` and `2.0.1` do the same work
+there; their per-round ratio, 1.02–1.04 across four runs with quartiles about
+±8 %, is within this host's noise for a memory-bound scenario.
+
+Criterion, `2.1.0` against `2.0.1`, two alternating runs each on the same
+loaded host: `check/eviction_sweep` 92 to 99 ns against 171 to 173 ns,
+`check/insert_at_default_cap` 352 to 361 ns against 376 to 417 ns; the other
+paths within the run-to-run spread (the pinned harness puts hot-key and
+10,000-key checks at a per-round ratio of 1.006 to `2.0.1`). The flood harness
+(`benches/flood.rs`) shows the same legitimate-key tails for both (p99 400 /
+700 / 500 ns, p99.9 700 to 800 / 1,500 / 1,200 to 1,300 ns for the recovered,
+drained, and `Forget` floods), with about 12 % more flood inserts per run in
+the recovered-key flood.
 
 ## Liveness under eviction pressure
 
@@ -271,10 +319,6 @@ with no automatic eviction. The many-key gap is the same cost.
 
 ## What's next
 
-- The ~58 ns an at-capacity insert gained in `2.0.0` is a known issue to be
-  resolved by the next minor release, 2.1.0 (see above): keeping a coarse recovery tick or
-  the state itself beside the CLOCK reference bit would avoid the extra cache
-  line per candidate.
 - A lock-free read path for existing keys (an epoch- or seqlock-protected index)
   would remove the read-lock acquire from the keyed check; it is deferred until
   it can be model-checked as thoroughly as the current store.

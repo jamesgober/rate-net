@@ -25,16 +25,24 @@
 //! - `peek/existing_key` — reading an allowance for `RateLimit-*` headers.
 //! - `check/blocked_key` — a key whose `quota_for` override admits nothing (a
 //!   blocked tenant): denied without ever taking the shard write lock.
+//! - `gcra/check_at`: the clock-free `Gcra`, with caller-supplied time: the
+//!   leaky-bucket arithmetic and one compare-and-swap, nothing else.
+//! - `gcra_params/check_at`: the same arithmetic through a shared
+//!   `GcraParams` and a caller-owned word, as a keyed table uses it.
 //!
 //! Run with `cargo bench --bench rate_bench`.
 
+use std::cell::Cell;
 use std::hint::black_box;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rate_net::{CoarseClock, DEFAULT_MAX_KEYS, DirectLimiter, Eviction, Quota, RateLimiter};
+use rate_net::{
+    CoarseClock, DEFAULT_MAX_KEYS, DirectLimiter, Eviction, Gcra, GcraParams, Quota, RateLimiter,
+};
 
 /// A limiter with effectively no rate ceiling, so the benchmark measures the
 /// check machinery rather than the deny branch.
@@ -198,6 +206,37 @@ fn bench_blocked_key(c: &mut Criterion) {
     });
 }
 
+/// One unit per nanosecond, with time advanced a nanosecond per check, so
+/// every check is admitted: the benchmark measures the admit path.
+fn gcra_quota() -> Quota {
+    Quota::per_second(1_000_000_000).with_burst(1)
+}
+
+fn bench_gcra(c: &mut Criterion) {
+    let gcra = Gcra::new(gcra_quota());
+    let now = Cell::new(0u64);
+
+    let _ = c.bench_function("gcra/check_at", |b| {
+        b.iter(|| {
+            now.set(now.get() + 1);
+            black_box(&gcra).check_at(Duration::from_nanos(now.get()))
+        });
+    });
+}
+
+fn bench_gcra_params(c: &mut Criterion) {
+    let params = GcraParams::new(gcra_quota());
+    let tat = AtomicU64::new(0);
+    let now = Cell::new(0u64);
+
+    let _ = c.bench_function("gcra_params/check_at", |b| {
+        b.iter(|| {
+            now.set(now.get() + 1);
+            black_box(&params).check_at(black_box(&tat), Duration::from_nanos(now.get()))
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_single_key,
@@ -210,6 +249,8 @@ criterion_group!(
     bench_direct,
     bench_direct_coarse_clock,
     bench_peek,
-    bench_blocked_key
+    bench_blocked_key,
+    bench_gcra,
+    bench_gcra_params
 );
 criterion_main!(benches);

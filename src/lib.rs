@@ -19,14 +19,15 @@
 //!
 //! ## Status
 //!
-//! **Stable (`2.0.1`).** The public API is frozen until `3.0`; each `2.x` only
+//! **Stable (`2.1.0`).** The public API is frozen until `3.0`; each `2.x` only
 //! adds to it (`docs/MIGRATION_1_TO_2.md` lists what changed from `1.x`). The five algorithms sit behind the one [`Limiter`] trait (and the
 //! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
 //! window algorithms under the `algorithms` feature — with the validating
 //! [`Builder`] (per-key quotas, key-length limits, long-key digests),
 //! [`peek`](RateLimiter::peek) snapshots and HTTP [`headers`](mod@headers)
 //! helpers, key management, the un-keyed [`DirectLimiter`], the `no_std`
-//! [`Gcra`] core, the fast [`CoarseClock`], and optional `AsyncLimiter`
+//! [`Gcra`] core (and [`GcraParams`], its arithmetic over a caller-owned
+//! word, for keyed tables of your own), the fast [`CoarseClock`], and optional `AsyncLimiter`
 //! (`async`), `Metrics` and `RecoveryLoad` (`metrics`), saturation warnings
 //! (`tracing`), and `tower` middleware (`tower`) layers.
 //! Checking an already-tracked key allocates nothing when the key is passed
@@ -95,7 +96,7 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`        | yes | The keyed limiter, [`DirectLimiter`], and [`CoarseClock`]. With it off the crate is `no_std` and offers [`Gcra`] (on targets with 64-bit atomics), [`Quota`], [`Decision`], [`Snapshot`], the error types, and the [`headers`](mod@headers) names. |
+//! | `std`        | yes | The keyed limiter, [`DirectLimiter`], and [`CoarseClock`]. With it off the crate is `no_std` and offers [`Gcra`] and [`GcraParams`] (on targets with 64-bit atomics), [`Quota`], [`Decision`], [`Snapshot`], the error types, and the [`headers`](mod@headers) names. |
 //! | `algorithms` | no  | The leaky bucket and the window algorithms (fixed window, sliding-window log, sliding-window counter). |
 //! | `async`      | no  | `AsyncLimiter` and `DirectLimiter::try_until_ready` — await until admitted. Additive only. |
 //! | `metrics`    | no  | `metrics()` counters on [`RateLimiter`] and [`DirectLimiter`], and `RateLimiter::recovery_load`, the gauge to alert on before eviction runs out of room; compiled out when off. |
@@ -135,7 +136,7 @@
 // The keyed limiter and everything clock-driven require the standard library
 // (the concurrent per-key store, the clock-driven token bucket, the domain
 // error integration). With `std` off the crate is no_std and exposes the
-// clock-free core: `Gcra`, `Quota`, `Decision`, `Snapshot`, the error types,
+// clock-free core: `Gcra`, `GcraParams`, `Quota`, `Decision`, `Snapshot`, the error types,
 // and the header names.
 #[cfg(feature = "std")]
 mod algo;
@@ -186,7 +187,7 @@ pub use crate::error::{InsufficientCapacity, RateLimiterError};
 #[cfg(feature = "std")]
 pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction, Overflow};
 #[cfg(target_has_atomic = "64")]
-pub use crate::gcra::Gcra;
+pub use crate::gcra::{Gcra, GcraParams};
 #[cfg(feature = "std")]
 pub use crate::key::Key;
 #[cfg(feature = "std")]

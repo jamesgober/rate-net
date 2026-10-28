@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "rate-net"
-version = "2.0.1"
+version = "2.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -103,7 +103,8 @@ default = ["std"]
 # token-bucket state (better-bucket's clock-free `BucketCore`), the injectable
 # clock, `DirectLimiter`, and `CoarseClock` — requires std, so std gates
 # `better-bucket`, `clock-lib`, `ahash`, and `hashbrown`. With std off the crate is no_std and exposes the
-# clock-free single-key core: `Gcra` (on targets with 64-bit atomics), `Quota`,
+# clock-free single-key core: `Gcra` and `GcraParams` (on targets with 64-bit
+# atomics), `Quota`,
 # `Decision`, `Snapshot`, the error types, and the header names and values.
 std = [
     "dep:better-bucket",
@@ -246,6 +247,10 @@ required-features = ["std"]
 
 [[example]]
 name              = "direct"
+required-features = ["std"]
+
+[[example]]
+name              = "shared_params"
 required-features = ["std"]
 
 [[example]]

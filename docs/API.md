@@ -19,7 +19,7 @@
 > ([metrics-lib API.md](https://github.com/jamesgober/metrics-lib/blob/main/docs/API.md)).
 > Every Rust example on this page is compiled and run as a doctest.
 >
-> **Stable (`v2.0.1`).** The public surface is frozen until `3.0`; each `2.x`
+> **Stable (`v2.1.0`).** The public surface is frozen until `3.0`; each `2.x`
 > adds to it without changing anything earlier `2.x` releases offered (two
 > methods are deprecated since `1.1`). What changed from `1.x` is listed in
 > [`MIGRATION_1_TO_2.md`](./MIGRATION_1_TO_2.md). Every public type is asserted `Send + Sync + 'static`
@@ -54,6 +54,7 @@
   - [`Key`](#key)
   - [`CoarseClock`](#coarseclock)
   - [`Gcra`](#gcra)
+  - [`GcraParams`](#gcraparams)
   - [`Metrics`](#metrics-1) _(feature: `metrics`)_
   - [`RateLimiterError`](#ratelimitererror)
   - [`InsufficientCapacity`](#insufficientcapacity)
@@ -943,6 +944,7 @@ pub fn check_n_at(&self, n: u32, now: Duration) -> Decision
 pub fn peek_at(&self, now: Duration) -> Snapshot
 pub fn reset(&self)
 pub const fn quota(&self) -> Quota
+pub const fn params(&self) -> &GcraParams        // since 2.1.0
 ```
 
 The `no_std` single-key core: a lock-free leaky bucket (the Generic Cell Rate
@@ -963,6 +965,73 @@ for _ in 0..10 {
 assert_eq!(gcra.check_at(Duration::ZERO).retry_after(), Some(Duration::from_millis(100)));
 assert!(gcra.check_at(Duration::from_millis(100)).is_allow());
 assert_eq!(gcra.peek_at(Duration::from_millis(100)).remaining(), 0);
+```
+
+A `Gcra` is one theoretical arrival time plus its [`GcraParams`](#gcraparams);
+`params()` returns them.
+
+---
+
+### `GcraParams`
+
+_Since `2.1.0`._
+
+```rust ignore
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GcraParams { /* private */ }   // Debug
+
+pub fn new(quota: Quota) -> GcraParams
+pub fn try_new(quota: Quota) -> Result<GcraParams, RateLimiterError>
+pub fn check_at(&self, tat: &AtomicU64, now: Duration) -> Decision
+pub fn check_n_at(&self, tat: &AtomicU64, n: u32, now: Duration) -> Decision
+pub fn peek_at(&self, tat: &AtomicU64, now: Duration) -> Snapshot
+pub fn reset(&self, tat: &AtomicU64)
+pub const fn quota(&self) -> Quota
+```
+
+The [`Gcra`](#gcra) arithmetic with the quota's parameters held once, run
+against a theoretical arrival time (TAT) that the caller stores as a
+`core::sync::atomic::AtomicU64`. A `Gcra` carries its parameters, about 80
+bytes, in every instance; a keyed table that limits many streams under one
+quota shares one `GcraParams` and keeps only the 8-byte word per key, beside
+the key itself, so a check reads one cache line instead of two.
+
+- **The word.** `AtomicU64::new(0)` is a full bucket, and storing `0` (or
+  calling `reset`) restores the full burst. Any other value counts emission
+  intervals of the quota it was written under, so use a word with one set of
+  parameters only. The methods update it with the same compare-and-swap loop
+  `Gcra` uses, so any number of threads may check one word at once; a denial
+  leaves it unchanged.
+- **Same decisions as `Gcra`.** `Gcra` is built on these methods, so for the
+  same quota, word, and times the two decide identically: the exact interval
+  arithmetic, the clamp to one unit per nanosecond, fail closed on a zero
+  limit, period, or burst (`new`; `try_new` rejects them), `n = 0` always
+  admitted, `n` past the burst denied with `retry_after == Duration::MAX`, and
+  a late `now` only ever stricter.
+- **Time.** As for `Gcra`: `Duration`s since one fixed origin, from one
+  monotonic source per word.
+- Available on every target with 64-bit atomics, with or without `std`.
+
+```rust
+use core::sync::atomic::AtomicU64;
+use core::time::Duration;
+use rate_net::{GcraParams, Quota};
+
+// One set of parameters for a whole tier; one word per key.
+let params = GcraParams::try_new(Quota::per_second(10).with_burst(2)).expect("valid quota");
+let table: [(u64, AtomicU64); 2] = [(7, AtomicU64::new(0)), (9, AtomicU64::new(0))];
+
+let (_, tat) = &table[0];
+assert!(params.check_n_at(tat, 2, Duration::ZERO).is_allow());
+assert_eq!(params.check_at(tat, Duration::ZERO).retry_after(), Some(Duration::from_millis(100)));
+assert_eq!(params.peek_at(tat, Duration::from_millis(100)).remaining(), 1);
+
+// Another key's word is independent.
+let (_, other) = &table[1];
+assert!(params.check_n_at(other, 2, Duration::ZERO).is_allow());
+
+params.reset(tat);
+assert_eq!(params.peek_at(tat, Duration::ZERO).remaining(), 2);
 ```
 
 ---
@@ -1224,16 +1293,18 @@ tokio::runtime::Builder::new_current_thread()
 ## The `no_std` core
 
 With `default-features = false` the crate is `no_std` and exposes
-[`Gcra`](#gcra) (on targets with 64-bit atomics), [`Quota`](#quota),
+[`Gcra`](#gcra) and [`GcraParams`](#gcraparams) (on targets with 64-bit
+atomics), [`Quota`](#quota),
 [`Decision`](#decision), [`Snapshot`](#snapshot), [`headers`](#headers),
 [`RateLimiterError`](#ratelimitererror),
 [`InsufficientCapacity`](#insufficientcapacity), and `VERSION`. Nothing
 allocates. On a target without 64-bit atomics (for example
-`thumbv7em-none-eabihf`) the crate still builds, without `Gcra`.
+`thumbv7em-none-eabihf`) the crate still builds, without `Gcra` and
+`GcraParams`.
 
 ```toml
 [dependencies]
-rate-net = { version = "2.0", default-features = false }
+rate-net = { version = "2.1", default-features = false }
 ```
 
 ---

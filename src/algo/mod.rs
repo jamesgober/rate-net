@@ -206,6 +206,12 @@ impl KeyState for Gcra {
         Self::reset(self);
     }
 
+    /// One read and a multiply: whole again once the theoretical arrival time
+    /// is not past `now`.
+    fn is_full(&self, now: Duration) -> bool {
+        self.is_full_at(now)
+    }
+
     /// Exact: the theoretical arrival time is raised to `debt.until`.
     fn restore(&mut self, debt: Debt, now: Duration) {
         if debt.until > now {
@@ -426,6 +432,30 @@ mod tests {
         assert!(state.is_full(Duration::ZERO));
         assert!(KeyState::acquire(&state, 10, Duration::ZERO).is_allow());
         assert!(state.is_full(ms(1_000)));
+    }
+
+    #[cfg(feature = "algorithms")]
+    #[test]
+    fn test_leaky_bucket_fullness_matches_its_debt() {
+        // The cheap override must agree with the default (`debt` is `None`).
+        for quota in [
+            Quota::per_second(10),
+            Quota::per_second(3).with_burst(1),
+            Quota::per_second(1_000_000_000).with_burst(4),
+        ] {
+            let state = crate::gcra::Gcra::new(quota);
+            for (n, at) in [(0u32, 0u64), (1, 0), (2, 1), (1, 50), (3, 333), (1, 2_000)] {
+                let now = ms(at);
+                let _ = KeyState::acquire(&state, n, now);
+                for probe in [now, now + ms(1), now + ms(100), now + ms(1_000)] {
+                    assert_eq!(
+                        state.is_full(probe),
+                        state.debt(probe).is_none(),
+                        "{quota:?} at {probe:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

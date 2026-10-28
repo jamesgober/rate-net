@@ -14,6 +14,71 @@
 
 ---
 
+## [2.1.0] - 2026-10-28
+
+**The leaky-bucket arithmetic over state you store yourself, and the
+at-capacity insert back to 1.1.0's cost.** An additive minor release: nothing
+existing changes behaviour, and code written for `2.0` builds unchanged.
+
+### Added
+
+- **`GcraParams`**: a quota's GCRA parameters held once, run against a
+  theoretical arrival time the caller stores as a
+  `core::sync::atomic::AtomicU64`: `check_at(&tat, now)`,
+  `check_n_at(&tat, n, now)`, `peek_at(&tat, now)`, `reset(&tat)`, `quota()`,
+  `new` (fail-closed) and `try_new` (validated). A word of `0` is a full
+  bucket. A `Gcra` carries its parameters, about 80 bytes, in every instance;
+  a keyed table of your own shares one `GcraParams` per quota and keeps 8
+  bytes per key, beside the key, so a check reads one cache line. `Clone`,
+  `Copy`, `PartialEq`, `Eq`, `Debug`, `Send + Sync`. Part of the `no_std`
+  core, on every target with 64-bit atomics.
+- **`Gcra::params`**, the parameters a `Gcra` runs on.
+- `examples/shared_params.rs`; the `gcra/check_at` and
+  `gcra_params/check_at` benchmarks.
+
+### Changed
+
+- `Gcra` is one theoretical arrival time plus a `GcraParams`, so the GCRA
+  arithmetic exists once. Its decisions, `retry_after` values, snapshots, and
+  size (80 bytes) are unchanged, and so is its speed (`gcra/check_at` 6.87 to
+  6.89 ns against 6.88 to 6.91 ns for `2.0.1`, alternating runs). A closed
+  quota is now marked by a zero reciprocal instead of a separate flag, which
+  keeps `GcraParams` to one 64-byte line. `tests/gcra_params.rs` checks
+  `GcraParams`, `Gcra`, and a frozen copy of the `2.0.1` implementation
+  against each other on random quotas (zero limits and bursts, rates past one
+  per nanosecond), `n` from `0` to past the burst, and times that step back or
+  saturate, comparing every decision, snapshot, and stored word.
+
+### Performance
+
+- **Inserting a new key at the cap costs what it did in `1.1.0` again**,
+  resolving `2.0.0`'s known issue. Pinned, alternating A/B at the default
+  1,048,576-key cap: `1.1.0` ~220 ns, `2.0.1` ~233 ns, `2.1.0` ~219 ns per
+  insert (per-round ratio to `1.1.0` 0.997); on a 64-key shard 97 / 146 /
+  88 ns. The cost was not the extra cache line `2.0.0` suspected but the exact
+  "recovers at" hint computed for every key as it was stored: two 128-bit
+  divisions in `better-bucket`'s `time_until_at` and a third in rate-net's
+  millisecond rounding. A fresh key that spent nothing now gets its hint with
+  no read; one that is whole again within the millisecond gets the exact hint
+  from one fullness check; only a key still owing past it (or restored from a
+  recorded debt) pays for the exact time, and the rounding is 64-bit. The
+  eviction sweep confirms a hint due within the current millisecond with one
+  fullness read instead of treating the key as owing. A hint is still never
+  earlier than the truth, so a still-limited key is never mistaken for a
+  recovered one. Method and full results in
+  [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md#new-key-at-capacity-resolved-in-210).
+- The leaky bucket's fullness check reads the theoretical arrival time
+  without a division.
+
+### Known issues
+
+- Unchanged from `2.0.0`: past about twice the cap of still-limited
+  evictions, `Overflow::FailClosed` (the default) denies some keys that owed
+  nothing; size the cap, alert on `recovery_load()` and `keys_refused`, or opt
+  into `Overflow::Forget`. See the README's "Sizing the cap".
+
+---
+
 ## [2.0.1] - 2026-10-19
 
 A patch release: the docs.rs build of `2.0.0` failed. No code, API, or
@@ -928,7 +993,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/rate-net/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/jamesgober/rate-net/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/jamesgober/rate-net/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/jamesgober/rate-net/compare/v1.0.0...v1.1.0
