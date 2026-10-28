@@ -85,7 +85,9 @@
 //! ([`Slot::recovers_at_ms`]) only while the slot's reference bit is clear:
 //! a set bit means a check may have spent since, and the state is read again
 //! — including for idle-expired slots, which are taken whatever their bit
-//! says.
+//! says. The hint a key is stored with avoids the exact recovery arithmetic
+//! in the common cases (see [`first_hint`]): computing it exactly on every
+//! insert at the cap was what made 2.0.0's insert slower than 1.1.0's.
 //!
 //! Removal is a swap-remove from the slot vector plus two table updates, so
 //! evicting is O(1). The one shard-wide pass that remains is amortized growth:
@@ -243,8 +245,7 @@ struct Slot<S> {
 const UNKNOWN: u64 = u64::MAX;
 
 impl<S: KeyState> Slot<S> {
-    fn new(hash: u64, key: Key, state: S, seeded: bool, now: Duration, now_ms: u64) -> Self {
-        let recovers_at_ms = recovers_at(&state, now);
+    fn new(hash: u64, key: Key, state: S, seeded: bool, recovers_at_ms: u64, now_ms: u64) -> Self {
         Self {
             state,
             // A new key starts unreferenced: a key seen once (a flood of
@@ -267,9 +268,18 @@ impl<S: KeyState> Slot<S> {
     /// may have spent since the hint was computed. The CLOCK hand clears the
     /// bit (and the hint) on its way past, but an idle-expired slot is taken
     /// whatever its bit says — so a set bit always forces a fresh read here.
-    fn recovers_at(&mut self, now: Duration) -> u64 {
+    ///
+    /// A hint is rounded up to the next millisecond, so a key due within the
+    /// current one (`now_ms + 1`) may already be whole: a small shard evicts
+    /// keys stored microseconds earlier. One cheap fullness read settles it,
+    /// instead of treating the key as owing (which costs the debt arithmetic
+    /// and passes over it for another candidate). Later hints are trusted
+    /// without touching the state.
+    fn recovers_at(&mut self, now: Duration, now_ms: u64) -> u64 {
         if self.recovers_at_ms == UNKNOWN || self.referenced.load(Ordering::Relaxed) {
             self.recovers_at_ms = recovers_at(&self.state, now);
+        } else if self.recovers_at_ms == now_ms.saturating_add(1) && self.state.is_full(now) {
+            self.recovers_at_ms = 0;
         }
         self.recovers_at_ms
     }
@@ -304,6 +314,45 @@ impl<S: KeyState> Slot<S> {
 /// rounded up; `0` if it already has.
 fn recovers_at<S: KeyState>(state: &S, now: Duration) -> u64 {
     state.recovers_at(now).map_or(0, ceil_millis)
+}
+
+/// The recovery hint for a key being stored at `now` (`now_ms` its floor),
+/// whose fresh state has just decided `outcome` for `n` units.
+///
+/// The exact time (`KeyState::recovers_at`) costs the token bucket a pair of
+/// 128-bit divisions, and computing it on every insert at the cap was most of
+/// 2.0's insert cost over 1.1. Most keys stored under a flood of new keys
+/// need none of it:
+///
+/// - A fresh state is whole, and a check is all or nothing, so a fresh key
+///   that spent nothing (`n == 0`, or denied) is whole: `0`.
+/// - A key seen once that spent a little of a generous quota is whole again
+///   within the millisecond. A hint is in whole milliseconds rounded up, so
+///   the next boundary is then the exact hint, and whether the state is full
+///   by it is one cheap read.
+///
+/// Only a key that still owes past the boundary, or one restored from a
+/// recorded debt (`fresh == false`), pays for the exact time, which the
+/// eviction sweep then reads instead of the key's state. Never earlier than
+/// the truth: a state full at the boundary has recovered by it, and nothing
+/// spends from the key before it is stored.
+fn first_hint<S: KeyState>(
+    state: &S,
+    fresh: bool,
+    n: u32,
+    outcome: Decision,
+    now: Duration,
+    now_ms: u64,
+) -> u64 {
+    if fresh && (n == 0 || outcome.is_deny()) {
+        return 0;
+    }
+    let boundary = now_ms.saturating_add(1);
+    if fresh && state.is_full(Duration::from_millis(boundary)) {
+        boundary
+    } else {
+        recovers_at(state, now)
+    }
 }
 
 /// What one evicted, unrecovered key owed, in the exact table.
@@ -913,7 +962,7 @@ impl<S: KeyState> ShardMap<S> {
         let Some(slot) = slots.get_mut(pos) else {
             return Evictable::No(UNKNOWN);
         };
-        let at = slot.recovers_at(now);
+        let at = slot.recovers_at(now, now_ms);
         if at <= now_ms {
             Evictable::Recovered
         } else if !slot.seeded || recovery.has_exact_room(slot.hash, now_ms) {
@@ -1325,7 +1374,8 @@ impl<S: KeyState> Store<S> {
         }
         let seeded = charge.is_some_and(|charge| charge.shared);
         let outcome = state.acquire(n, now);
-        map.insert(Slot::new(hash, key.to_key(), state, seeded, now, now_ms));
+        let hint = first_hint(&state, charge.is_none(), n, outcome, now, now_ms);
+        map.insert(Slot::new(hash, key.to_key(), state, seeded, hint, now_ms));
         shard.on_inserted(charge.is_some());
         shard.on_decision(outcome)
     }
@@ -1798,8 +1848,17 @@ fn millis(now: Duration) -> u64 {
 }
 
 /// Milliseconds in `duration`, rounded up and saturating.
+///
+/// Whole seconds are whole milliseconds, so only the sub-second part rounds;
+/// this keeps to 64-bit arithmetic, where dividing the `u128` nanosecond count
+/// would call a 128-bit division routine on every eviction hint.
 fn ceil_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
+    let sub = u64::from(duration.subsec_nanos().div_ceil(1_000_000));
+    duration
+        .as_secs()
+        .checked_mul(1_000)
+        .and_then(|ms| ms.checked_add(sub))
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(all(test, not(loom)))]
@@ -1811,7 +1870,9 @@ mod tests {
 
     use better_bucket::BucketCore;
 
-    use super::{CLOCK_SCAN, Known, Store, TTL_SWEEP, TableSize};
+    use super::{
+        CLOCK_SCAN, Known, Store, TTL_SWEEP, TableSize, ceil_millis, first_hint, recovers_at,
+    };
     use crate::algo::KeyState;
     use crate::eviction::{Eviction, Overflow};
     use crate::key::Key;
@@ -2099,6 +2160,64 @@ mod tests {
         // After its debt is repaid a returning key is simply fresh.
         assert!(check(&store, "b", 1, 1_000, quota));
         assert!(check(&store, "a", 10, 5_000, quota));
+    }
+
+    #[test]
+    fn test_ceil_millis_rounds_up_and_saturates() {
+        for duration in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_nanos(999_999),
+            Duration::from_millis(1),
+            Duration::from_nanos(1_000_001),
+            Duration::new(7, 999_999_999),
+            Duration::new(u64::MAX / 1_000, 0),
+            Duration::new(u64::MAX / 1_000, 999_999_999),
+            Duration::new(u64::MAX, 0),
+            Duration::MAX,
+        ] {
+            let exact = u64::try_from(duration.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+            assert_eq!(ceil_millis(duration), exact, "{duration:?}");
+        }
+    }
+
+    #[test]
+    fn test_first_hint_is_exact_or_a_valid_later_bound() {
+        // The insert-time hint must never be earlier than the truth (the
+        // state is whole by then) and never later than the exact hint 2.0
+        // computed, across quotas that recover within the millisecond, after
+        // it, or not at all.
+        let quotas = [
+            Quota::per_second(u32::MAX),
+            Quota::per_second(1_000_000),
+            Quota::per_second(1_000),
+            Quota::per_second(10),
+            Quota::per_minute(1),
+            Quota::per_second(10).with_burst(3),
+        ];
+        for quota in quotas {
+            for start_ns in [0u64, 1, 400_000, 999_999, 1_000_000, 7_123_456_789] {
+                for n in [0u32, 1, 2, 3, 10, u32::MAX] {
+                    let now = Duration::from_nanos(start_ns);
+                    let now_ms = start_ns / 1_000_000;
+                    let state = BucketCore::create(&quota, now).unwrap();
+                    let outcome = state.acquire(n, now);
+                    let hint = first_hint(&state, true, n, outcome, now, now_ms);
+                    assert!(
+                        hint <= recovers_at(&state, now),
+                        "{quota:?} n={n} at {now:?}"
+                    );
+                    if hint == 0 {
+                        assert!(state.is_full(now));
+                    } else {
+                        assert!(
+                            state.is_full(Duration::from_millis(hint)),
+                            "{quota:?} n={n}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

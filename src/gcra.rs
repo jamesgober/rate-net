@@ -448,6 +448,14 @@ impl GcraParams {
         )
     }
 
+    /// Whether `tat` holds the whole burst at `now`: the theoretical arrival
+    /// time is not past the current interval. The same answer as a
+    /// [`peek_at`](Self::peek_at) with nothing spent, without its division.
+    #[cfg(all(feature = "std", feature = "algorithms"))]
+    fn is_full_in<W: Word>(&self, tat: &W, now: Duration) -> bool {
+        self.closed() || tat.load(Ordering::Acquire) <= self.intervals_at(nanos(now))
+    }
+
     /// Makes `tat` no fuller than a bucket that is whole again exactly at
     /// `until` (a duration on the caller's time line): the theoretical arrival
     /// time is raised to the first emission interval that begins at or after
@@ -685,6 +693,13 @@ impl Gcra {
     /// ```
     pub fn reset(&self) {
         self.tat.store(0, Ordering::Release);
+    }
+
+    /// Whether the bucket holds its whole burst at `now`. See
+    /// [`GcraParams::is_full_in`].
+    #[cfg(all(feature = "std", feature = "algorithms"))]
+    pub(crate) fn is_full_at(&self, now: Duration) -> bool {
+        self.params.is_full_in(&self.tat, now)
     }
 
     /// Makes the bucket no fuller than one that is whole again exactly at
