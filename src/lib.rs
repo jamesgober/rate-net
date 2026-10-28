@@ -19,7 +19,7 @@
 //!
 //! ## Status
 //!
-//! **Stable (`2.0.1`).** The public API is frozen until `3.0`; each `2.x` only
+//! **Stable (`2.1.0`).** The public API is frozen until `3.0`; each `2.x` only
 //! adds to it (`docs/MIGRATION_1_TO_2.md` lists what changed from `1.x`). The five algorithms sit behind the one [`Limiter`] trait (and the
 //! object-safe [`DynLimiter`]) — token bucket by default; the leaky bucket and
 //! window algorithms under the `algorithms` feature — with the validating

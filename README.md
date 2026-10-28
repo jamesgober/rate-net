@@ -33,13 +33,14 @@
 
 <br>
 
-> **Stable (`v2.0.1`).** The public API is frozen until `3.0`; each `2.x` only
+> **Stable (`v2.1.0`).** The public API is frozen until `3.0`; each `2.x` only
 > adds to it. Five algorithms (token bucket by default; leaky bucket, fixed
 > window, sliding-window log, and sliding-window counter under the `algorithms`
 > feature) behind one `Limiter` trait; a validating builder with per-key
 > quotas, key-length limits, and long-key digests; `peek` snapshots and
 > `Retry-After` / `RateLimit` header helpers; `tower` middleware; key
-> management; an un-keyed `DirectLimiter` and a `no_std` `Gcra` core; a fast
+> management; an un-keyed `DirectLimiter` and a `no_std` `Gcra` core (with
+> `GcraParams` for keyed tables of your own); a fast
 > `CoarseClock`; optional metrics and an async layer with bounded waits.
 > `2.0.0` closes the last eviction loophole — an evicted, still-limited key
 > keeps its debt instead of coming back with a fresh allowance, and by default
@@ -70,7 +71,7 @@ Rate limiting looks trivial until production traffic finds the edges — the ove
 - **Multi-algorithm** — token bucket, leaky bucket, fixed window, sliding-window log, sliding-window counter, all behind one `Limiter` trait (and the object-safe `DynLimiter`)
 - **Per-key limiting** — per-IP, per-subnet, per-user, per-endpoint, per-anything; sharded so keys rarely contend
 - **Direct limiting** — `DirectLimiter` for one stream: no key, no map, no shard lock
-- **`no_std` core** — `Gcra`, a clock-free single-key limiter driven by caller-supplied time
+- **`no_std` core**: `Gcra`, a clock-free single-key limiter driven by caller-supplied time, and `GcraParams`, the same arithmetic over an 8-byte word per key in your own table
 - **Validated configuration** — `Builder::try_build` rejects zero periods, zero bursts, out-of-range rates, and idle TTLs that would reset a key early; `build` fails closed
 - **Tiered limits** — `Builder::quota_for` gives chosen keys (paid tenants, internal callers) their own quota in one limiter
 - **Bounded memory** — O(1) CLOCK eviction plus an incremental idle sweep; survives a hostile unique-key flood without resetting anyone's limit
@@ -358,6 +359,22 @@ assert!(gcra.check_at(now).is_allow());
 
 `Gcra` needs only `core` and 64-bit atomics.
 
+A `Gcra` carries its quota's parameters, about 80 bytes, in every instance.
+To limit many streams under one quota from a table of your own, hold the
+parameters once in a `GcraParams` and keep only an `AtomicU64` per key, beside
+the key, so a check reads one cache line. The decisions are exactly `Gcra`'s
+(`Gcra` is built on it), and a word of `0` is a full bucket:
+
+```rust
+use core::sync::atomic::AtomicU64;
+use core::time::Duration;
+use rate_net::{GcraParams, Quota};
+
+let params = GcraParams::new(Quota::per_second(10));
+let tat = AtomicU64::new(0); // stored with the key
+assert!(params.check_at(&tat, Duration::ZERO).is_allow());
+```
+
 <br>
 
 ## Algorithms
@@ -498,6 +515,7 @@ cargo run --example mock_clock    # deterministic refill with a ManualClock
 cargo run --example retry_after   # 429 + Retry-After + RateLimit-* headers
 cargo run --example gatekeeper    # per-client-network gatekeeper (IPv6 /64 keys)
 cargo run --example direct        # pacing one stream with a DirectLimiter
+cargo run --example shared_params # a keyed table of your own on GcraParams
 
 cargo run --example algorithms  --features algorithms  # compare all five algorithms
 cargo run --example async_wait  --features async       # await until allowed
@@ -510,7 +528,7 @@ cargo run --example tower_layer --features tower       # 429s from tower middlew
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std`        | ✅ | Standard library: the keyed limiter, `DirectLimiter`, and `CoarseClock`. Off, the crate is `no_std` and offers `Gcra`, `Quota`, `Decision`, `Snapshot`, the error types, and the header names. |
+| `std`        | ✅ | Standard library: the keyed limiter, `DirectLimiter`, and `CoarseClock`. Off, the crate is `no_std` and offers `Gcra`, `GcraParams`, `Quota`, `Decision`, `Snapshot`, the error types, and the header names. |
 | `algorithms` | ❌ | The full suite beyond the default token bucket (leaky, fixed window, sliding-window log, sliding-window counter). |
 | `async`      | ❌ | `AsyncLimiter` and `DirectLimiter::try_until_ready` / `until_ready_within` (await until allowed, optionally bounded and jittered). Additive — only this layer touches a runtime. |
 | `metrics`    | ❌ | `metrics()` counters on `RateLimiter` and `DirectLimiter`, and the `recovery_load()` saturation gauge. Without it they are compiled out. |
@@ -569,9 +587,11 @@ the full table are in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 | `DirectLimiter` check / on `CoarseClock` | 38.1 ns / 12.2 ns | 37.2 ns / 11.1 ns |
 | `peek` | 80.4 ns | 54.1 ns |
 
-An insert at the cap costs ~58 ns more than in `1.1.0` (see
-[Known issues](#known-issues)): the eviction now reads each candidate's state
-so that it does not evict and reset a still-limited key.
+`2.1.0` brings the insert at the cap back to `1.1.0`'s cost. Measured the
+steadier way (each version its own binary, pinned to one core, alternated
+round by round): `1.1.0` ~220 ns, `2.0.1` ~235 ns, `2.1.0` ~219 ns per insert
+at the default cap, and on a 64-key shard 97 / 146 / 88 ns. The rest of the
+table is unchanged from `2.0.0`.
 
 Under a unique-key flood (three threads inserting new keys as fast as they can,
 the default limiter at its 1,048,576-key cap), a legitimate key's check latency
@@ -600,14 +620,6 @@ default `SystemClock` reads `Instant::now()` (~26 ns on Windows); on
 
 ## Known issues
 
-- **Inserting a new key into a full store is ~58 ns slower than in 1.1.0.**
-  When the key table is at its cap, inserting a never-seen key costs about
-  +58 ns (≈293 → 351 ns at the default 1,048,576-key cap; criterion medians on
-  a loaded Windows host, best of runs, so approximate), because eviction checks
-  that each candidate has fully recovered before evicting it — the price of
-  never resetting a still-limited key. Checks of keys already tracked are
-  unaffected, and below the cap nothing changes. It is to be optimised in a
-  future release and is a blocker for the next minor release, 2.1.0.
 - **Past about twice the cap of still-limited evictions, one side gives.**
   Debts of evicted, still-limited keys are kept exactly for about twice the
   cap's worth of such keys at once (what counts is the rate at which they are
