@@ -231,7 +231,12 @@ impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
 ///         // 429, Retry-After: retry_after
 ///         let _ = retry_after;
 ///     }
-///     _ => {}
+///     // `Decision` is `#[non_exhaustive]`: treat any later outcome as a
+///     // denial, never as an allow.
+///     other => {
+///         // 429
+///         let _ = other.retry_after();
+///     }
 /// }
 /// ```
 pub struct RateLimiter<C: Clock + Clone = SystemClock> {
@@ -739,8 +744,8 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// record is cleared, but if the store has been evicting unrecovered keys
     /// faster than its exact recovery table holds them (see [`Eviction`]), its
     /// next check can still be charged from the shared overflow, which no
-    /// single key can clear; that charge expires within one recovery period,
-    /// and [`clear`](Self::clear) drops it at once.
+    /// single key can clear; that charge never holds the key back longer than
+    /// its own recovery time, and [`clear`](Self::clear) drops it at once.
     /// A key the limiter refuses outright ([`Builder::max_key_len`](crate::Builder::max_key_len))
     /// has neither.
     ///
@@ -769,8 +774,8 @@ impl<C: Clock + Clone> RateLimiter<C> {
     /// Forgets `key` entirely, releasing its state and any debt recorded for it
     /// when it was evicted. Its next check starts from a fresh allowance —
     /// unless, as for [`reset`](Self::reset), the shared overflow of an
-    /// overloaded recovery table charges it, which expires within one recovery
-    /// period.
+    /// overloaded recovery table charges it, which holds it back for at most
+    /// its own recovery time.
     ///
     /// Returns `true` if the key had state or a recorded debt of its own.
     ///
@@ -1002,8 +1007,10 @@ impl<C: Clock + Clone> RateLimiter<C> {
     pub(crate) fn peek_ref(&self, key: KeyRef<'_>) -> Snapshot {
         let now = self.now();
         let known = match self.admit(key) {
-            Admitted::AsIs(stored) => self.store.peek(stored, now),
-            Admitted::Digest(digest) => self.store.peek(KeyRef::digest(&digest), now),
+            Admitted::AsIs(stored) => self.store.peek(stored, now, || self.quota_of_ref(key)),
+            Admitted::Digest(digest) => self
+                .store
+                .peek(KeyRef::digest(&digest), now, || self.quota_of_ref(key)),
             Admitted::TooLong => return Snapshot::closed(),
         };
         match known {

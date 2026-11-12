@@ -52,7 +52,10 @@ enum Repr {
 ///
 /// You rarely name `Key` directly. The check methods accept `impl Into<Key>`,
 /// and this module provides `From` conversions for the common identity types, so
-/// `limiter.check("user:42")` and `limiter.check(ip)` both work. Small keys are
+/// `limiter.check("user:42")` works. For a client IP address, use
+/// [`Key::client_ip`]: `limiter.check(Key::client_ip(ip))`. The plain
+/// `From<IpAddr>` conversion keys each address separately, so an IPv6 client
+/// can rotate through the 2^64 addresses of its `/64` and never be limited. Small keys are
 /// stored inline, which is what keeps an existing-key check allocation-free.
 ///
 /// # Raw and tagged keys
@@ -68,10 +71,13 @@ enum Repr {
 /// - [`Key::id`] — a numeric id.
 /// - [`Key::ip`] — an IP address, canonicalised (an IPv4-mapped IPv6 address
 ///   is the same key as the IPv4 address).
-/// - [`Key::ipv4_prefix`], [`Key::ipv6_prefix`], [`Key::ip_prefix`] — an
-///   address masked to a network prefix. Keying IPv6 clients by their `/64`
-///   stops one host from rotating through the 2^64 addresses it owns to dodge a
-///   per-address limit.
+/// - [`Key::client_ip`]: the usual per-client key. An IPv4 address (including
+///   an IPv4-mapped IPv6 one), or an IPv6 address masked to its `/64`.
+/// - [`Key::ipv4_prefix`], [`Key::ipv6_prefix`], [`Key::ip_prefix`]: an
+///   address masked to a network prefix of your choice. Keying IPv6 clients by
+///   their `/64` (or a shorter prefix, such as `/56` or `/48`, for networks
+///   that hand out larger blocks) stops one host from rotating through the
+///   addresses it owns to dodge a per-address limit.
 ///
 /// # Privacy
 ///
@@ -259,6 +265,33 @@ impl Key {
         bytes[..16].copy_from_slice(&masked);
         bytes[16] = len;
         Self::with_kind(Kind::IpPrefix, &bytes)
+    }
+
+    /// The usual per-client key for an IP address: an IPv4 address exactly
+    /// (an IPv4-mapped IPv6 address is the same key), and an IPv6 address
+    /// masked to its `/64`, the block one host or subscriber normally holds.
+    ///
+    /// The same as [`Key::ip_prefix`]`(addr, 32, 64)`. Use `ip_prefix` to
+    /// choose other prefix lengths, such as `/56` or `/48` for networks that
+    /// give each subscriber a larger IPv6 block.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rate_net::{Key, RateLimiter};
+    /// use std::net::IpAddr;
+    ///
+    /// let limiter = RateLimiter::per_second(1);
+    /// let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    /// let rotated: IpAddr = "2001:db8:1:2:dead:beef:0:9".parse().unwrap();
+    /// assert!(limiter.check(Key::client_ip(first)).is_allow());
+    /// // Another address in the same /64 is the same client.
+    /// assert!(limiter.check(Key::client_ip(rotated)).is_deny());
+    /// assert_eq!(Key::client_ip(first), Key::ip_prefix(first, 32, 64));
+    /// ```
+    #[must_use]
+    pub fn client_ip(addr: IpAddr) -> Self {
+        Self::ip_prefix(addr, 32, 64)
     }
 
     /// A tagged network key for any address: IPv4 (including IPv4-mapped IPv6)
@@ -550,8 +583,12 @@ impl From<u64> for Key {
 }
 
 impl From<IpAddr> for Key {
-    /// A raw key of the address octets (4 or 16 bytes). Prefer [`Key::ip`] or
-    /// [`Key::ip_prefix`] for client keys.
+    /// A raw key of the address octets (4 or 16 bytes), one key per address.
+    ///
+    /// Not suited to keying clients: an IPv6 client can rotate through the
+    /// 2^64 addresses of its `/64`, and `::ffff:a.b.c.d` is a different key
+    /// from `a.b.c.d`. Use [`Key::client_ip`] (or [`Key::ip_prefix`]) for
+    /// client keys.
     fn from(value: IpAddr) -> Self {
         match value {
             IpAddr::V4(addr) => Self::from(addr),
@@ -569,6 +606,8 @@ impl From<Ipv4Addr> for Key {
 
 impl From<Ipv6Addr> for Key {
     /// A raw key of the 16 address octets, equal to `Key::from(IpAddr::V6(..))`.
+    /// One key per address: use [`Key::client_ip`] or [`Key::ipv6_prefix`]
+    /// for client keys.
     fn from(value: Ipv6Addr) -> Self {
         Self::with_kind(Kind::Raw, &value.octets())
     }
@@ -577,7 +616,8 @@ impl From<Ipv6Addr> for Key {
 impl From<SocketAddr> for Key {
     /// A raw key of the peer's IP address. The port is dropped: a client opens
     /// a new port per connection, so a port in the key would give it a fresh
-    /// allowance every time.
+    /// allowance every time. One key per address, like `From<IpAddr>`: use
+    /// [`Key::client_ip`]`(addr.ip())` for client keys.
     fn from(value: SocketAddr) -> Self {
         Self::from(value.ip())
     }

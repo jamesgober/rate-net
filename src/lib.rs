@@ -49,7 +49,12 @@
 //!         // denied — return 429 with `Retry-After`, rounded up:
 //!         let _secs = Decision::Deny { retry_after }.retry_after_secs();
 //!     }
-//!     _ => {}
+//!     // `Decision` is `#[non_exhaustive]`: handle any outcome a later
+//!     // release adds as a denial, never as an allow.
+//!     other => {
+//!         // return 429
+//!         let _ = other.retry_after();
+//!     }
 //! }
 //! # }
 //! ```

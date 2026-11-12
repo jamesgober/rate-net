@@ -22,7 +22,12 @@ fn main() {
                 denied += 1;
                 println!("request {i}: denied (retry after {retry_after:?})");
             }
-            _ => {}
+            // `Decision` is `#[non_exhaustive]`: count any later outcome as
+            // a denial, never as an allow.
+            other => {
+                denied += 1;
+                println!("request {i}: denied ({other:?})");
+            }
         }
     }
 

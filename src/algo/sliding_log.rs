@@ -12,8 +12,11 @@
 //! 16-byte `(timestamp, running total)` record per *distinct admit time* in the
 //! trailing window: at most `limit` records, and a single `check_n` of any size
 //! costs one. The worst case per key is therefore `16 * limit` bytes, which is
-//! why the validating builder caps the limit at
-//! [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT).
+//! why the limit is capped at
+//! [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT) (1 MiB per key): the
+//! validating builder rejects a larger limit, and every other constructor
+//! clamps it, so the log admits at most that many units per period (fewer
+//! than configured, never more).
 //!
 //! The log is a `VecDeque` that grows by doubling as a key's traffic rises, so
 //! unlike the other algorithms a check is not strictly allocation-free: a
@@ -96,6 +99,16 @@ pub(crate) struct SlidingLog {
 }
 
 impl SlidingLog {
+    /// The limit this state runs under (for its quota class).
+    pub(crate) const fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// The window length in nanoseconds (for its quota class).
+    pub(crate) const fn period_ns(&self) -> u64 {
+        self.period_ns
+    }
+
     pub(crate) fn new(quota: &Quota) -> Self {
         Self {
             log: Mutex::new(Log {
@@ -103,7 +116,9 @@ impl SlidingLog {
                 expired_total: 0,
             }),
             period_ns: nanos(quota.period()),
-            limit: quota.limit(),
+            // Bounds the log at 16 * MAX_SLIDING_LOG_LIMIT bytes per key on
+            // every construction path, not only the validating builder.
+            limit: quota.limit().min(crate::MAX_SLIDING_LOG_LIMIT),
         }
     }
 
@@ -269,11 +284,24 @@ mod tests {
     fn test_large_check_n_is_one_record() {
         // A single huge request used to push one timestamp per unit (hundreds
         // of megabytes for 50M units). Coalesced, it is one record.
+        let sl = SlidingLog::new(&Quota::per_second(crate::MAX_SLIDING_LOG_LIMIT));
+        assert!(sl.acquire(30_000, at(0)).is_allow());
+        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
+        assert!(sl.acquire(30_000, at(0)).is_allow());
+        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
+    }
+
+    #[test]
+    fn test_limit_is_capped_on_every_construction_path() {
+        // 16 bytes per record and up to `limit` records: an uncapped limit
+        // made per-key memory unbounded outside the validating builder.
         let sl = SlidingLog::new(&Quota::per_second(u32::MAX));
-        assert!(sl.acquire(50_000_000, at(0)).is_allow());
-        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
-        assert!(sl.acquire(50_000_000, at(0)).is_allow());
-        assert_eq!(super::sync::lock(&sl.log).runs.len(), 1);
+        assert_eq!(sl.limit, crate::MAX_SLIDING_LOG_LIMIT);
+        assert_eq!(sl.peek(at(0)).limit(), crate::MAX_SLIDING_LOG_LIMIT);
+        assert!(
+            sl.acquire(crate::MAX_SLIDING_LOG_LIMIT + 1, at(0))
+                .is_deny()
+        );
     }
 
     #[test]

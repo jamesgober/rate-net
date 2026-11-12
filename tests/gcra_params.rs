@@ -1,9 +1,12 @@
-//! `GcraParams` against `Gcra` and against the 2.0.1 arithmetic.
+//! `GcraParams` against `Gcra` and against a reference GCRA.
 //!
 //! `Gcra` is built on `GcraParams`, so the two agreeing would prove little on
-//! its own. Both are also checked against `Reference` below: the GCRA exactly
-//! as `rate-net` 2.0.1 shipped it, before the parameters were split out, kept
-//! here as the oracle. Every check, peek, and reset must give the same
+//! its own. Both are also checked against `Reference` below: the GCRA as
+//! `rate-net` 2.0.1 shipped it, before the parameters were split out, with the
+//! one change 2.2.0 made: time is counted in `2^k` units per emission interval
+//! (the largest `k <= 30` keeping a unit at least one nanosecond) instead of in
+//! whole intervals, so the elapsed part of an interval is no longer credited
+//! for free. Kept here as the oracle. Every check, peek, and reset must give the same
 //! decision, the same snapshot, and leave the same theoretical arrival time,
 //! across random quotas (zero limits and bursts, rates past one per
 //! nanosecond, non-integral intervals), random `n` (`0`, within the burst, and
@@ -24,6 +27,8 @@ struct Reference {
     period_ns: u64,
     per_ns: u128,
     tolerance: u64,
+    shift: u32,
+    burst: u32,
     deny_all: bool,
 }
 
@@ -37,6 +42,12 @@ impl Reference {
         let burst = quota.burst();
         let limit = u64::from(quota.limit()).min(period_ns);
         let deny_all = limit == 0 || burst == 0;
+        // The largest power of two `2^k <= period / limit`, at most 2^30.
+        let mut shift = 0;
+        while limit != 0 && shift < 30 && (limit << (shift + 1)) <= period_ns {
+            shift += 1;
+        }
+        let limit = limit << shift;
         let per_ns = if deny_all {
             0
         } else {
@@ -47,7 +58,9 @@ impl Reference {
             limit,
             period_ns,
             per_ns,
-            tolerance: u64::from(burst.saturating_sub(1)),
+            tolerance: u64::from(burst.saturating_sub(1)) << shift,
+            shift,
+            burst,
             deny_all,
         }
     }
@@ -73,12 +86,12 @@ impl Reference {
         if n == 0 {
             return Decision::Allow;
         }
-        let span = u64::from(n - 1);
-        if self.deny_all || span > self.tolerance {
+        if self.deny_all || n > self.burst {
             return Decision::Deny {
                 retry_after: Duration::MAX,
             };
         }
+        let span = u64::from(n - 1) << self.shift;
         let now_ns = nanos(now);
         let now_iv = self.intervals_at(now_ns);
         let ceiling = now_iv.saturating_add(self.tolerance);
@@ -86,7 +99,7 @@ impl Reference {
             let tat = self.tat.load(Ordering::Acquire);
             let effective = tat.max(now_iv);
             if effective.saturating_add(span) <= ceiling {
-                let new_tat = effective.saturating_add(u64::from(n));
+                let new_tat = effective.saturating_add(u64::from(n) << self.shift);
                 if self
                     .tat
                     .compare_exchange_weak(tat, new_tat, Ordering::AcqRel, Ordering::Acquire)
@@ -109,19 +122,22 @@ impl Reference {
         if self.deny_all {
             return None;
         }
-        let burst = self.tolerance + 1;
         let now_ns = nanos(now);
         let now_iv = self.intervals_at(now_ns);
         let tat = self.tat.load(Ordering::Acquire).max(now_iv);
-        let remaining = now_iv.saturating_add(burst).saturating_sub(tat);
+        let remaining = now_iv
+            .saturating_add(self.tolerance)
+            .saturating_add(1u64 << self.shift)
+            .saturating_sub(tat)
+            >> self.shift;
         let reset_after = if tat == now_iv {
             Duration::ZERO
         } else {
             Duration::from_nanos(self.nanos_at(tat).saturating_sub(now_ns))
         };
         Some((
-            u32::try_from(burst).unwrap_or(u32::MAX),
-            u32::try_from(remaining).unwrap_or(u32::MAX),
+            self.burst,
+            u32::try_from(remaining).unwrap_or(u32::MAX).min(self.burst),
             reset_after,
         ))
     }

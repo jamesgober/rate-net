@@ -51,12 +51,25 @@ pub(crate) struct Debt {
 
 /// One key's state under one algorithm.
 pub(crate) trait KeyState: Send + Sync + Sized + 'static {
+    /// Whether [`restore`](Self::restore) rebuilds the state from the debt's
+    /// deadline alone (the buckets) rather than from its spent count (the
+    /// window algorithms). The store uses it to judge whether a shared
+    /// overflow charge already covers a key's debt.
+    const RESTORES_BY_DEADLINE: bool = false;
+
     /// Fresh state with its whole allowance as of `now`, or `None` for a quota
     /// that admits nothing (such a key is never stored: it fails closed).
     fn create(quota: &Quota, now: Duration) -> Option<Self>;
 
     /// Checks `n` units as of `now`.
     fn acquire(&self, n: u32, now: Duration) -> Decision;
+
+    /// An 8-bit digest of the quota this state runs under, never `0`. Keys
+    /// under the same quota share a class; the recovery table's overflow
+    /// sketch charges a newcomer only from cells its own class wrote (or
+    /// several classes did), so a slow per-key quota's debts cannot charge
+    /// keys under a faster one through cells only it has written.
+    fn class(&self) -> u8;
 
     /// The remaining allowance as of `now`, without consuming any.
     fn peek(&self, now: Duration) -> Snapshot;
@@ -91,6 +104,13 @@ pub(crate) trait KeyState: Send + Sync + Sized + 'static {
     /// the state of a key that was evicted before it recovered and has now
     /// returned.
     ///
+    /// Never stricter than a state drained empty at `now`: a debt that would
+    /// outlast the key's own recovery time (one read from the shared overflow
+    /// sketch, recorded there under another key's slower quota) is cut to it.
+    /// A key's own debt never exceeds that bound, so honest restores are
+    /// unchanged. The window algorithms meet the bound by construction: they
+    /// charge at most one full allowance at `now`.
+    ///
     /// The buckets override this to be exact: their whole state is "when is
     /// the bucket whole again", so they resume exactly at `debt.until`, with no
     /// rounding of fractional units (a key evicted and restored over and over
@@ -111,6 +131,8 @@ pub(crate) trait KeyState: Send + Sync + Sized + 'static {
 }
 
 impl KeyState for BucketCore {
+    const RESTORES_BY_DEADLINE: bool = true;
+
     fn create(quota: &Quota, now: Duration) -> Option<Self> {
         let burst = quota.burst();
         // Only a zero limit, burst, or period is rejected: such a key admits
@@ -123,6 +145,15 @@ impl KeyState for BucketCore {
     #[inline]
     fn acquire(&self, n: u32, now: Duration) -> Decision {
         self.acquire_at(n, now).into()
+    }
+
+    fn class(&self) -> u8 {
+        let config = self.config();
+        quota_class(
+            u64::from(config.capacity()),
+            u64::from(config.refill_amount()),
+            u64::try_from(config.refill_period().as_nanos()).unwrap_or(u64::MAX),
+        )
     }
 
     fn peek(&self, now: Duration) -> Snapshot {
@@ -163,7 +194,13 @@ impl KeyState for BucketCore {
         // Time to refill the whole capacity, rounded down, so the rebuilt
         // bucket is whole no earlier than `debt.until`.
         let full = u128::from(capacity) * period / u128::from(amount);
-        let until = debt.until.as_nanos();
+        // Never hold the key back longer than its own full refill: a debt
+        // from the shared overflow sketch may have been recorded under
+        // another key's slower quota.
+        let until = debt
+            .until
+            .as_nanos()
+            .min(now.as_nanos().saturating_add(full));
         // The bucket was empty at `until - full`. Before the time line's
         // origin that instant cannot be expressed, so anchor later with the
         // whole tokens it had accrued by then: `k` tokens at
@@ -189,6 +226,8 @@ impl KeyState for BucketCore {
 
 #[cfg(feature = "algorithms")]
 impl KeyState for Gcra {
+    const RESTORES_BY_DEADLINE: bool = true;
+
     fn create(quota: &Quota, _now: Duration) -> Option<Self> {
         admits_anything(Algorithm::LeakyBucket, quota).then(|| Self::new(*quota))
     }
@@ -196,6 +235,15 @@ impl KeyState for Gcra {
     #[inline]
     fn acquire(&self, n: u32, now: Duration) -> Decision {
         self.check_n_at(n, now)
+    }
+
+    fn class(&self) -> u8 {
+        let quota = self.quota();
+        quota_class(
+            u64::from(quota.limit()),
+            u64::from(quota.burst()),
+            u64::try_from(quota.period().as_nanos()).unwrap_or(u64::MAX),
+        )
     }
 
     fn peek(&self, now: Duration) -> Snapshot {
@@ -212,10 +260,11 @@ impl KeyState for Gcra {
         self.is_full_at(now)
     }
 
-    /// Exact: the theoretical arrival time is raised to `debt.until`.
+    /// Exact: the theoretical arrival time is raised to `debt.until`, but
+    /// never past a bucket drained at `now` (see [`KeyState::restore`]).
     fn restore(&mut self, debt: Debt, now: Duration) {
         if debt.until > now {
-            self.restore_until(debt.until);
+            self.restore_until(debt.until, now);
         }
     }
 }
@@ -229,6 +278,10 @@ impl KeyState for FixedWindow {
     #[inline]
     fn acquire(&self, n: u32, now: Duration) -> Decision {
         Self::acquire(self, n, now)
+    }
+
+    fn class(&self) -> u8 {
+        quota_class(u64::from(self.limit()), self.period_ns(), 0)
     }
 
     fn peek(&self, now: Duration) -> Snapshot {
@@ -251,6 +304,10 @@ impl KeyState for SlidingLog {
         Self::acquire(self, n, now)
     }
 
+    fn class(&self) -> u8 {
+        quota_class(u64::from(self.limit()), self.period_ns(), 0)
+    }
+
     fn peek(&self, now: Duration) -> Snapshot {
         Self::peek(self, now)
     }
@@ -271,6 +328,10 @@ impl KeyState for SlidingCounter {
         Self::acquire(self, n, now)
     }
 
+    fn class(&self) -> u8 {
+        quota_class(u64::from(self.limit()), self.period_ns(), 0)
+    }
+
     fn peek(&self, now: Duration) -> Snapshot {
         Self::peek(self, now)
     }
@@ -278,6 +339,20 @@ impl KeyState for SlidingCounter {
     fn reset(&self, _now: Duration) {
         Self::reset(self);
     }
+}
+
+/// The quota class of a state with these parameters: a mix of them folded to
+/// eight bits, `1..=255` (`0` marks a sketch cell several classes wrote).
+#[allow(clippy::cast_possible_truncation, reason = "folded to 8 bits")]
+pub(crate) const fn quota_class(a: u64, b: u64, c: u64) -> u8 {
+    let mut z = a
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(b.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+        .wrapping_add(c.wrapping_mul(0x94D0_49BB_1331_11EB));
+    z ^= z >> 31;
+    z = z.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    z ^= z >> 32;
+    (z % 255) as u8 + 1
 }
 
 /// Whether `quota` admits anything at all under `algorithm`.

@@ -181,6 +181,26 @@ const WALK_BACKOFF: u8 = 32;
 /// the shared overflow sketch: see [`Recovery::record`].
 const INHERITED: u64 = 1 << 63;
 
+/// Bits of [`Record::until_ms`] and of a sketch cell that hold the debt's
+/// *quota class*: an 8-bit digest of the owing key's quota (see
+/// [`KeyState::class`]). A sketch cell written by keys of one class charges
+/// only newcomers of that class; a cell two classes have written is
+/// [`MIXED`] and charges everyone (each charge cut to the newcomer's own
+/// recovery time). So debts under a slow per-key quota cannot charge keys
+/// under a faster one through cells only the slow quota has written.
+const CLASS_SHIFT: u32 = 48;
+const CLASS_MASK: u64 = 0xFF << CLASS_SHIFT;
+
+/// The deadline bits of [`Record::until_ms`].
+const DEADLINE_MASK: u64 = (1 << CLASS_SHIFT) - 1;
+
+/// The class of a sketch cell written by keys of more than one class.
+const MIXED: u8 = 0;
+
+/// The quota class the unit tests' recovery tables record under.
+#[cfg(test)]
+const TEST_CLASS: u8 = 1;
+
 /// The fewest and most buckets a shard's exact table holds (4 records each).
 const MIN_BUCKETS: usize = 2;
 const MAX_BUCKETS: usize = 1 << 13;
@@ -197,10 +217,13 @@ const CELLS_PER_KEY: usize = 4;
 const MIN_CELLS: usize = 8;
 const MAX_CELLS: usize = 1 << 16;
 
-/// Bits of a sketch cell holding the spent units; the rest hold the deadline.
-const SPENT_BITS: u32 = 24;
+/// Bits of a sketch cell holding the spent units; above them sit the 8 class
+/// bits, and the rest hold the deadline.
+const SPENT_BITS: u32 = 16;
 const SPENT_MAX: u64 = (1 << SPENT_BITS) - 1;
-const UNTIL_MAX: u64 = u64::MAX >> SPENT_BITS;
+const CELL_CLASS_SHIFT: u32 = SPENT_BITS;
+const CELL_DEADLINE_SHIFT: u32 = SPENT_BITS + 8;
+const UNTIL_MAX: u64 = u64::MAX >> CELL_DEADLINE_SHIFT;
 
 /// Odd 64-bit constants (the golden ratio, and a second from `splitmix64`)
 /// used to remix a key's hash for the recovery table, so its bucket, cell, and
@@ -363,14 +386,21 @@ struct Record {
     /// Units the key had spent and not yet recovered.
     spent: u32,
     /// When they would all have been back, in whole milliseconds since the
-    /// limiter epoch (rounded up), with the [`INHERITED`] bit on top. A record
-    /// is live while the deadline is in the future.
+    /// limiter epoch (rounded up, in the low 48 bits), the key's quota class
+    /// above it, and the [`INHERITED`] bit on top. A record is live while the
+    /// deadline is in the future.
     until_ms: u64,
 }
 
 impl Record {
     const fn until(&self) -> u64 {
-        self.until_ms & !INHERITED
+        self.until_ms & DEADLINE_MASK
+    }
+
+    /// The owing key's quota class.
+    #[allow(clippy::cast_possible_truncation, reason = "masked to 8 bits")]
+    const fn class(&self) -> u8 {
+        ((self.until_ms & CLASS_MASK) >> CLASS_SHIFT) as u8
     }
 
     const fn is_live(&self, now_ms: u64) -> bool {
@@ -398,8 +428,10 @@ struct Bucket([Record; BUCKET_RECORDS]);
 
 /// A cell of the overflow sketch: a deadline (milliseconds since the epoch,
 /// rounded up) and a spent count, packed into one word; `0` is empty.
-fn pack(until_ms: u64, spent: u32) -> u64 {
-    (until_ms.min(UNTIL_MAX) << SPENT_BITS) | u64::from(spent).min(SPENT_MAX)
+fn pack(until_ms: u64, class: u8, spent: u32) -> u64 {
+    (until_ms.min(UNTIL_MAX) << CELL_DEADLINE_SHIFT)
+        | (u64::from(class) << CELL_CLASS_SHIFT)
+        | u64::from(spent).min(SPENT_MAX)
 }
 
 /// The deadline and spent count of a sketch cell. A spent count that filled
@@ -417,7 +449,13 @@ const fn unpack(cell: u64) -> (u64, u32) {
     } else {
         spent as u32
     };
-    (cell >> SPENT_BITS, spent)
+    (cell >> CELL_DEADLINE_SHIFT, spent)
+}
+
+/// The quota class of a sketch cell.
+#[allow(clippy::cast_possible_truncation, reason = "masked to 8 bits")]
+const fn cell_class(cell: u64) -> u8 {
+    ((cell >> CELL_CLASS_SHIFT) & 0xFF) as u8
 }
 
 /// Where a key's records and cells live in a recovery table, and its tag.
@@ -600,6 +638,25 @@ impl Recovery {
             })
     }
 
+    /// Whether the overflow sketch alone already charges a key with `hash` at
+    /// least `debt`, so the key can be forgotten without recording anything.
+    ///
+    /// A sketch cell only grows while it is live and expires no earlier than
+    /// its deadline, so while both of the key's cells are at or past `debt`, a
+    /// return before `debt.until` is charged no less than the key owes now (a
+    /// restore cuts the charge to the key's own recovery time, which is never
+    /// below its own debt), and after that the key owes nothing. `by_deadline`
+    /// states restore from the deadline alone, so for them the spend does not
+    /// need to be covered.
+    fn covers(&self, hash: u64, class: u8, debt: Debt, now_ms: u64, by_deadline: bool) -> bool {
+        let Some(probe) = self.probe(hash) else {
+            return false;
+        };
+        self.shared(&probe, class, now_ms).is_some_and(|shared| {
+            shared.until >= debt.until && (by_deadline || shared.spent >= debt.spent)
+        })
+    }
+
     /// A free or expired record of bucket `b`.
     fn free_in(&self, b: usize, now_ms: u64) -> Option<usize> {
         self.buckets
@@ -631,13 +688,16 @@ impl Recovery {
     fn overflow(&mut self, record: Record, bucket: usize, now_ms: u64) {
         let low = bucket.min(alt_bucket(bucket, record.tag, self.buckets.len()));
         let until_ms = record.until();
+        let class = record.class();
         for c in cells_of(record.tag, low, self.cells.len()) {
             if let Some(cell) = self.cells.get_mut(c) {
                 let (old_until, old_spent) = unpack(*cell);
                 *cell = if old_until > now_ms {
-                    pack(old_until.max(until_ms), old_spent.max(record.spent))
+                    let old_class = cell_class(*cell);
+                    let merged = if old_class == class { class } else { MIXED };
+                    pack(old_until.max(until_ms), merged, old_spent.max(record.spent))
                 } else {
-                    pack(until_ms, record.spent)
+                    pack(until_ms, class, record.spent)
                 };
             }
         }
@@ -659,10 +719,24 @@ impl Recovery {
     /// let it spread and ratchet across keys that never owed it. Returns
     /// `None`, recording nothing, when an inherited debt finds no place (see
     /// [`has_exact_room`](Self::has_exact_room)).
+    #[cfg(test)]
     fn record(
         &mut self,
         hash: u64,
         debt: Debt,
+        now_ms: u64,
+        size: TableSize,
+        inherited: bool,
+    ) -> Option<Recorded> {
+        self.record_class(hash, debt, TEST_CLASS, now_ms, size, inherited)
+    }
+
+    /// [`record`](Self::record) for a key of quota class `class`.
+    fn record_class(
+        &mut self,
+        hash: u64,
+        debt: Debt,
+        class: u8,
         now_ms: u64,
         size: TableSize,
         inherited: bool,
@@ -673,7 +747,8 @@ impl Recovery {
         }
         let probe = Probe::new(hash, self.buckets.len(), self.cells.len());
         let flag = if inherited { INHERITED } else { 0 };
-        let until_ms = ceil_millis(debt.until).min(!INHERITED);
+        let class_bits = u64::from(class) << CLASS_SHIFT;
+        let until_ms = ceil_millis(debt.until).min(DEADLINE_MASK);
         if let Some((b, r)) = self.own(&probe, now_ms) {
             if let Some(record) = self
                 .buckets
@@ -682,14 +757,14 @@ impl Recovery {
             {
                 record.spent = record.spent.max(debt.spent);
                 let kept = record.until_ms & INHERITED;
-                record.until_ms = record.until().max(until_ms) | kept | flag;
+                record.until_ms = record.until().max(until_ms) | class_bits | kept | flag;
             }
             return Some(Recorded::Exact);
         }
         let new = Record {
             tag: probe.tag,
             spent: debt.spent,
-            until_ms: until_ms | flag,
+            until_ms: until_ms | class_bits | flag,
         };
         for b in probe.buckets {
             if let Some(r) = self.free_in(b, now_ms) {
@@ -770,13 +845,19 @@ impl Recovery {
     /// record, combined with the overflow cells' lower bound — the smaller of
     /// the key's two cells, which is at least anything recorded for the key
     /// itself there.
+    #[cfg(test)]
     fn peek(&self, hash: u64, now_ms: u64) -> Option<Charge> {
+        self.peek_class(hash, TEST_CLASS, now_ms)
+    }
+
+    /// [`peek`](Self::peek) for a key of quota class `class`.
+    fn peek_class(&self, hash: u64, class: u8, now_ms: u64) -> Option<Charge> {
         let probe = self.probe(hash)?;
         let own = self
             .own(&probe, now_ms)
             .and_then(|(b, r)| self.buckets.get(b)?.0.get(r))
             .map(Record::debt);
-        let shared = self.shared(&probe, now_ms);
+        let shared = self.shared(&probe, class, now_ms);
         match (own, shared) {
             (None, None) => None,
             (Some(debt), None) => Some(Charge {
@@ -796,18 +877,29 @@ impl Recovery {
 
     /// As [`peek`](Self::peek), for a key being stored: its own record is
     /// cleared, since the key now carries the debt itself.
+    #[cfg(test)]
     fn take(&mut self, hash: u64, now_ms: u64) -> Option<Charge> {
-        let charge = self.peek(hash, now_ms)?;
+        self.take_class(hash, TEST_CLASS, now_ms)
+    }
+
+    /// [`take`](Self::take) for a key of quota class `class`.
+    fn take_class(&mut self, hash: u64, class: u8, now_ms: u64) -> Option<Charge> {
+        let charge = self.peek_class(hash, class, now_ms)?;
         let _cleared = self.forget(hash, now_ms);
         Some(charge)
     }
 
-    /// The overflow sketch's lower bound for a key: only when both of its cells
-    /// are live, the smaller deadline and the smaller spend.
-    fn shared(&self, probe: &Probe, now_ms: u64) -> Option<Debt> {
-        let [a, b] = probe
-            .cells
-            .map(|c| unpack(self.cells.get(c).copied().unwrap_or(0)));
+    /// The overflow sketch's lower bound for a key of quota class `class`:
+    /// only when both of its cells are live and were written by its class (or
+    /// by several classes), the smaller deadline and the smaller spend. A cell
+    /// only other classes have written holds none of this key's debt.
+    fn shared(&self, probe: &Probe, class: u8, now_ms: u64) -> Option<Debt> {
+        let [a, b] = probe.cells.map(|c| {
+            let cell = self.cells.get(c).copied().unwrap_or(0);
+            let (until, spent) = unpack(cell);
+            let applies = matches!(cell_class(cell), c if c == class || c == MIXED);
+            (if applies { until } else { 0 }, spent)
+        });
         (a.0 > now_ms && b.0 > now_ms).then(|| Debt {
             spent: a.1.min(b.1),
             until: Duration::from_millis(a.0.min(b.0)),
@@ -954,7 +1046,9 @@ impl<S: KeyState> ShardMap<S> {
     /// evicted if its debt can be recorded: always for a key whose own state
     /// it is, but a key whose state carries a debt charged from the shared
     /// overflow only into the exact table — never back into the overflow,
-    /// which would spread debt it may not owe to other keys.
+    /// which would spread debt it may not owe to other keys; or when the
+    /// overflow already charges it at least what it owes, so forgetting it
+    /// loses nothing.
     fn evictable(&mut self, pos: usize, now: Duration, now_ms: u64) -> Evictable {
         let Self {
             slots, recovery, ..
@@ -967,6 +1061,16 @@ impl<S: KeyState> ShardMap<S> {
             Evictable::Recovered
         } else if !slot.seeded || recovery.has_exact_room(slot.hash, now_ms) {
             Evictable::Owing
+        } else if slot.state.debt(now).is_none_or(|debt| {
+            recovery.covers(
+                slot.hash,
+                slot.state.class(),
+                debt,
+                now_ms,
+                S::RESTORES_BY_DEADLINE,
+            )
+        }) {
+            Evictable::Covered
         } else {
             Evictable::No(at)
         }
@@ -992,7 +1096,8 @@ impl<S: KeyState> ShardMap<S> {
                 if let Some(debt) = slot.state.debt(now) {
                     // `evictable` checked that a seeded key fits the exact
                     // table, so recording cannot fail.
-                    match recovery.record(slot.hash, debt, now_ms, size, slot.seeded) {
+                    let class = slot.state.class();
+                    match recovery.record_class(slot.hash, debt, class, now_ms, size, slot.seeded) {
                         Some(Recorded::Overflowed) => {
                             out.remembered += 1;
                             out.overflowed += 1;
@@ -1032,7 +1137,7 @@ impl<S: KeyState> ShardMap<S> {
                 .is_some_and(|slot| slot.is_expired(now_ms, Some(ttl_ms)));
             let evict = if expired {
                 match self.evictable(self.sweep, now, now_ms) {
-                    Evictable::Recovered => Some(true),
+                    Evictable::Recovered | Evictable::Covered => Some(true),
                     Evictable::Owing => Some(false),
                     Evictable::No(_) => None,
                 }
@@ -1088,13 +1193,16 @@ impl<S: KeyState> ShardMap<S> {
                     return Ok(());
                 }
                 Evictable::Owing => {
-                    let _first = owing.get_or_insert(pos);
+                    let _first = owing.get_or_insert((pos, false));
+                }
+                Evictable::Covered => {
+                    let _first = owing.get_or_insert((pos, true));
                 }
                 Evictable::No(at) => earliest = earliest.min(at),
             }
         }
-        if let Some(pos) = owing {
-            self.finish_eviction(pos, false, now, now_ms, size, out);
+        if let Some((pos, covered)) = owing {
+            self.finish_eviction(pos, covered, now, now_ms, size, out);
             return Ok(());
         }
         // Every examined slot was referenced (now cleared) or blocked: take
@@ -1102,7 +1210,7 @@ impl<S: KeyState> ShardMap<S> {
         for step in 0..scan {
             let pos = (start + step) % len;
             match self.evictable(pos, now, now_ms) {
-                Evictable::Recovered => {
+                Evictable::Recovered | Evictable::Covered => {
                     self.finish_eviction(pos, true, now, now_ms, size, out);
                     return Ok(());
                 }
@@ -1141,6 +1249,9 @@ enum Evictable {
     Recovered,
     /// It still owes, and its debt can be recorded.
     Owing,
+    /// It still owes, but the overflow sketch already charges it at least
+    /// that much: evicting it without recording loses nothing.
+    Covered,
     /// It still owes and its debt cannot be recorded; it recovers at this time.
     No(u64),
 }
@@ -1368,7 +1479,7 @@ impl<S: KeyState> Store<S> {
         }
         // A key evicted before it recovered resumes no more permissive than it
         // left.
-        let charge = map.recovery.take(hash, now_ms);
+        let charge = map.recovery.take_class(hash, state.class(), now_ms);
         if let Some(charge) = charge {
             state.restore(charge.debt, now);
         }
@@ -1408,14 +1519,29 @@ impl<S: KeyState> Store<S> {
 
     /// What the store knows about `key` as of `now`. Takes only the shard read
     /// lock, consumes nothing, and leaves the key's eviction recency untouched.
-    pub(crate) fn peek(&self, key: KeyRef<'_>, now: Duration) -> Known {
+    pub(crate) fn peek(
+        &self,
+        key: KeyRef<'_>,
+        now: Duration,
+        make_state: impl FnOnce(Duration) -> Option<S>,
+    ) -> Known {
         let hash = self.hasher.hash_one(key);
-        let map = sync::read(&self.shard(hash).map);
+        let shard = self.shard(hash);
+        if let Some(slot) = sync::read(&shard.map).get(hash, key) {
+            return Known::Tracked(slot.state.peek(now));
+        }
+        // An untracked key is charged as a newcomer of its own quota class.
+        // The state (and so the caller's quota resolver) is made outside the
+        // lock, as in `check`.
+        let Some(class) = make_state(now).map(|state| state.class()) else {
+            return Known::Unknown;
+        };
+        let map = sync::read(&shard.map);
         if let Some(slot) = map.get(hash, key) {
             return Known::Tracked(slot.state.peek(now));
         }
         map.recovery
-            .peek(hash, millis(now))
+            .peek_class(hash, class, millis(now))
             .map_or(Known::Unknown, |charge| Known::Owed(charge.debt))
     }
 
@@ -1676,9 +1802,14 @@ impl Keyed {
         keyed!(self, store: State => store.check(key, n, clock, |now| State::create(&quota(), now)))
     }
 
-    /// See [`Store::peek`].
-    pub(crate) fn peek(&self, key: KeyRef<'_>, now: Duration) -> Known {
-        keyed!(self, store: State => store.peek(key, now))
+    /// See [`Store::peek`]; an untracked key is judged under `quota()`.
+    pub(crate) fn peek(
+        &self,
+        key: KeyRef<'_>,
+        now: Duration,
+        quota: impl FnOnce() -> Quota,
+    ) -> Known {
+        keyed!(self, store: State => store.peek(key, now, |now| State::create(&quota(), now)))
     }
 
     /// The allowance of an untracked key that owes `debt`: a fresh state under
@@ -1916,12 +2047,16 @@ mod tests {
             .is_allow()
     }
 
-    fn peek(store: &Store<BucketCore>, key: impl Into<Key>, ms: u64) -> Known {
-        store.peek(key.into().as_key_ref(), at(ms))
+    /// What the store knows of `key` at `ms`, judging an untracked key under
+    /// `quota` (its quota class picks the overflow cells that apply).
+    fn peek(store: &Store<BucketCore>, key: impl Into<Key>, ms: u64, quota: Quota) -> Known {
+        store.peek(key.into().as_key_ref(), at(ms), |now| {
+            BucketCore::create(&quota, now)
+        })
     }
 
     fn tracked(store: &Store<BucketCore>, key: impl Into<Key>) -> bool {
-        matches!(peek(store, key, 0), Known::Tracked(_))
+        matches!(peek(store, key, 0, slow(1)), Known::Tracked(_))
     }
 
     /// A rate so slow nothing refills during a test.
@@ -2139,7 +2274,7 @@ mod tests {
             !tracked(&store, "victim"),
             "the flood should have evicted it"
         );
-        assert!(matches!(peek(&store, "victim", 0), Known::Owed(_)));
+        assert!(matches!(peek(&store, "victim", 0, slow(5)), Known::Owed(_)));
         assert!(
             !check(&store, "victim", 1, 0, slow(5)),
             "eviction reset the limit"
@@ -2232,7 +2367,7 @@ mod tests {
         // A newcomer evicts the recovered key, so nothing is owed.
         assert!(check(&store, "new", 1, 0, quota));
         assert!(!tracked(&store, "idle"));
-        assert!(matches!(peek(&store, "idle", 0), Known::Unknown));
+        assert!(matches!(peek(&store, "idle", 0, quota), Known::Unknown));
         assert_eq!(store.recovery_bytes(), 0, "no debt had to be recorded");
         for k in 0..7u64 {
             assert!(tracked(&store, k));
@@ -2266,16 +2401,17 @@ mod tests {
 
     #[test]
     fn test_a_spent_count_past_the_sketch_field_charges_everything() {
-        // RN3-002: the sketch keeps 24 bits of spent units; a count that
-        // fills them reads back as all of the key's allowance.
+        // RN3-002: the sketch keeps 16 bits of spent units (24 before 2.2.0,
+        // which took 8 for the quota class); a count that fills them reads
+        // back as all of the key's allowance.
         use super::{Recorded, Recovery, SPENT_MAX, TableSize, pack, unpack};
         use crate::algo::Debt;
 
         let below = u32::try_from(SPENT_MAX - 1).unwrap();
-        assert_eq!(unpack(pack(7, below)), (7, below));
+        assert_eq!(unpack(pack(7, 3, below)), (7, below));
         for spent in [SPENT_MAX, SPENT_MAX + 1, 100_000_000, u64::from(u32::MAX)] {
             let spent = u32::try_from(spent).unwrap();
-            assert_eq!(unpack(pack(7, spent)), (7, u32::MAX), "{spent}");
+            assert_eq!(unpack(pack(7, 3, spent)), (7, u32::MAX), "{spent}");
         }
         assert_eq!(unpack(0), (0, 0));
 
@@ -2453,7 +2589,7 @@ mod tests {
         let mut charged = 0;
         for k in 0..1_000u64 {
             let key = format!("new-{k}");
-            if let Known::Owed(debt) = peek(&store, key.as_str(), 0) {
+            if let Known::Owed(debt) = peek(&store, key.as_str(), 0, quota) {
                 assert!(debt.spent <= 1, "{key} would be charged {}", debt.spent);
                 charged += 1;
             }
@@ -2478,7 +2614,7 @@ mod tests {
             }
         }
         for k in 0..500u64 {
-            if let Known::Owed(debt) = peek(&store, format!("probe-{k}").as_str(), 0) {
+            if let Known::Owed(debt) = peek(&store, format!("probe-{k}").as_str(), 0, quota) {
                 assert!(debt.spent <= 1, "charged {} units", debt.spent);
             }
         }
@@ -2487,18 +2623,29 @@ mod tests {
     #[test]
     fn test_a_saturated_shard_refuses_newcomers_until_a_key_recovers() {
         // Fill a tiny shard and its exact table with keys seeded from the
-        // overflow and still limited: nothing can be evicted without losing a
-        // debt, so a newcomer is refused with a wait — and admitted once one
-        // of them recovers.
+        // overflow that then spent more than the overflow charged them: such
+        // a key owes past what the overflow holds for it, so nothing can be
+        // evicted without losing a debt, and a newcomer is refused with a
+        // wait, and admitted once one of them recovers.
         let store = make_store(1, Eviction::capacity(2));
-        let quota = Quota::from_parts(1, Duration::from_secs(60), 1);
+        // Two per minute: a drained key is half refilled 30 s later.
+        let quota = Quota::from_parts(2, Duration::from_secs(60), 2);
+        for k in 0..10_000u64 {
+            let key = Key::from(k);
+            let _ = store.check(
+                key.as_key_ref(),
+                2,
+                || at(0),
+                |now| BucketCore::create(&quota, now),
+            );
+        }
         let mut refused = None;
-        for k in 0..100_000u64 {
+        for k in 10_000..110_000u64 {
             let key = Key::from(k);
             let decision = store.check(
                 key.as_key_ref(),
                 1,
-                || at(0),
+                || at(30_000),
                 |now| BucketCore::create(&quota, now),
             );
             if let crate::decision::Decision::Deny { retry_after } = decision {
@@ -2510,7 +2657,28 @@ mod tests {
         }
         let wait = refused.unwrap(); // a tiny shard under a drain flood saturates
         assert!(wait > Duration::ZERO && wait <= Duration::from_secs(60));
-        assert!(check(&store, "late", 1, 60_001, quota));
+        assert!(check(&store, "late", 1, 90_001, quota));
+    }
+
+    #[test]
+    fn test_a_key_the_overflow_already_covers_is_evicted_not_refused() {
+        // Every newcomer is seeded from the overflow and spends nothing more:
+        // the overflow alone charges it at least what it owes, so forgetting
+        // it loses nothing. Newcomers are charged, never refused.
+        let store = make_store(1, Eviction::capacity(2));
+        let quota = Quota::from_parts(1, Duration::from_secs(60), 1);
+        for k in 0..100_000u64 {
+            let key = Key::from(k);
+            let decision = store.check(
+                key.as_key_ref(),
+                1,
+                || at(0),
+                |now| BucketCore::create(&quota, now),
+            );
+            if decision.is_deny() {
+                assert!(tracked(&store, key.clone()), "key {k} was refused");
+            }
+        }
     }
 
     #[test]
@@ -2519,18 +2687,18 @@ mod tests {
         let quota = slow(2);
         assert!(check(&store, "a", 2, 0, quota));
         assert!(check(&store, "b", 2, 0, quota)); // "a" evicted, owing 2
-        assert!(matches!(peek(&store, "a", 0), Known::Owed(_)));
+        assert!(matches!(peek(&store, "a", 0, quota), Known::Owed(_)));
         assert!(store.reset(Key::from("a").as_key_ref(), at(0)));
-        assert!(matches!(peek(&store, "a", 0), Known::Unknown));
+        assert!(matches!(peek(&store, "a", 0, quota), Known::Unknown));
         assert!(!store.reset(Key::from("a").as_key_ref(), at(0)));
 
         assert!(check(&store, "c", 2, 0, quota)); // "b" evicted, owing 2
         assert!(store.remove(Key::from("b").as_key_ref(), at(0)));
-        assert!(matches!(peek(&store, "b", 0), Known::Unknown));
+        assert!(matches!(peek(&store, "b", 0, quota), Known::Unknown));
 
         assert!(check(&store, "d", 2, 0, quota)); // "c" evicted, owing 2
         store.clear();
-        assert!(matches!(peek(&store, "c", 0), Known::Unknown));
+        assert!(matches!(peek(&store, "c", 0, quota), Known::Unknown));
         assert_eq!(store.recovery_bytes(), 0);
         assert!(check(&store, "c", 2, 0, quota));
     }
@@ -2609,15 +2777,24 @@ mod tests {
         let store = make_store(2, Eviction::unbounded());
         let quota = Quota::per_second(10);
         let key = Key::from("k");
-        assert_eq!(store.peek(key.as_key_ref(), at(0)), Known::Unknown);
+        assert_eq!(
+            store.peek(key.as_key_ref(), at(0), |now| BucketCore::create(
+                &slow(1),
+                now
+            )),
+            Known::Unknown
+        );
         assert!(!store.reset(key.as_key_ref(), at(0)));
         assert!(!store.remove(key.as_key_ref(), at(0)));
 
         assert!(check(&store, key.clone(), 4, 0, quota));
-        let remaining = |store: &Store<BucketCore>| match store.peek(key.as_key_ref(), at(0)) {
-            Known::Tracked(snapshot) => Some(snapshot.remaining()),
-            _ => None,
-        };
+        let remaining =
+            |store: &Store<BucketCore>| match store.peek(key.as_key_ref(), at(0), |now| {
+                BucketCore::create(&slow(1), now)
+            }) {
+                Known::Tracked(snapshot) => Some(snapshot.remaining()),
+                _ => None,
+            };
         assert_eq!(remaining(&store), Some(6));
         assert!(store.reset(key.as_key_ref(), at(0)));
         assert_eq!(remaining(&store), Some(10));
@@ -2775,8 +2952,9 @@ mod tests {
         let _ = table.record(9, debt(3, 50), 0, size, false);
         assert_eq!(table.take(9, 0), Some(own(3, 50)));
         assert_eq!(table.peek(9, 0), None);
-        assert!(super::pack(u64::MAX, u32::MAX) > 0);
-        assert_eq!(super::unpack(super::pack(5, 7)), (5, 7));
+        assert!(super::pack(u64::MAX, u8::MAX, u32::MAX) > 0);
+        assert_eq!(super::unpack(super::pack(5, 9, 7)), (5, 7));
+        assert_eq!(super::cell_class(super::pack(5, 9, 7)), 9);
     }
 
     proptest::proptest! {

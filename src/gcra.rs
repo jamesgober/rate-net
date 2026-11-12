@@ -1,9 +1,9 @@
 //! The Generic Cell Rate Algorithm: the clock-free single-key core.
 //!
 //! [`Gcra`] is the leaky bucket: where a token bucket lets a full burst through
-//! and then sustains the rate, the GCRA *spaces* admitted units at least one
-//! emission interval apart, smoothing traffic toward a steady output rate while
-//! still tolerating a burst up to the quota's `burst`. The whole state is one
+//! and then sustains the rate, the GCRA *spaces* admitted units one emission
+//! interval apart, smoothing traffic toward a steady output rate while still
+//! tolerating a burst up to the quota's `burst`. The whole state is one
 //! atomic "theoretical arrival time" advanced by compare-and-swap, so a check is
 //! lock-free.
 //!
@@ -22,14 +22,23 @@
 //!
 //! # Exact units
 //!
-//! Time is accounted in *emission intervals* rather than nanoseconds: one unit
-//! of the theoretical arrival time is exactly `period / limit`. An interval in
-//! whole nanoseconds would truncate (`period / limit` rounds down), which
-//! over-admits (600 M/s became 1 G/s, a 1.67x overshoot) and collapses to zero
-//! once the rate passes one per nanosecond. In interval units every admitted
-//! unit costs exactly one, so there is no drift at any rate. The current time is
+//! Time is accounted in fixed fractions of an *emission interval* rather than
+//! in nanoseconds: one unit of the theoretical arrival time is exactly
+//! `period / (limit * 2^k)`, where `2^k` (at most `2^30`) is the largest power
+//! of two that keeps that unit at least one nanosecond. An interval in whole
+//! nanoseconds would truncate (`period / limit` rounds down), which over-admits
+//! (600 M/s became 1 G/s, a 1.67x overshoot) and collapses to zero once the
+//! rate passes one per nanosecond. In these units every admitted unit costs
+//! exactly `2^k`, so there is no drift at any rate. The current time is
 //! converted with a precomputed 64.64 fixed-point reciprocal (two multiplies,
 //! no division on the check path) and corrected to the exact floor.
+//!
+//! The fractions are what keep the spacing honest. With whole intervals, the
+//! part of an interval that had already passed was credited for free, so a
+//! burst-1 limit at one per second admitted units at 1.999 s and 2.000 s. Now
+//! two admitted units of a burst-1 limit are at least one interval apart, less
+//! at most one unit of the time line: under 2 ns, or `1/2^30` of the interval
+//! for intervals longer than about one second.
 
 use core::fmt;
 use core::sync::atomic::AtomicU64;
@@ -41,6 +50,16 @@ use crate::quota::Quota;
 use crate::snapshot::Snapshot;
 // `core`'s ordering, re-exported by loom too, so one type in every build.
 use crate::sync::Ordering;
+
+/// Most time-line units per emission interval, as a power of two: `2^30`. Keeps
+/// `(burst - 1) * 2^k` within `u64` for any `u32` burst.
+const MAX_SHIFT: u32 = 30;
+
+/// Where [`GcraParams::shift`] sits in `per_ns`: the reciprocal is at most
+/// `2^64`, so bits 96 and up are free.
+const SHIFT_BITS_AT: u32 = 96;
+/// The reciprocal bits of `per_ns`.
+const RECIPROCAL_MASK: u128 = (1 << 65) - 1;
 
 /// Clamps a duration-since-epoch to nanoseconds, saturating rather than wrapping
 /// past the ~584-year `u64` ceiling.
@@ -113,12 +132,15 @@ impl_word!(crate::sync::AtomicU64);
 ///
 /// # The TAT word
 ///
-/// A word holding `0` is a full bucket: interval 0 is at or before any `now`.
+/// A word holding `0` is a full bucket: time 0 is at or before any `now`.
 /// So `AtomicU64::new(0)` starts a stream with its whole burst, and storing
 /// `0` (or calling [`reset`](Self::reset)) restores it. Any other value is the
-/// theoretical arrival time in emission intervals of *this* quota. Use a word
-/// with one set of parameters only; read under a different quota, its value
-/// means something else. The methods load and update the word atomically, so
+/// theoretical arrival time in *this* quota's fixed fractions of an emission
+/// interval (`2^k` of them per interval, `k <= 30`); treat it as opaque.
+/// Use a word with one set of parameters only; read under a different quota,
+/// its value means something else. Since 2.2.0 the fractions are finer than
+/// the whole intervals 2.1 used, so a word saved by 2.1 reads as an earlier
+/// time (a fuller bucket) under 2.2. The methods load and update the word atomically, so
 /// any number of threads may check one word at once.
 ///
 /// # Time and quota semantics
@@ -154,19 +176,23 @@ impl_word!(crate::sync::AtomicU64);
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GcraParams {
-    /// Effective `limit` (units per period), clamped to at most one unit per
-    /// nanosecond so an interval is never shorter than the clock resolution.
+    /// Time-line units per period: the effective `limit`, clamped to at most
+    /// one unit per nanosecond, times `2^k` sub-intervals per emission
+    /// interval (see [`shift`](Self::shift)). Never more than `period_ns`.
     limit: u64,
     /// Period in nanoseconds.
     period_ns: u64,
-    /// `limit * 2^64 / period_ns`, the ns→interval reciprocal. At most `2^64`
-    /// (exactly `2^64` when one interval is one nanosecond). Zero exactly when
+    /// `limit * 2^64 / period_ns`, the ns→interval reciprocal, in the low 65
+    /// bits, and the [`shift`](Self::shift) from bit 96 up. The reciprocal is
+    /// at most `2^64` (exactly `2^64` when one unit of the time line is one
+    /// nanosecond). The reciprocal is zero exactly when
     /// the quota admits nothing (`limit == 0`, `burst == 0`, or a zero period):
     /// with `1 <= limit <= period_ns < 2^64` the quotient is at least one, so
     /// zero is free to mark the closed quota without a separate flag (which
     /// would round the struct up past one cache line).
     per_ns: u128,
-    /// Delay tolerance in intervals: `burst - 1`, the slack a burst rides on.
+    /// Delay tolerance in time-line units: `(burst - 1) * 2^k`, the slack a
+    /// burst rides on.
     tolerance: u64,
     /// The quota as configured, for introspection.
     quota: Quota,
@@ -194,16 +220,25 @@ impl GcraParams {
         // Fail closed on a rate finer than one unit per nanosecond: clamp it to
         // exactly one per nanosecond (admit less, never more).
         let limit = u64::from(quota.limit()).min(period_ns);
-        let per_ns = if limit == 0 || burst == 0 {
+        // Split each emission interval into `2^shift` units of the time line,
+        // as many as keep a unit at least one nanosecond (and at most 2^30, so
+        // the tolerance below always fits).
+        let shift = period_ns
+            .checked_div(limit)
+            .and_then(u64::checked_ilog2)
+            .map_or(0, |log2| log2.min(MAX_SHIFT));
+        let limit = limit << shift;
+        let reciprocal = if limit == 0 || burst == 0 {
             0
         } else {
             (u128::from(limit) << 64) / u128::from(period_ns)
         };
+        let per_ns = reciprocal | (u128::from(shift) << SHIFT_BITS_AT);
         Self {
             limit,
             period_ns,
             per_ns,
-            tolerance: u64::from(burst.saturating_sub(1)),
+            tolerance: u64::from(burst.saturating_sub(1)) << shift,
             quota,
         }
     }
@@ -250,10 +285,27 @@ impl GcraParams {
     /// Whether the quota admits nothing.
     #[inline]
     const fn closed(&self) -> bool {
-        self.per_ns == 0
+        self.per_ns & RECIPROCAL_MASK == 0
     }
 
-    /// `floor(now_ns * limit / period_ns)`: the current time in intervals.
+    /// `k`, where one emission interval is `2^k` units of the time line. Kept
+    /// in the otherwise unused top bits of `per_ns`, so the struct stays one
+    /// cache line.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation, reason = "the shift is at most 30")]
+    const fn shift(&self) -> u32 {
+        (self.per_ns >> SHIFT_BITS_AT) as u32
+    }
+
+    /// `units` admitted units in time-line units. `units` is at most a `u32`
+    /// burst and the shift at most 30, so this never overflows.
+    #[inline]
+    const fn cost(&self, units: u64) -> u64 {
+        units << self.shift()
+    }
+
+    /// `floor(now_ns * limit / period_ns)`: the current time in time-line
+    /// units.
     ///
     /// The reciprocal estimate is low by at most one (`per_ns` is rounded down,
     /// and the error term `now_ns / 2^64` is below one), so one exact multiply
@@ -261,7 +313,7 @@ impl GcraParams {
     /// `now_ns`, so it always fits.
     fn intervals_at(&self, now_ns: u64) -> u64 {
         let wide = u128::from(now_ns);
-        let estimate = ((wide * self.per_ns) >> 64) as u64;
+        let estimate = ((wide * (self.per_ns & RECIPROCAL_MASK)) >> 64) as u64;
         let next = u128::from(estimate) + 1;
         if next * u128::from(self.period_ns) <= wide * u128::from(self.limit) {
             estimate + 1
@@ -270,7 +322,7 @@ impl GcraParams {
         }
     }
 
-    /// The first nanosecond at which interval `interval` has begun:
+    /// The first nanosecond at which time-line unit `interval` has begun:
     /// `ceil(interval * period_ns / limit)`. Off the hot path (denials only).
     fn nanos_at(&self, interval: u64) -> u64 {
         let scaled = u128::from(interval) * u128::from(self.period_ns);
@@ -302,6 +354,11 @@ impl GcraParams {
     /// Checks `n` units against `tat` at time `now`, all or nothing. On
     /// admission the word is advanced by `n` intervals; on denial it is left
     /// as it was.
+    ///
+    /// Units admitted one after another are spaced one emission interval
+    /// apart once the burst is used, to within one unit of the time line:
+    /// under 2 ns, or `1/2^30` of the interval for intervals longer than
+    /// about one second.
     ///
     /// Requesting `0` always succeeds; requesting more than the burst can never
     /// succeed, and the denial's `retry_after` is [`Duration::MAX`]. A denial
@@ -386,14 +443,14 @@ impl GcraParams {
         if n == 0 {
             return Decision::Allow;
         }
-        // A request wider than the burst tolerance can never conform, even
-        // from an empty bucket.
-        let span = u64::from(n - 1);
-        if self.closed() || span > self.tolerance {
+        // A request wider than the burst can never conform, even from an
+        // empty bucket.
+        if self.closed() || n > self.quota.burst() {
             return Decision::Deny {
                 retry_after: Duration::MAX,
             };
         }
+        let span = self.cost(u64::from(n - 1));
 
         let now_ns = nanos(now);
         let now_iv = self.intervals_at(now_ns);
@@ -405,7 +462,7 @@ impl GcraParams {
             let effective = current.max(now_iv);
             // Conforms iff `effective + span <= now + tolerance`.
             if effective.saturating_add(span) <= ceiling {
-                let new_tat = effective.saturating_add(u64::from(n));
+                let new_tat = effective.saturating_add(self.cost(u64::from(n)));
                 if tat
                     .compare_exchange_weak(current, new_tat, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
@@ -429,21 +486,25 @@ impl GcraParams {
         if self.closed() {
             return Snapshot::closed();
         }
-        let burst = self.tolerance + 1;
+        let burst = self.quota.burst();
         let now_ns = nanos(now);
         let now_iv = self.intervals_at(now_ns);
         let tat = tat.load(Ordering::Acquire).max(now_iv);
-        // `k` units conform iff `tat + (k - 1) <= now + tolerance`.
-        let remaining = now_iv.saturating_add(burst).saturating_sub(tat);
+        // `k` units conform iff `tat + (k - 1) * unit <= now + tolerance`.
+        let unit = self.cost(1);
+        let remaining = now_iv
+            .saturating_add(self.tolerance)
+            .saturating_add(unit)
+            .saturating_sub(tat)
+            >> self.shift();
         let reset_after = if tat == now_iv {
             Duration::ZERO
         } else {
             Duration::from_nanos(self.nanos_at(tat).saturating_sub(now_ns))
         };
-        let burst = u32::try_from(burst).unwrap_or(u32::MAX);
         Snapshot::new(
             burst,
-            u32::try_from(remaining).unwrap_or(u32::MAX),
+            u32::try_from(remaining).unwrap_or(u32::MAX).min(burst),
             reset_after,
         )
     }
@@ -458,11 +519,16 @@ impl GcraParams {
 
     /// Makes `tat` no fuller than a bucket that is whole again exactly at
     /// `until` (a duration on the caller's time line): the theoretical arrival
-    /// time is raised to the first emission interval that begins at or after
-    /// it. Exact, with no rounding of fractional units, so a key restored
+    /// time is raised to the first time-line unit that begins at or after it.
+    /// Exact, with no rounding of fractional units, so a key restored
     /// repeatedly loses nothing.
+    ///
+    /// Never past a bucket drained empty at `now`: a debt that would take
+    /// longer than this quota's own full refill (one recorded under another,
+    /// slower quota) is cut to that refill, so a restore holds a key back for
+    /// at most its own recovery time.
     #[cfg(all(feature = "std", feature = "algorithms"))]
-    fn restore_until_in<W: Word>(&self, tat: &W, until: Duration) {
+    fn restore_until_in<W: Word>(&self, tat: &W, until: Duration, now: Duration) {
         if self.closed() {
             return;
         }
@@ -473,7 +539,11 @@ impl GcraParams {
         } else {
             floor.saturating_add(1)
         };
-        let _previous = tat.fetch_max(interval, Ordering::AcqRel);
+        let drained = self
+            .intervals_at(nanos(now))
+            .saturating_add(self.tolerance)
+            .saturating_add(self.cost(1));
+        let _previous = tat.fetch_max(interval.min(drained), Ordering::AcqRel);
     }
 }
 
@@ -529,8 +599,8 @@ impl fmt::Debug for GcraParams {
 /// assert_eq!(gcra.check_at(Duration::from_millis(100)), Decision::Allow);
 /// ```
 pub struct Gcra {
-    /// Theoretical arrival time of the next conforming unit, in emission
-    /// intervals since the limiter epoch. Loom's atomic under `cfg(loom)`.
+    /// Theoretical arrival time of the next conforming unit, in time-line
+    /// units since the limiter epoch. Loom's atomic under `cfg(loom)`.
     tat: crate::sync::AtomicU64,
     /// The quota's parameters; all of the arithmetic lives there.
     params: GcraParams,
@@ -703,11 +773,11 @@ impl Gcra {
     }
 
     /// Makes the bucket no fuller than one that is whole again exactly at
-    /// `until` (a duration on the caller's time line). See
-    /// [`GcraParams::restore_until_in`].
+    /// `until` (a duration on the caller's time line), and never emptier than
+    /// one drained at `now`. See [`GcraParams::restore_until_in`].
     #[cfg(all(feature = "std", feature = "algorithms"))]
-    pub(crate) fn restore_until(&self, until: Duration) {
-        self.params.restore_until_in(&self.tat, until);
+    pub(crate) fn restore_until(&self, until: Duration, now: Duration) {
+        self.params.restore_until_in(&self.tat, until, now);
     }
 }
 
@@ -916,7 +986,11 @@ mod tests {
 
     #[test]
     fn test_interval_conversion_is_exact_floor() {
+        // 3 per second: an interval of 333_333_333.3 ns splits into 2^28
+        // time-line units (the largest power of two keeping a unit >= 1 ns).
         let lb = Gcra::new(Quota::per_second(3));
+        assert_eq!(lb.params.shift(), 28);
+        let per_period: u128 = 3 << 28;
         for ns in [
             0u64,
             1,
@@ -926,11 +1000,64 @@ mod tests {
             1_000_000_000,
             u64::MAX,
         ] {
-            let exact = u64::try_from(u128::from(ns) * 3 / 1_000_000_000).unwrap_or(u64::MAX);
+            let exact =
+                u64::try_from(u128::from(ns) * per_period / 1_000_000_000).unwrap_or(u64::MAX);
             assert_eq!(lb.params.intervals_at(ns), exact, "ns={ns}");
         }
         let one_per_ns = Gcra::new(Quota::from_parts(1_000, Duration::from_micros(1), 1));
+        assert_eq!(one_per_ns.params.shift(), 0);
         assert_eq!(one_per_ns.params.intervals_at(u64::MAX), u64::MAX);
+        // Long intervals stop at 2^30 units.
+        assert_eq!(Gcra::new(Quota::per_minute(1)).params.shift(), 30);
+    }
+
+    #[test]
+    fn test_burst_one_spacing_holds_across_an_interval_boundary() {
+        // 2.1 floored `now` to whole intervals and admitted at 1.999 s and
+        // 2.000 s with burst 1: two units 1 ms apart.
+        let lb = Gcra::new(Quota::per_second(1).with_burst(1));
+        assert!(lb.check_at(at(0)).is_allow());
+        assert!(lb.check_at(at(1_999)).is_allow());
+        assert!(lb.check_at(at(2_000)).is_deny());
+        assert!(lb.check_at(at(2_998)).is_deny());
+        assert!(lb.check_at(at(2_999)).is_allow());
+
+        // No window shorter than one interval (100 ms) ever holds more than
+        // the burst, polled at uneven times.
+        for burst in [1u32, 3, 10] {
+            let lb = Gcra::new(Quota::per_second(10).with_burst(burst));
+            let mut admitted = Vec::new();
+            for step in 0..5_000u64 {
+                let ms = step * 7 / 3;
+                if lb.check_at(at(ms)).is_allow() {
+                    admitted.push(ms);
+                }
+            }
+            let width = usize::try_from(burst).unwrap_or(1) + 1;
+            for w in admitted.windows(width) {
+                let first = w.first().copied().unwrap_or(0);
+                let last = w.last().copied().unwrap_or(0);
+                assert!(
+                    last - first >= 100,
+                    "burst {burst}: {width} units within {} ms",
+                    last - first
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", feature = "algorithms"))]
+    fn test_restore_never_holds_back_past_own_refill() {
+        // A debt recorded under a slower quota (an hour) restored into a
+        // one-per-100ms bucket of burst 10: the bucket is drained at most,
+        // and whole again after its own one-second refill.
+        let lb = Gcra::new(Quota::per_second(10));
+        lb.restore_until(Duration::from_secs(3_600), at(5_000));
+        assert!(lb.check_at(at(5_000)).is_deny());
+        assert!(lb.check_at(at(5_100)).is_allow());
+        // Drained at 5 s, one unit taken at 5.1 s: whole again at 6.1 s.
+        assert_eq!(lb.peek_at(at(6_100)), Snapshot::full(10));
     }
 
     #[test]

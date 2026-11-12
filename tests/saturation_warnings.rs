@@ -12,8 +12,11 @@ use rate_net::{Eviction, RateLimiter};
 
 fn limiter(overflow: Overflow) -> (Arc<ManualClock>, RateLimiter<Arc<ManualClock>>) {
     let clock = Arc::new(ManualClock::new());
+    // Two per minute: a key charged from the overflow sketch still has a unit
+    // to spend, so its debt outgrows what the sketch holds for it; such keys
+    // cannot be forgotten, and the shard saturates.
     let limiter = RateLimiter::builder()
-        .per_minute(1)
+        .per_minute(2)
         .shards(1)
         .eviction(Eviction::capacity(64).with_overflow(overflow))
         .clock(Arc::clone(&clock))
