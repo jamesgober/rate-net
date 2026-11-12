@@ -225,7 +225,8 @@ impl GcraParams {
         // the tolerance below always fits).
         let shift = period_ns
             .checked_div(limit)
-            .map_or(0, |per_unit| (63 - per_unit.leading_zeros()).min(MAX_SHIFT));
+            .and_then(u64::checked_ilog2)
+            .map_or(0, |log2| log2.min(MAX_SHIFT));
         let limit = limit << shift;
         let reciprocal = if limit == 0 || burst == 0 {
             0
