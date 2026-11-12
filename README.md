@@ -118,8 +118,12 @@ match limiter.check("user:42") {
         // denied — return 429 with Retry-After: {retry_after}
         let _ = retry_after;
     }
-    // `Decision` is `#[non_exhaustive]`: future variants land here.
-    _ => {}
+    // `Decision` is `#[non_exhaustive]`: future variants land here. Treat
+    // them as denials, never as allows.
+    other => {
+        // return 429
+        let _ = other.retry_after();
+    }
 }
 ```
 
@@ -314,8 +318,11 @@ let limiter = RateLimiter::per_second(10);
 let client: IpAddr = "2001:db8:aa:bb::42".parse().unwrap();
 
 // One allowance per IPv4 address and per IPv6 /64: a host cannot rotate through
-// the 2^64 addresses it owns to reset its limit.
-assert!(limiter.check(Key::ip_prefix(client, 32, 64)).is_allow());
+// the 2^64 addresses it owns to reset its limit. `Key::client_ip(ip)` is the
+// same as `Key::ip_prefix(ip, 32, 64)`; use `ip_prefix` for other prefixes
+// (a /56 or /48 where subscribers get larger IPv6 blocks).
+assert!(limiter.check(Key::client_ip(client)).is_allow());
+assert_eq!(Key::client_ip(client), Key::ip_prefix(client, 32, 64));
 
 // Tagged ids never collide with string keys, even with identical bytes.
 assert!(limiter.check(Key::id(42)).is_allow());
@@ -326,6 +333,11 @@ The `From` conversions (`&str`, `String`, bytes, `u64`, `IpAddr`, `SocketAddr`
 — port dropped — …) produce *raw* keys whose identity is the bytes alone; that
 is fine for a limiter holding one kind of key. When one limiter mixes kinds,
 use the tagged constructors. `Key`'s `Debug` never prints the key's bytes.
+
+`limiter.check(ip)` with a plain `IpAddr` or `SocketAddr` keys each address on
+its own. That is not a client key: an IPv6 client can rotate through its /64
+and never be limited, and `::ffff:a.b.c.d` counts apart from `a.b.c.d`. Key
+clients with `Key::client_ip` (or `Key::ip_prefix`).
 
 <br>
 
@@ -386,7 +398,7 @@ always available; the rest are behind the `algorithms` feature.
 | Algorithm | Shape | Bound per key | Good for |
 |-----------|-------|---------------|----------|
 | **Token bucket** | Smooth refill, bursts up to `burst` | `burst + rate × elapsed` | General-purpose; the default |
-| **Leaky bucket** | Spaces units at a steady interval (GCRA) | `burst + rate × elapsed` | Shaping bursty traffic to a steady rate |
+| **Leaky bucket** | Spaces units at a steady interval (GCRA); since 2.2.0 never more than `burst` in any window shorter than one interval | `burst + rate × elapsed` | Shaping bursty traffic to a steady rate |
 | **Fixed window** | Counter resets each window | `limit` per aligned window | Cheapest; tolerates boundary bursts (`2 × limit` across a boundary) |
 | **Sliding-window log** | Exact timestamps in a window | `limit` in any rolling window | Highest accuracy; memory grows with `limit` |
 | **Sliding-window counter** | Weighted blend of two windows | `≈ limit`, worst case `2 × limit` | Accuracy/cost balance; common production choice |
@@ -637,8 +649,19 @@ default `SystemClock` reads `Instant::now()` (~26 ns on Windows); on
   never happens, and alert on `recovery_load()` and `keys_refused` (feature
   `metrics`) before it does.
 - **Under `FailClosed`, a sketch charge is shared**: `reset` and `remove`
-  cannot clear it for one key (it expires within one recovery period), and a
-  slow tier's long deadline can drain a fast-tier newcomer for that long.
+  cannot clear it for one key, but it never holds a key back longer than the
+  key's own recovery time. Since 2.2.0 a slow tier's long deadline is cut to
+  a fast-tier newcomer's own refill; before, it drained the newcomer for the
+  slow tier's whole recovery time.
+- **What a lockout costs an attacker:** the `FailClosed` newcomer lockout
+  starts once about 4x the cap of still-limited keys are evicted within one
+  recovery period: about `4 x cap x burst` requests in that period, each from
+  a fresh key. Cheap for slow quotas keyed by something free to invent (at the
+  default cap, a 5-per-hour login limiter keyed by username needs about 21 M
+  requests in the hour, about 5,800 a second); out of reach for a fast quota
+  keyed by peer address (`per_second(100)` by IP needs about 4 M fresh
+  addresses, 400 M requests, every second). Size the cap for slow quotas from the attacker's
+  key rate, not from the real key count.
 
 <br>
 
@@ -755,7 +778,10 @@ legitimate key is ever charged or refused. So the first defence is the cap:
   default cap, and under eviction pressure the recovery tables add 64 bytes
   per key of capacity with `FailClosed` (about 202 bytes in all) or 32 with
   `Forget` (about 170). The default 1,048,576-key cap is about 140 MiB idle and
-  202 MiB under pressure; plus the bytes of keys longer than 22.
+  202 MiB under pressure; plus the bytes of keys longer than 22. The
+  sliding-window log is different: up to `16 x limit` bytes per key, so budget
+  `cap x 16 x limit`. Its limit is capped at `MAX_SLIDING_LOG_LIMIT` (65,536,
+  1 MiB per key) on every construction path.
 - **Operations checklist:**
   1. Size the cap with the rule above, and re-check it when traffic grows.
   2. Export `limiter.recovery_load()` (feature `metrics`) every few seconds

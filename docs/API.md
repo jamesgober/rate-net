@@ -82,7 +82,8 @@ let limiter = RateLimiter::per_second(100);
 match limiter.check("user:42") {
     Decision::Allow => { /* serve */ }
     Decision::Deny { retry_after } => { let _ = retry_after; /* 429 + Retry-After */ }
-    _ => {}
+    // `Decision` is `#[non_exhaustive]`: treat any later outcome as a denial.
+    other => { let _ = other.retry_after(); /* 429 */ }
 }
 ```
 
@@ -1304,7 +1305,7 @@ allocates. On a target without 64-bit atomics (for example
 
 ```toml
 [dependencies]
-rate-net = { version = "2.1", default-features = false }
+rate-net = { version = "2.2", default-features = false }
 ```
 
 ---
@@ -1397,10 +1398,19 @@ removes only recovered keys; a key with a longer per-key quota that expires
 while still limited has its debt recorded like any other eviction — the eviction judges such a key by its current
 state, not by a recovery time cached before it last spent. `remove`, `reset`,
 and `clear` forget a key's own record — they are explicit resets — but a
-sketch charge is shared and cannot be cleared for one key (it expires within
-one recovery period; `clear` drops the whole table). A sketch charge carries
-the debt's own deadline, so under per-key tiers a slow tier's long debt can
-drain a fast-tier newcomer for that long.
+sketch charge is shared and cannot be cleared for one key, but it never holds
+a key back longer than the key's own recovery time (`clear` drops the whole
+table). Since 2.2.0 a sketch charge recorded under a slower per-key tier is cut
+to the newcomer's own full refill; before, a slow tier's long debt drained a
+fast-tier newcomer for the slow tier's whole recovery time.
+
+Under `FailClosed` the newcomer lockout starts once about 4x the cap of
+still-limited keys are evicted within one recovery period: an attacker needs
+about `4 x cap x burst` requests in that period, each from a fresh key. That is
+cheap for a slow quota keyed by something free to invent (a 5-per-hour login
+limiter keyed by username, at the default cap: about 21 M requests in the
+hour) and out of reach for a fast quota keyed by peer address. Size the cap for
+slow quotas from the attacker's key rate.
 
 ### Sizing the cap
 

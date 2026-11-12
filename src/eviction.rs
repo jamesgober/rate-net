@@ -100,6 +100,21 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// keeping newcomers admitted under a flood matters more than never resetting
 /// a key (load shedding for anonymous traffic).
 ///
+/// **What a lockout costs an attacker.** Under `FailClosed`, the newcomer
+/// lockout starts once about 4x the cap of still-limited keys are evicted
+/// within one recovery period, which takes about `4 x cap x burst` requests
+/// within that period, each from a fresh key. That is cheap for a slow quota
+/// keyed by something free to invent, and out of reach for a fast one keyed by
+/// peer address. At the default cap: a login limiter of 5 per hour keyed by
+/// username needs about 21 M requests in the hour (about 5,800 a second); a
+/// `per_second(100)` limiter keyed by IP needs about 4 M fresh addresses (400 M
+/// requests) every second. For slow quotas, size the cap from the attacker's
+/// key rate, not from the real key count, and watch `keys_refused` and
+/// `recovery_load`. A newcomer charged from the sketch is held back for at
+/// most its own recovery time,
+/// never for another quota's: a charge recorded under a slower per-key quota
+/// is cut to the newcomer's own full refill (since 2.2.0).
+///
 /// The exact table costs 32 bytes per key of capacity, and `FailClosed`'s
 /// sketch another 32 (64 or 32 MiB at the default cap; up to twice that when
 /// a shard's share of the cap is just past a power of two).
@@ -124,11 +139,16 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 ///
 /// `remove`, `reset`, and `clear` forget a key's own record along with its
 /// state; they are explicit resets. A sketch charge is shared and cannot be
-/// cleared for one key (it expires within one recovery period); `clear`
-/// drops the whole table.
+/// cleared for one key, but it never holds a key back longer than the key's
+/// own recovery time; `clear` drops the whole table.
 ///
 /// Size the cap above your real key cardinality so only flood keys are ever
-/// evicted. A tracked token-bucket key costs about 138 bytes of heap at the
+/// evicted. The sliding-window log is the exception to the per-key figures
+/// here: it keeps one 16-byte record per distinct admit time in its window, up
+/// to `16 x limit` bytes per key, and its limit is capped at
+/// [`MAX_SLIDING_LOG_LIMIT`](crate::MAX_SLIDING_LOG_LIMIT) (1 MiB per key) on
+/// every construction path. Budget `cap x 16 x limit` for it. A tracked
+/// token-bucket key costs about 138 bytes of heap at the
 /// default cap (up to ~210 bytes just after a shard's tables have grown), plus
 /// its bytes beyond 22; see
 /// [`Builder::max_key_len`](crate::Builder::max_key_len) and

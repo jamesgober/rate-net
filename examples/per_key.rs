@@ -4,23 +4,25 @@
 //! cargo run --example per_key
 //! ```
 
-use rate_net::RateLimiter;
+use rate_net::{Key, RateLimiter};
 use std::net::{IpAddr, Ipv4Addr};
 
 fn main() {
     // Two requests per second, applied independently per key.
     let limiter = RateLimiter::per_second(2);
 
-    let alice = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-    let bob = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+    // Key clients by `Key::client_ip`: IPv4 addresses exactly, IPv6 by /64,
+    // so one IPv6 host cannot rotate addresses to dodge its limit.
+    let alice = Key::client_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+    let bob = Key::client_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
 
     // Alice spends her whole allowance.
-    println!("alice #1: {}", verdict(limiter.check(alice).is_allow()));
-    println!("alice #2: {}", verdict(limiter.check(alice).is_allow()));
-    println!("alice #3: {}", verdict(limiter.check(alice).is_allow()));
+    println!("alice #1: {}", verdict(limiter.check(&alice).is_allow()));
+    println!("alice #2: {}", verdict(limiter.check(&alice).is_allow()));
+    println!("alice #3: {}", verdict(limiter.check(&alice).is_allow()));
 
     // Bob is on a different key, so he is untouched by Alice's traffic.
-    println!("bob   #1: {}", verdict(limiter.check(bob).is_allow()));
+    println!("bob   #1: {}", verdict(limiter.check(&bob).is_allow()));
 
     // String keys work the same way — per user, per tenant, per endpoint.
     println!("user:42 : {}", verdict(limiter.check("user:42").is_allow()));

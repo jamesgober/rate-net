@@ -14,6 +14,81 @@
 
 ---
 
+## [2.2.0] - 2026-11-12
+
+**Review fixes: per-quota overflow charges, a capped sliding log, exact GCRA
+spacing, and a client IP key.** A minor release: no public item is removed or
+changes signature. Two documented behaviours change, both toward the docs'
+promises; see Changed.
+
+### Fixed
+
+- **Overflow charges across per-key quotas.** Under `Overflow::FailClosed`,
+  debts that keys under a slow `quota_for` quota spilled into the shared
+  overflow sketch charged newcomers under faster quotas for the slow quota's
+  recovery time (an hour, for a newcomer whose own quota recovers in a
+  second), and `remove` could not clear it. Now:
+  - a restored debt is cut to the key's own recovery time, so a sketch charge
+    never holds a key back longer than its own full refill, which is what the
+    docs promised;
+  - sketch cells carry an 8-bit quota class: a cell only one class wrote
+    charges only newcomers of that class, and a cell several classes wrote
+    charges everyone (each charge cut as above);
+  - a key charged from the sketch that owes no more than the sketch already
+    holds for it can be evicted without recording anything, instead of
+    filling the shard and getting newcomers refused with the slowest quota's
+    retry time.
+- **Sliding-window log memory.** The log's limit is capped at
+  `MAX_SLIDING_LOG_LIMIT` (65,536, at most 1 MiB per key) on every
+  construction path, not only `try_build`; a larger limit is clamped (the
+  log admits fewer units than configured, never more).
+- **GCRA spacing.** The leaky bucket (`Gcra`, `GcraParams` and the keyed
+  `Algorithm::LeakyBucket`) credited the elapsed part of an emission interval
+  for free, so a burst-1 limit at one per second admitted units at 1.999 s
+  and 2.000 s. Time is now counted in up to `2^30` units per interval, and
+  units are spaced to within one such unit (under 2 ns, or `1/2^30` of the
+  interval for intervals longer than about a second).
+
+### Added
+
+- **`Key::client_ip(addr)`**: the usual per-client key, an IPv4 address
+  exactly or an IPv6 address masked to its `/64` (the same as
+  `Key::ip_prefix(addr, 32, 64)`).
+
+### Changed
+
+- **The `GcraParams` word.** A theoretical arrival time is now in the
+  quota's fixed fractions of an emission interval instead of whole
+  intervals; treat the word as opaque (`0` is still a full bucket). A word
+  saved by 2.1 reads as an earlier time, a fuller bucket, under 2.2.
+- **Fewer refusals under `FailClosed`.** A key charged from the sketch and
+  owing no more than it holds is now evicted rather than kept, so a flood
+  that used to fill a shard with such keys (and refuse newcomers,
+  `keys_refused`) now charges newcomers from the sketch instead
+  (`keys_restored`). Both deny; the retry time is now the newcomer's own.
+- The overflow sketch keeps 16 bits of a spent count (24 before, 8 went to
+  the quota class); a larger count is still charged as everything.
+
+### Docs
+
+- The cost of a `FailClosed` newcomer lockout to an attacker (about
+  `4 x cap x burst` requests per recovery period, each from a fresh key),
+  with worked numbers for a slow login quota and a fast IP quota, and
+  advice to size the cap from the attacker's key rate.
+- The sliding-window log's per-key memory (`16 x limit` bytes) beside the
+  per-key memory figures.
+- `From<IpAddr>`, `From<Ipv6Addr>` and `From<SocketAddr>` say they key each
+  address separately and point at `Key::client_ip`; `examples/per_key.rs`
+  uses it.
+- The `Decision` match examples handle a future variant as a denial instead
+  of an empty `_ => {}` arm.
+
+### Compatibility
+
+- MSRV stays at Rust 1.85. No new dependencies.
+
+---
+
 ## [2.1.0] - 2026-10-28
 
 **The leaky-bucket arithmetic over state you store yourself, and the
@@ -993,7 +1068,8 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
   roadmap for the dependency ordering.
 - Libraries do not commit `Cargo.lock` (per portfolio convention).
 
-[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/rate-net/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/jamesgober/rate-net/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/jamesgober/rate-net/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/jamesgober/rate-net/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/jamesgober/rate-net/compare/v1.1.0...v2.0.0

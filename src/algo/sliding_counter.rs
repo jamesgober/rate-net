@@ -39,6 +39,16 @@ pub(crate) struct SlidingCounter {
 }
 
 impl SlidingCounter {
+    /// The limit this state runs under (for its quota class).
+    pub(crate) const fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// The window length in nanoseconds (for its quota class).
+    pub(crate) const fn period_ns(&self) -> u64 {
+        self.period_ns
+    }
+
     pub(crate) fn new(quota: &Quota, now: Duration) -> Self {
         let period_ns = nanos(quota.period());
         Self {
