@@ -1057,8 +1057,6 @@ CI matrix (Linux/macOS/Windows, stable and MSRV).
 - `deny.toml` — cargo-deny license / advisory / source policy.
 - `.gitattributes` normalising line endings to LF and keeping
   development-only paths out of `git archive` tarballs.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) and `.dev/release/`
-  note template — gitignored.
 
 ### Notes
 
